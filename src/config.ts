@@ -85,6 +85,7 @@ export interface AppConfig {
   extraHighAvailable?: boolean;
   proAvailable: boolean;
   experimentalBiggerContext: boolean;
+  experimentalSkillAttachments: boolean;
   /** Explicitly install the additional Pro-sized model row while Zero Risk is active. */
   zeroRiskProEnabled: boolean;
   /** Optional adapter-silence budget for the Responses watchdog. */
@@ -214,6 +215,7 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     extraHighAvailable: false,
     proAvailable: false,
     experimentalBiggerContext: false,
+    experimentalSkillAttachments: false,
     zeroRiskProEnabled: false,
     autoApproveToolCalls: false,
     controlToken: randomBytes(32).toString("base64url"),
@@ -504,6 +506,13 @@ function parseConfig(value: unknown, path: string): AppConfig {
   }
   const solAvailable = parsed.solAvailable !== false;
   const proAvailable = parsed.proAvailable === true;
+  if (parsed.experimentalSkillAttachments !== undefined && typeof parsed.experimentalSkillAttachments !== "boolean") {
+    throw new Error(`Invalid experimentalSkillAttachments in ${path}`);
+  }
+  const experimentalSkillAttachments = parsed.experimentalSkillAttachments === true;
+  if (browserInteractionMode === "manual" && experimentalSkillAttachments) {
+    throw new Error(`Zero Risk does not support Skills as files in ${path}`);
+  }
   const experimentalBiggerContext = parsed.experimentalBiggerContext === true;
   const zeroRiskProEnabled = parsed.zeroRiskProEnabled === true;
   if (browserInteractionMode === "manual" && experimentalBiggerContext) {
@@ -525,6 +534,7 @@ function parseConfig(value: unknown, path: string): AppConfig {
     solAvailable,
     proAvailable,
     experimentalBiggerContext,
+    experimentalSkillAttachments,
     zeroRiskProEnabled,
   } as AppConfig;
 }
@@ -580,6 +590,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       extraHighAvailable: !manual && config.extraHighAvailable === true,
       proAvailable: manual ? false : config.proAvailable,
       experimentalBiggerContext: manual ? false : config.experimentalBiggerContext,
+      experimentalSkillAttachments: manual ? false : config.experimentalSkillAttachments,
       ...(config.stallTimeoutSec !== undefined ? { stallTimeoutSec: config.stallTimeoutSec } : {}),
       autoApproveToolCalls: manual ? false : config.autoApproveToolCalls,
     },

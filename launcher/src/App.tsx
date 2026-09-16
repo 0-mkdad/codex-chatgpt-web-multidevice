@@ -1627,6 +1627,17 @@ function SettingsSurface({
       setBusy(false);
     }
   };
+  const setSkillAttachments = async (enabled: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      updateState(await api!.setSkillAttachments(enabled));
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
   const setInteractionMode = async (mode: BrowserInteractionMode) => {
     setBusy(true);
     setError(null);
@@ -1703,6 +1714,14 @@ function SettingsSurface({
               || snapshot.state.browserInteractionMode === "manual"
               || snapshot.state.coreSetupComplete !== true}
             onChange={(checked) => void setBiggerContext(checked)}
+          />
+        </SettingRow>
+        <SettingRow body={snapshot.state.browserInteractionMode === "manual"
+          ? copy.manualSkillAttachmentsUnavailable : copy.skillAttachmentsBody} label={copy.skillAttachments}>
+          <Switch
+            checked={snapshot.state.experimentalSkillAttachments}
+            disabled={busy || snapshot.state.browserInteractionMode === "manual" || !snapshot.state.coreSetupComplete}
+            onChange={(checked) => void setSkillAttachments(checked)}
           />
         </SettingRow>
         <SettingRow body={copy.chooseLanguageHint} label={copy.language}>

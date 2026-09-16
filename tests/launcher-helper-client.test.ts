@@ -1,3 +1,4 @@
+import { selectedSkillFile } from "../src/adapters/chatgpt-web/skill-attachments";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -22,6 +23,7 @@ test("daemon streams browser lifecycle through the real helper process", async (
     ChatGptBrowserWorker.prototype.run = async turn => {
       await turn.onPreparedSelected(false);
       const prepared = await turn.prepare();
+      if (prepared.skillFiles?.[0]?.text !== "<skill>\\n<name>ipc</name>\\n<path>/skills/ipc/SKILL.md</path>\\ncheck IPC\\n</skill>") throw new Error("Skill file lost in IPC");
       if (prepared.multipart.parts.length !== 3) throw new Error("Multipart context was lost");
       await turn.onMultipartStageAcknowledged?.(1);
       await turn.onMultipartStageAcknowledged?.(2);
@@ -92,6 +94,9 @@ test("daemon streams browser lifecycle through the real helper process", async (
       capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
       prepare: async () => ({
         text: "inspect", images: [],
+        skillFiles: [selectedSkillFile({ role: "user", origin: "codex_skill", timestamp: 0,
+          content: "<skill>\n<name>ipc</name>\n<path>/skills/ipc/SKILL.md</path>\ncheck IPC\n</skill>",
+        })],
         multipart: { parts: ["part one", "part two", "part three"], commit: "inspect" },
         release: () => { released = true; },
       }),
@@ -399,4 +404,44 @@ test("structured helper errors preserve the ChatGPT adapter failure contract", a
     code: "rate_limit_exceeded",
     retryable: true,
   });
+});
+
+test("an older helper cannot silently drop selected skill files and releases the prepared turn", async () => {
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native2", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
+    storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false,
+  });
+  const internal = client as unknown as {
+    child: unknown;
+    ensureChild(): Promise<void>;
+    send(message: Record<string, unknown>): Promise<void>;
+    handleLine(child: unknown, line: string): void;
+  };
+  const child = {};
+  internal.child = child;
+  internal.ensureChild = async () => {};
+  const sent: string[] = [];
+  internal.send = async message => {
+    sent.push(String(message.type));
+    if (message.type === "run") queueMicrotask(() => internal.handleLine(child, JSON.stringify({
+      type: "event", id: message.id, event: "prepared_selected", reused: false,
+    })));
+    if (message.type === "abort") queueMicrotask(() => internal.handleLine(child, JSON.stringify({
+      type: "error", id: message.id, message: "aborted",
+    })));
+  };
+  let released = false;
+  await expect(client.run({
+    traceId: "skill-old-helper", modelId: "gpt-5.6-sol", reasoning: "high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    prepare: async () => ({ text: "inspect", images: [],
+      skillFiles: [selectedSkillFile({ role: "user", origin: "codex_skill", timestamp: 0,
+        content: "<skill>\n<name>test</name>\n<path>/test</path>\ncheck\n</skill>",
+      })],
+      release() { released = true; },
+    }),
+    onTextDelta() {},
+  })).rejects.toThrow("does not support skill attachments");
+  expect(sent).toEqual(["run", "abort"]);
+  expect(released).toBe(true);
 });

@@ -82,6 +82,22 @@ it to exercise the one-message composer budget and multi-chunk prompt insertion 
 history growth. The normal model-specific browser preflight still applies and fails closed above
 the measured transport limit.
 
+## Skills as files experiment
+
+**Settings → Skills as files (experimental)** is off by default in both launcher profiles.
+It uploads only skills explicitly selected in Codex and identified by native selected-skill
+metadata. Skill discovery and reading other skills through tools are unchanged. The CLI setup
+flags are `--skill-attachments` and `--inline-skills`; Zero Risk does not support automated uploads.
+
+Each UTF-8 `.txt` attachment contains the original skill envelope, including its path or resource
+authority. Its filename uses the skill name and a content digest to distinguish changed versions.
+Files are generated in memory, with no persistent file cache. Retained chats send only new context;
+a fresh chat reconstructs its attachments from canonical history. Files and images share the
+10-attachment limit, and skill content still counts toward context and message token budgets.
+An unsupported browser helper or rejected upload produces an error instead of silently omitting
+instructions. This remains experimental: moving instructions into attachments does not guarantee
+that ChatGPT will follow them more reliably.
+
 ## Bigger Context experiment
 
 Both launcher profiles expose **Bigger Context (experimental)** in Settings. It is disabled by

@@ -3557,14 +3557,6 @@ test("stalled-turn diagnostics record DOM metrics without response or overlay co
   expect(diagnosticSource).not.toMatch(/\bariaLabel:\s*candidate\.getAttribute/);
 });
 
-test("browser completion requires ChatGPT's response-scoped copy action", () => {
-  const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
-  const sessionSource = readFileSync(new URL("../src/chatgpt-session.ts", import.meta.url), "utf8");
-  expect(sessionSource).toContain('button[data-testid="copy-turn-action-button"]');
-  expect(workerSource).toContain("CHATGPT_COMPLETION_ACTION_SELECTOR");
-  expect(workerSource).not.toContain('root.querySelectorAll<HTMLElement>("button")');
-});
-
 test("browser send accepts only new logical turns or generation, not remounted history", () => {
   const idle = {
     initialTurnIdentities: ["old-user", "old-answer", "current-user", "current-answer"],

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { skillFileTokens, validateSkillFiles } from "./skill-attachments";
 import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright-core";
 import {
   atomicWriteFile,
@@ -2043,10 +2044,27 @@ export function chatGptImageFilePayloads(images: ChatGptWebPromptImage[]): Array
   });
 }
 
+function assertChatGptPromptAttachments(prompt: CompiledChatGptWebPrompt): void {
+  if (prompt.images.length + (prompt.skillFiles?.length ?? 0) > CHATGPT_MAX_INPUT_IMAGES) {
+    throw new ChatGptWebAdapterError(
+      "Selected skills and images exceed ChatGPT's 10 attachments per message; disable Skills as files or reduce attachments.",
+      { status: 400, errorType: "invalid_request_error", code: "too_many_attachments", retryable: false },
+    );
+  }
+  validateSkillFiles(prompt.skillFiles);
+}
+
 export function chatGptPromptFilePayloads(
   prompt: CompiledChatGptWebPrompt,
 ): Array<{ name: string; mimeType: string; buffer: Buffer }> {
-  return chatGptImageFilePayloads(prompt.images);
+  assertChatGptPromptAttachments(prompt);
+  const files = [...chatGptImageFilePayloads(prompt.images), ...(prompt.skillFiles ?? []).map(file => ({
+    name: file.name, mimeType: "text/plain", buffer: Buffer.from(file.text, "utf8"),
+  }))];
+  if (files.reduce((sum, file) => sum + file.buffer.length, 0) > 50_000_000) {
+    throw new Error("ChatGPT web attachments exceed the 50 MB per-turn limit");
+  }
+  return files;
 }
 
 /**
@@ -3814,13 +3832,17 @@ export class ChatGptBrowserWorker {
         return rendered;
       };
 
-      // ChatGPT uses the same Markdown renderer for intermediate commentary and for the final
+      // ChatGPT's DIL renderer has no .markdown class (#538). Read its response root within the
+      // assistant-owned PUIK container; the CSS module hash is build-specific. Both renderers
+      // feed the same content serializer and completion checks below, without reading UI text.
+      const answerRootSelector = '.markdown, [data-message-author-role="assistant"] .puik-root.not-markdown > [class*="_DilResponseRoot"]';
+      // ChatGPT uses the same content renderer for intermediate commentary and for the final
       // answer. Older responses nested commentary in the streaming-status container. Pro can also
       // render a completed commentary Markdown root immediately before that live status container.
       // Final-answer Markdown follows the live status instead, so DOM order remains the semantic
       // boundary without relying on localized labels such as "Pro thinking".
-      const allMarkdownRoots = [...root.querySelectorAll<HTMLElement>(".markdown")]
-        .filter(candidate => !candidate.parentElement?.closest(".markdown"))
+      const allMarkdownRoots = [...root.querySelectorAll<HTMLElement>(answerRootSelector)]
+        .filter(candidate => !candidate.parentElement?.closest(answerRootSelector))
         .filter(renderedInDom);
       const streamingStatusContainers = [...root.querySelectorAll<HTMLElement>("[data-streaming-response-status]")]
         .filter(renderedInDom);
@@ -4364,6 +4386,8 @@ export class ChatGptBrowserWorker {
     let diagnosticPage: Page | undefined;
     try {
       if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+      // Validate only the selected physical message, not canonical history used for usage estimates.
+      assertChatGptPromptAttachments(prepared);
       const multipartTransactionId = prepared.multipart
         ? `ctx_${randomUUID().replaceAll("-", "")}`
         : undefined;
@@ -4411,7 +4435,7 @@ export class ChatGptBrowserWorker {
             stagingEffort: stagingMode.effort,
             maxStageMessageTokens,
             maxStageChars,
-            finalMessageTokens: estimateTokens(multipartFinalPrompt, turn.modelId),
+            finalMessageTokens: estimateTokens(multipartFinalPrompt, turn.modelId) + skillFileTokens(prepared.skillFiles, turn.modelId),
             finalMessageChars: multipartFinalPrompt.length,
             finalImageTokens: estimateChatGptWebImageTokens(prepared),
           } : undefined,
