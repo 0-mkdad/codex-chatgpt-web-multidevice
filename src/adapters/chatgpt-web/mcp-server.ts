@@ -7,6 +7,7 @@ import { VERSION } from "../../version";
 import type { ChatGptTurnEnvironment } from "./environment";
 import { CODEX_COMPACTION_CONTROL_WIRE_NAME } from "./native-compaction-control";
 import { callTurnBroker, TurnBrokerTimeoutError, type BrokerToolResult } from "./turn-broker";
+import { observeMcpToolCalls } from "./mcp-observation";
 
 interface ClaimedTurn {
   bindingId: string;
@@ -620,6 +621,12 @@ export async function runChatGptMcpServer(options: {
         yield_time_ms: z.number().int().min(250).max(30_000).optional(),
         max_output_tokens: z.number().int().min(1).max(1_000_000).optional(),
         tty: z.boolean().optional(),
+        sandbox_permissions: z.enum(["use_default", "require_escalated"]).optional()
+          .describe("Native Codex sandbox request, only when the current command tool supports it. Codex decides whether to approve."),
+        justification: z.string().optional()
+          .describe("Approval question for a native require_escalated request; omit otherwise."),
+        prefix_rule: z.array(z.string()).optional()
+          .describe("Optional native approval prefix for require_escalated; Codex owns its approval and persistence."),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
@@ -628,22 +635,36 @@ export async function runChatGptMcpServer(options: {
       turnReference(contract, input),
       extra,
       async claimed => {
-        const { cmd, workdir, yield_time_ms, max_output_tokens, tty } = input;
+        const { cmd, workdir, yield_time_ms, max_output_tokens, tty, sandbox_permissions, justification, prefix_rule } = input;
         const bound = claimed.environment;
+        const permissions = {
+          ...(sandbox_permissions !== undefined ? { sandbox_permissions } : {}),
+          ...(justification !== undefined ? { justification } : {}),
+          ...(prefix_rule !== undefined ? { prefix_rule } : {}),
+        };
         const execCommandArguments = {
           cmd,
           ...(workdir ? { workdir } : {}),
           ...(yield_time_ms !== undefined ? { yield_time_ms } : {}),
           ...(max_output_tokens !== undefined ? { max_output_tokens } : {}),
           ...(tty !== undefined ? { tty } : {}),
+          ...permissions,
         };
         const shellCommandArguments = {
           command: cmd,
           ...(workdir ? { workdir } : {}),
           ...(yield_time_ms !== undefined ? { timeout_ms: yield_time_ms } : {}),
+          ...permissions,
         };
         const tool = exactTool(bound, "exec_command") ?? exactTool(bound, "shell_command");
         if (tool) {
+          // Never silently discard an approval request on a native registry that cannot express it.
+          const properties = tool.parameters.properties;
+          for (const key of Object.keys(permissions)) {
+            if (!properties || typeof properties !== "object" || !Object.hasOwn(properties, key)) {
+              throw new Error(`The current native ${tool.name} tool does not support ${key}`);
+            }
+          }
           const args = tool.name === "exec_command" ? execCommandArguments : shellCommandArguments;
           return invoke(claimed.bindingId, bound, tool, { arguments: args }, extra.signal);
         }
@@ -932,5 +953,5 @@ export async function runChatGptMcpServer(options: {
     );
   }
 
-  await server.connect(new StdioServerTransport());
+  await server.connect(observeMcpToolCalls(new StdioServerTransport(), BRIDGE_TOOL_NAMES));
 }

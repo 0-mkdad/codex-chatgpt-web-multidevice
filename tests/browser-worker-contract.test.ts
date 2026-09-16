@@ -5,8 +5,9 @@ import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
 import type { Page } from "playwright-core";
 import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
-import { ensureChatGptPersonalizedConnectorAccess } from "../src/adapters/chatgpt-web/browser-worker";
+import { ensureChatGptPersonalizedConnectorAccess, chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
+import { CHATGPT_STOPPED_THINKING_LABELS } from "../src/adapters/chatgpt-web/ui-labels";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
 import { parseChatGptEffortSliderState } from "../src/chatgpt-session";
@@ -30,6 +31,49 @@ function personalizedTemporaryChatRole(
   };
   return locator;
 }
+
+test("unavailable Pro detail reads only its linked tooltip in any language", async () => {
+  const { createWindow } = require("@mixmark-io/domino");
+  const details = [
+    "Limit reached. Try again after Sep 18, 2026.",
+    "上限に達しました。明日の14:30以降にお試しください。",
+    "已達上限，請於9月18日後再試。",
+    "한도에 도달했습니다. 내일 다시 시도하세요.",
+    "Лимит достигнут. Повторите завтра.",
+  ];
+  const observe = async (detail: string, kind = "owned") => {
+    const window = createWindow('<div id="other" role="tooltip">Unrelated old limit</div><div id="menu"><div role="menuitemradio" aria-disabled="true">Pro</div></div>');
+    const menu = window.document.getElementById("menu");
+    const row = menu.firstElementChild;
+    const tooltip = window.document.createElement("div");
+    tooltip.id = "owned";
+    tooltip.setAttribute("role", kind === "quote" ? "paragraph" : "tooltip");
+    tooltip.textContent = detail;
+    tooltip.hidden = kind === "hidden";
+    window.document.body.appendChild(tooltip);
+    if (kind === "enabled") row.removeAttribute("aria-disabled");
+    let clock = 0;
+    const context = createContext({
+      document: window.document, HTMLElement: window.HTMLElement,
+      Date: { now: () => { clock += 1_001; return clock; } },
+      setTimeout: (callback: () => void) => { callback(); return 0; },
+      getComputedStyle: (element: HTMLElement) => element.style,
+    });
+    const locator = {
+      filter() { return this; },
+      count: async () => kind === "ambiguous" ? 2 : 1,
+      getAttribute: async (name: string) => row.getAttribute(name),
+      hover: async () => { if (kind !== "unlinked") row.setAttribute("aria-describedby", "owned"); },
+      evaluate: async (callback: Function) => runInContext(`(${callback.toString()})`, context)(row),
+    };
+    return chatGptUnavailableProDetail({ getByRole: () => locator } as never);
+  };
+  for (const detail of details) expect(await observe(detail)).toBe(detail);
+  for (const kind of ["quote", "hidden", "enabled", "ambiguous", "unlinked"]) {
+    expect(await observe(details[0]!, kind)).toBeUndefined();
+  }
+  expect(await observe("x".repeat(513))).toBeUndefined();
+});
 
 test("conversation turn identity survives ChatGPT DOM virtualization", () => {
   expect(chatGptNewTurnIdentity(
@@ -125,6 +169,69 @@ test("assistant tracking rebinds only one proven replacement after React detache
   )).toThrow("2 new conversation turns");
 });
 
+test("response caching rechecks CSS visibility without requiring a DOM mutation", async () => {
+  const { createWindow } = require("@mixmark-io/domino");
+  const dom = createWindow();
+  const originalInnerText = Object.getOwnPropertyDescriptor(dom.HTMLElement.prototype, "innerText");
+  Object.defineProperty(dom.HTMLElement.prototype, "innerText", {
+    configurable: true, get() { return this.textContent; },
+  });
+  // Domino collections predate iterable DOM collections; supply that browser API in the fixture.
+  const prototypes = [dom.document.querySelectorAll(".markdown"), dom.document.body.children].map(Object.getPrototypeOf);
+  for (const prototype of prototypes) Object.defineProperty(prototype, Symbol.iterator, {
+    configurable: true, value: Array.prototype[Symbol.iterator],
+  });
+  try {
+    for (const target of ["answer", "copy"]) {
+      const window = createWindow('<article id="old"><button data-testid="copy-turn-action-button">Copy</button></article><article id="turn"><div class="markdown" id="answer">CODEX WEB GPT READY</div><button id="copy" data-testid="copy-turn-action-button">Copy</button></article>');
+      let visible = false;
+      const context = createContext({
+        document: window.document, HTMLElement: window.HTMLElement, Element: window.Element, Node: window.Node,
+        NodeFilter: window.NodeFilter, performance: { timeOrigin: 1 },
+        getComputedStyle: (element: HTMLElement) => ({
+          display: "block", visibility: "visible", opacity: element.id === target && !visible ? "0" : "1",
+        }),
+        MutationObserver: class { observe() {} },
+      });
+      const evaluationErrors: string[] = [];
+      const locator = {
+        evaluate: async (callback: Function, options: unknown) => {
+          try { return runInContext(`(${callback.toString()})`, context)(window.document.getElementById("turn"), options); }
+          catch (error) { evaluationErrors.push((error as Error).stack ?? String(error)); throw error; }
+        },
+        page: () => ({ isClosed: () => false }),
+      };
+      const worker = Object.create(ChatGptBrowserWorker.prototype) as {
+        responseDomSnapshot(locator: unknown, cache: object): Promise<{ visibleText: string; completionActionVisible: boolean }>;
+      };
+      const cache = {} as { fullScans?: number; cacheHits?: number };
+      const first = await worker.responseDomSnapshot(locator, cache);
+      expect(evaluationErrors).toEqual([]);
+      expect(first.completionActionVisible).toBeFalse();
+      expect(first.visibleText).toBe(target === "answer" ? "" : "CODEX WEB GPT READY");
+      await worker.responseDomSnapshot(locator, cache);
+      expect(cache.fullScans).toBe(1);
+      expect(cache.cacheHits).toBe(1);
+      // A stylesheet/animation changes computed opacity; no subtree mutation occurs.
+      visible = true;
+      expect(await worker.responseDomSnapshot(locator, cache)).toMatchObject({
+        visibleText: "CODEX WEB GPT READY", completionActionVisible: true,
+      });
+      expect(cache.fullScans).toBe(2);
+      await worker.responseDomSnapshot(locator, cache);
+      expect(cache.fullScans).toBe(2);
+      expect(cache.cacheHits).toBe(2);
+      visible = false;
+      expect((await worker.responseDomSnapshot(locator, cache)).completionActionVisible).toBeFalse();
+      expect(cache.fullScans).toBe(3);
+    }
+  } finally {
+    for (const prototype of prototypes) delete prototype[Symbol.iterator];
+    if (originalInnerText) Object.defineProperty(dom.HTMLElement.prototype, "innerText", originalInnerText);
+    else delete dom.HTMLElement.prototype.innerText;
+  }
+});
+
 test("a retained MCP conversation reuses its proven connector binding", () => {
   expect(chatGptConnectorAttachmentMode(true, false)).toBe("mention");
   expect(chatGptConnectorAttachmentMode(true, true)).toBe("retained");
@@ -144,7 +251,7 @@ test("browser turns run concurrently up to the five-tab limit", async () => {
   const browserTurn = (traceId: string) => ({
     traceId,
     modelId: "chatgpt-web/high",
-    capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     prepare: async () => ({ text: traceId, images: [], release() {} }),
     onTextDelta() {},
   });
@@ -451,7 +558,7 @@ test("an accepted Full-mode send survives one stalled DOM probe and a later MCP 
     chatgptWeb: {
       localToolsEnabled: true,
       solAvailable: true,
-      proAvailable: true,
+      extraHighAvailable: true, proAvailable: true,
       storageStatePath: `/tmp/issue-285-${Date.now()}-${Math.random()}.json`,
     },
   };
@@ -594,7 +701,7 @@ test("Bigger Context send activation keeps the outer stage budget instead of res
     chatgptWeb: {
       localToolsEnabled: true,
       solAvailable: true,
-      proAvailable: true,
+      extraHighAvailable: true, proAvailable: true,
       storageStatePath: `/tmp/multipart-send-budget-${Date.now()}-${Math.random()}.json`,
     },
   };
@@ -654,7 +761,7 @@ test("submission observation recovery resumes with rebound locators and is stric
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
     baseUrl: `browser://submission-recovery-${Date.now()}-${Math.random()}`,
-    chatgptWeb: { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
   };
   type Evidence = "user_turn" | "assistant_turn" | "generation_running" | "mcp_tool_call";
   type Recovery = { page: Page; baseline: unknown };
@@ -729,7 +836,7 @@ test("an accepted turn rebinds the missing assistant observation and acknowledge
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
     baseUrl: `browser://assistant-recovery-${Date.now()}-${Math.random()}`,
-    chatgptWeb: { localToolsEnabled: true, solAvailable: true, proAvailable: true },
+    chatgptWeb: { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
   };
   type Baseline = {
     initialTurnIdentities: string[];
@@ -845,7 +952,7 @@ test("missing-assistant expiry checks fresh DOM after a delayed wake while prese
       const worker = ChatGptBrowserWorker.forProvider({
         adapter: "chatgpt-web",
         baseUrl: `browser://assistant-expiry-${scenario}-${Math.random()}`,
-        chatgptWeb: { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+        chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
       }) as unknown as {
         waitForNewAssistantTurn(page: Page, baseline: Baseline, deadline: number | undefined): Promise<{
           identity: string; locator: unknown;
@@ -2186,7 +2293,7 @@ test("Luna-only browser turns verify selector absence instead of opening an effo
       page: unknown,
       modelId: string,
       reasoning: string,
-      capabilities: { localToolsEnabled: boolean; solAvailable: boolean; proAvailable: boolean },
+      capabilities: { localToolsEnabled: boolean; solAvailable: boolean; extraHighAvailable: boolean; proAvailable: boolean },
       captureDiagnostic: (checkpoint: string) => Promise<void>,
     ): Promise<{ displayLabel: string; uiEffortIndex: number | null }>;
   }).selectModelAndEffort;
@@ -2198,7 +2305,7 @@ test("Luna-only browser turns verify selector absence instead of opening an effo
   }, "gpt-5.6-luna", "low", {
     localToolsEnabled: true,
     solAvailable: false,
-    proAvailable: false,
+    extraHighAvailable: false, proAvailable: false,
   }, async checkpoint => { checkpoints.push(checkpoint); });
 
   expect(mode).toMatchObject({ displayLabel: "Luna", uiEffortIndex: null });
@@ -2584,7 +2691,7 @@ test("effort selection stops as soon as ChatGPT reports an expired session", asy
       page: unknown,
       modelId: string,
       reasoning: string,
-      capabilities: { localToolsEnabled: boolean; solAvailable: boolean; proAvailable: boolean },
+      capabilities: { localToolsEnabled: boolean; solAvailable: boolean; extraHighAvailable: boolean; proAvailable: boolean },
     ): Promise<unknown>;
   }).selectModelAndEffort;
 
@@ -2595,7 +2702,7 @@ test("effort selection stops as soon as ChatGPT reports an expired session", asy
   }, "gpt-5.6-sol", "high", {
     localToolsEnabled: true,
     solAvailable: true,
-    proAvailable: true,
+    extraHighAvailable: true, proAvailable: true,
   });
   const result = await Promise.race([
     selection.catch(error => error),
@@ -2650,7 +2757,7 @@ test("effort menu waiting stops when ChatGPT reports an expired session", async 
       page: unknown,
       modelId: string,
       reasoning: string,
-      capabilities: { localToolsEnabled: boolean; solAvailable: boolean; proAvailable: boolean },
+      capabilities: { localToolsEnabled: boolean; solAvailable: boolean; extraHighAvailable: boolean; proAvailable: boolean },
     ): Promise<unknown>;
   }).selectModelAndEffort;
 
@@ -2667,7 +2774,7 @@ test("effort menu waiting stops when ChatGPT reports an expired session", async 
   }, "gpt-5.6-sol", "high", {
     localToolsEnabled: true,
     solAvailable: true,
-    proAvailable: true,
+    extraHighAvailable: true, proAvailable: true,
   });
   const result = await Promise.race([
     selection.catch(error => error),
@@ -2837,9 +2944,9 @@ test("auto-approval recognizes the observed non-dialog approval card", async () 
 });
 
 test("browser preflight separates model context from one-message transport limits", () => {
-  const plus = { localToolsEnabled: false, solAvailable: true, proAvailable: false };
-  const pro = { localToolsEnabled: false, solAvailable: true, proAvailable: true };
-  const luna = { localToolsEnabled: false, solAvailable: false, proAvailable: false };
+  const plus = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+  const pro = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true };
+  const luna = { localToolsEnabled: false, solAvailable: false, extraHighAvailable: false, proAvailable: false };
 
   try {
     assertChatGptWebInputWithinLimits(90_000, 81_808, "gpt-5.6-sol", "medium", plus);
@@ -2941,7 +3048,7 @@ test("browser preflight separates model context from one-message transport limit
 });
 
 test("Bigger Context fits mixed-density whole records within both token and composer limits", () => {
-  const capabilities = { localToolsEnabled: false, solAvailable: true, proAvailable: false, experimentalBiggerContext: true };
+  const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false, experimentalBiggerContext: true };
   const dense = "a!b@c#d$e%f^g&h*".repeat(3_750);
   const sparse = "x".repeat(dense.length);
   const whitespace = " ".repeat(450_000);
@@ -2993,13 +3100,13 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
   const plus = {
     localToolsEnabled: false,
     solAvailable: true,
-    proAvailable: false,
+    extraHighAvailable: false, proAvailable: false,
     experimentalBiggerContext: true,
   };
   const pro = {
     localToolsEnabled: false,
     solAvailable: true,
-    proAvailable: true,
+    extraHighAvailable: true, proAvailable: true,
     experimentalBiggerContext: true,
   };
   expect(() => assertChatGptWebMultipartInputWithinLimits(
@@ -3079,15 +3186,15 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     10_000,
     "gpt-5.6-luna",
     "low",
-    { localToolsEnabled: false, solAvailable: false, proAvailable: false },
+    { localToolsEnabled: false, solAvailable: false, extraHighAvailable: false, proAvailable: false },
     40_000,
     2,
   )).toThrow("unavailable for Luna");
 });
 
 test("Bigger Context stages use the lowest account mode that can carry the stage", () => {
-  const plus = { localToolsEnabled: false, solAvailable: true, proAvailable: false };
-  const pro = { localToolsEnabled: false, solAvailable: true, proAvailable: true };
+  const plus = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+  const pro = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true };
   expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 30_000, 200_000).effort).toBe("low");
   expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 30_000, 300_000).effort).toBe("medium");
   expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 80_000, 300_000).effort).toBe("medium");
@@ -3117,7 +3224,7 @@ test("Bigger Context stages use the lowest account mode that can carry the stage
   expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 104_000, 1_200_000).effort).toBe("max");
   expect(() => resolveChatGptWebMultipartStagingMode(
     "gpt-5.6-luna",
-    { localToolsEnabled: false, solAvailable: false, proAvailable: false },
+    { localToolsEnabled: false, solAvailable: false, extraHighAvailable: false, proAvailable: false },
     10_000,
     20_000,
   )).toThrow("Luna-only");
@@ -3289,6 +3396,50 @@ test("Stopped thinking is an explicit upstream error, not a user cancellation or
   expect(error).toMatchObject({ status: 502, errorType: "server_error", code: "chatgpt_stopped_thinking", retryable: false });
   expect(error.message).toContain("usage limit may have been reached");
   expect(error.message).not.toContain("5 seconds");
+});
+
+test("stopped-thinking detection recognizes localized UI without matching response content", () => {
+  const { createWindow } = require("@mixmark-io/domino") as {
+    createWindow(html: string): { document: Document; NodeFilter: typeof NodeFilter };
+  };
+  const worker = readFileSync("src/adapters/chatgpt-web/browser-worker.ts", "utf8");
+  const source = worker.split("const stoppedThinkingVisible = (() => {")[1]?.split("})();")[0];
+  if (!source) throw new Error("Stopped-thinking predicate is missing");
+  const javascript = new Bun.Transpiler({ loader: "ts" }).transformSync(
+    `function detect(root, options, document, NodeFilter, renderedInDom, overlapsRenderedAnswer, overlapsCommentary) { ${source} }`,
+  );
+  const detect = new Function(`${javascript}; return detect;`)();
+  const stopped = (html: string): boolean => {
+    const window = createWindow(`<article id="old"><button>已停止思考</button></article><article id="current">${html}</article>`);
+    const root = window.document.getElementById("current")!;
+    const overlaps = (selector: string) => (candidate: HTMLElement) => Array.from(root.querySelectorAll(selector))
+      .some(content => content.contains(candidate) || candidate.contains(content));
+    return detect(root, { stoppedThinkingLabels: CHATGPT_STOPPED_THINKING_LABELS }, window.document,
+      window.NodeFilter, (element: HTMLElement) => element.style.display !== "none"
+        && element.style.visibility !== "hidden" && element.style.opacity !== "0",
+      overlaps(".answer"), overlaps(".commentary"));
+  };
+  // Independent observed labels include distinct Simplified/Traditional Chinese and Japanese.
+  for (const label of ["已停止思考", "已中斷思考", "思考を停止しました", "Stopped thinking",
+    "Рассуждение остановлено", "توقّف التفكير", "Réflexion interrompue", "생각 중지됨"]) {
+    expect(stopped(`<div data-streaming-response-status><button>${label}</button></div>`)).toBeTrue();
+    expect(stopped(`<button aria-label="  ${label}  ">Status</button>`)).toBeTrue();
+    for (const html of [
+      `<div class="answer"><p>${label}</p></div>`,
+      `<div class="commentary"><p>${label}</p></div>`,
+      `<pre><code>${label}</code></pre>`,
+      `<blockquote>${label}</blockquote>`,
+      `<div class="answer"><button aria-label="${label}">quoted</button></div>`,
+      `<div style="display:none"><button aria-label="${label}">${label}</button></div>`,
+      `<button style="visibility:hidden">${label}</button>`,
+      `<div style="opacity:0"><button>${label}</button></div>`,
+      `<button>"${label}"</button>`,
+    ]) expect(stopped(html)).toBeFalse();
+  }
+  expect(stopped('<button>Stopped\n  thinking</button>')).toBeTrue();
+  expect(stopped('<div class="answer">Current answer</div>')).toBeFalse();
+  expect(stopped('<button>Thinking</button>')).toBeFalse();
+  expect(stopped('<button>Stop thinking</button>')).toBeFalse();
 });
 
 test("visible DOM trace keeps a complete action phrase instead of a nested count", () => {
@@ -3959,7 +4110,7 @@ test("a stage that spans a system sleep is not charged for the slept time", asyn
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
     baseUrl: `browser://suspension-stage-${Date.now()}`,
-    chatgptWeb: { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
   };
   const worker = ChatGptBrowserWorker.forProvider(provider) as unknown as {
     runStage<T>(

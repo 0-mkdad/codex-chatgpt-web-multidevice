@@ -143,7 +143,7 @@ export function formatChatGptWebMultipartCommit(
   ].join("\n");
 }
 
-const RETIRED_TURN_HANDLE = /\b(turn|request|binding)_[A-Za-z0-9_-]{24,}/g;
+const RETIRED_TURN_HANDLE = /(?<![A-Za-z0-9_-])(turn|request|binding)_[A-Za-z0-9_-]{32}(?![A-Za-z0-9_-])/g;
 
 /**
  * The accumulated Codex context replays earlier turns, including the broker handles those turns
@@ -151,7 +151,11 @@ const RETIRED_TURN_HANDLE = /\b(turn|request|binding)_[A-Za-z0-9_-]{24,}/g;
  * the current turn is supplied by the contract text, never by the replayed context.
  */
 export function withoutRetiredTurnHandles(contextJson: string): string {
-  return contextJson.replace(RETIRED_TURN_HANDLE, (_handle, kind: string) => `[retired ${kind} handle]`);
+  // Match decoded string values: in serialized JSON a newline's `n` is a word character
+  // immediately before the handle. Leave structural keys and native tool-call IDs intact.
+  return JSON.stringify(JSON.parse(contextJson, (_key, value: unknown) => typeof value === "string"
+    ? value.replace(RETIRED_TURN_HANDLE, (_handle, kind: string) => `[retired ${kind} handle]`)
+    : value));
 }
 
 /** ChatGPT accepts at most this many attachments on one message. */
@@ -578,7 +582,7 @@ export function compileChatGptWebPrompt(
       "The task context is complete. Execute the latest active user request now under the capability contract above.",
       "</codex_transport_resume>",
     ];
-  const build = (sourceMessages: readonly CodexMessage[]): CompiledChatGptWebPrompt => {
+  const build = (sourceMessages: readonly CodexMessage[], omittedMessages = 0): CompiledChatGptWebPrompt => {
     const images: ChatGptWebPromptImage[] = [];
     const budget: ImageBudget = {
       seen: 0,
@@ -650,7 +654,15 @@ export function compileChatGptWebPrompt(
       "<codex_context_json>",
       envelopeJson,
       "</codex_context_json>",
-      ...transportResume,
+      ...(omittedMessages > 0 ? [
+        "<codex_transport_resume>",
+        `${omittedMessages} earlier history items were omitted to fit this compaction request; the supplied history is incomplete.`,
+        "Preserve still-relevant progress, constraints and pending work from any supplied cumulative checkpoint and the remaining evidence. Do not infer that omitted work was never done or invent missing details.",
+        manualControl
+          ? "Produce the requested checkpoint summary now."
+          : "Produce the requested checkpoint summary now without calling tools.",
+        "</codex_transport_resume>",
+      ] : transportResume),
     ].join("\n");
     return { text, images };
   };
@@ -671,20 +683,23 @@ export function compileChatGptWebPrompt(
     chatGptPromptJsonBytes(compiled.text) > CHATGPT_COMPACTION_PROMPT_JSON_BYTE_BUDGET
   );
 
-  // Match native Codex compaction recovery: discard oldest history items one at a time until the
-  // summarization request fits. Never discard the final compaction instruction itself, and rebuild
-  // image references after every trim so removed messages cannot leave orphaned attachments.
-  while (
-    exceedsCompactionBudget()
-    && sourceMessages.length > 1
-  ) {
-    sourceMessages = sourceMessages.slice(1);
-    compiled = build(sourceMessages);
+  // A cumulative checkpoint may be the only remaining account of earlier work. Preserve the
+  // newest one and the final compaction instruction; trim other history in its original order.
+  let checkpointIndex = sourceMessages.findLastIndex(message =>
+    message.role === "user" && isReadableCompactionSummaryText(plainMessageText(message))
+  );
+  while (exceedsCompactionBudget() && sourceMessages.length > 1) {
+    const discardIndex = checkpointIndex === 0 ? 1 : 0;
+    if (discardIndex === sourceMessages.length - 1) break;
+    sourceMessages.splice(discardIndex, 1);
+    if (checkpointIndex > discardIndex) checkpointIndex -= 1;
+    // Rebuild image references and count the omission notice inside the same byte budget.
+    compiled = build(sourceMessages, initialMessageCount - sourceMessages.length);
   }
   const encodedBytes = chatGptPromptJsonBytes(compiled.text);
   if (exceedsCompactionBudget()) {
     throw new Error(
-      `ChatGPT Web compaction prompt still requires ${encodedBytes.toLocaleString("en-US")} JSON bytes after all older history was trimmed; the final compaction instruction alone exceeds the browser compaction budget`,
+      `ChatGPT Web compaction prompt still requires ${encodedBytes.toLocaleString("en-US")} JSON bytes after other history was trimmed; ${checkpointIndex >= 0 ? "the cumulative checkpoint and final compaction instruction exceed" : "the final compaction instruction alone exceeds"} the browser compaction budget`,
     );
   }
   const trimmedCompactionMessages = initialMessageCount - sourceMessages.length;

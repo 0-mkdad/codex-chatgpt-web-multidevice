@@ -286,7 +286,7 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
       authenticated: true,
       temporary: true,
       solAvailable: true,
-      proAvailable: false,
+      extraHighAvailable: false, proAvailable: false,
       url: "https://chatgpt.com/?temporary-chat=true",
     }));
   });
@@ -339,7 +339,7 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
       browserHost: "launcher",
       browserHostDescriptorPath: descriptorPath,
       solAvailable: true,
-      proAvailable: false,
+      extraHighAvailable: false, proAvailable: false,
     });
     expect(existsSync(join(root, "production-codex", "config.toml"))).toBe(false);
     expect(existsSync(join(devHome, "codex-home", "config.toml"))).toBe(false);
@@ -498,7 +498,7 @@ test("terminal uninstall refuses to race a launcher-owned runtime", async () => 
     storageStatePath: join(appHome, "browser", "storage-state.json"),
     brokerSocketPath: defaultBrokerEndpoint(appHome),
     headed: true,
-    proAvailable: false,
+    extraHighAvailable: false, proAvailable: false,
     autoApproveToolCalls: false,
     controlToken: "launcher-uninstall-control-token-0123456789abcdef",
     runtimeCommand: [process.execPath],
@@ -561,7 +561,7 @@ test("authorized launcher uninstall does not re-probe an already stopped full ru
     storageStatePath: join(appHome, "browser", "storage-state.json"),
     brokerSocketPath: defaultBrokerEndpoint(appHome),
     headed: true,
-    proAvailable: false,
+    extraHighAvailable: false, proAvailable: false,
     autoApproveToolCalls: false,
     controlToken: "runtime-control-token-0123456789abcdef0123456789",
     runtimeCommand: [process.execPath],

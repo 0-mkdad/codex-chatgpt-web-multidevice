@@ -714,7 +714,8 @@ test("authenticated lifecycle control cancels orphaned browser turns", async () 
   }
 });
 
-test("authenticated targeted cancellation terminates one browser trace without reopening it", async () => {
+for (const reason of [undefined, "browser_surface_bootstrap_timeout", "helper_heartbeat_expired"] as const)
+test(`targeted cancellation preserves peer turns and its cause: ${reason ?? "user close"}`, async () => {
   const config = { ...defaultConfig("browser-only"), port: 0 };
   const server = startServer(config);
   chatGptTurnSessions.clear();
@@ -728,9 +729,9 @@ test("authenticated targeted cancellation terminates one browser trace without r
     physicalSettlement: targetBrowser.then(() => undefined, () => undefined),
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
-    cancel: () => {
+    cancel: reason => {
       targetCancelled += 1;
-      rejectTarget(new Error("tab closed"));
+      rejectTarget(reason ?? new Error("tab closed"));
     },
   }), "trace_target");
   chatGptTurnSessions.getOrCreate("other-key", () => ({
@@ -746,7 +747,7 @@ test("authenticated targeted cancellation terminates one browser trace without r
     const unauthorized = await fetch(`http://127.0.0.1:${server.port}/admin/cancel-turn`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: "Bearer invalid" },
-      body: JSON.stringify({ traceId: "trace_target" }),
+      body: JSON.stringify({ traceId: "trace_target", ...(reason ? { reason } : {}) }),
     });
     expect(unauthorized.status).toBe(401);
 
@@ -756,7 +757,7 @@ test("authenticated targeted cancellation terminates one browser trace without r
         "content-type": "application/json",
         authorization: `Bearer ${config.controlToken}`,
       },
-      body: JSON.stringify({ traceId: "trace_target" }),
+      body: JSON.stringify({ traceId: "trace_target", ...(reason ? { reason } : {}) }),
     });
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
@@ -768,7 +769,7 @@ test("authenticated targeted cancellation terminates one browser trace without r
     });
     expect(targetCancelled).toBe(1);
     expect(otherCancelled).toBe(0);
-    expect(target.settledOutcome()).toMatchObject({ type: "error" });
+    expect(target.settledOutcome()).toMatchObject({ type: "error", error: { code: reason ?? "client_cancelled", retryable: false } });
     expect(chatGptTurnSessions.getOrCreate("target-key", () => {
       throw new Error("cancelled trace must remain terminal");
     }, "trace_target")).toBe(target);

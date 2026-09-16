@@ -81,6 +81,92 @@ test("normal shutdown persists the ChatGPT session before closing browser views"
   assert.ok(destroy > persist, "browser views must close only after session persistence completes");
 });
 
+test("setup preserves session-check failures and never installs without verified authentication", async () => {
+  const vm = require("node:vm");
+  const source = electronMain.slice(
+    electronMain.indexOf('handle("launcher:setup-core",'),
+    electronMain.indexOf('handle("launcher:setup-mcp",'),
+  );
+  for (const dev of [false, true]) {
+    let setup;
+    let installs = 0;
+    let browser = { authenticated: false, status: "error", message: "ChatGPT session verification failed (HTTP 503)." };
+    const state = { browserInteractionMode: "automatic", coreSetupComplete: false };
+    const run = async () => { installs++; return { mode: "browser-only", stdout: "" }; };
+    vm.runInNewContext(source, {
+      handle: (_name, handler) => { setup = handler; }, IS_DEV_PROFILE: dev,
+      stateStore: { read: () => state, update() {} },
+      browserHost: { probeAuthentication: async () => browser, returnToIdle: async () => {} },
+      runtimeHost: { setupCore: run, setupDevCore: run, runtimeConfigSnapshot: () => ({ config: {} }) },
+      smokePassedThisSession: true, send() {}, startCatalogVerificationMonitor() {}, logger: {},
+    });
+    await assert.rejects(setup, error => error.message === browser.message);
+    assert.equal(installs, 0);
+    browser = { authenticated: false, status: "signed-out", message: "Sign in to ChatGPT" };
+    await assert.rejects(setup, /Sign in to/);
+    assert.equal(installs, 0);
+    browser = { authenticated: true, status: "ready", message: "ChatGPT is ready" };
+    assert.equal((await setup()).ok, true);
+    assert.equal(installs, 1);
+  }
+});
+
+test("startup failure stays visible on another launch and Retry exits the failed instance", async () => {
+  const vm = require("node:vm");
+  const source = electronMain.slice(electronMain.indexOf("function showMainWindow()"), electronMain.indexOf("async function openWebUrl"))
+    + electronMain.slice(electronMain.indexOf("void start().catch("));
+  const events = [];
+  let visible = false;
+  let answer;
+  const dialogOpened = new Promise(resolve => {
+    answer = { opened: resolve };
+  });
+  const window = { isDestroyed: () => false, isMinimized: () => false,
+    show: () => { visible = true; }, focus() {}, };
+  const sandbox = {
+    mainWindow: window, mainWindowReadyToShow: false, mainWindowShowRequested: false,
+    startupFailed: false, quitting: false,
+    browserHost: { destroy: () => events.push("destroy") },
+    browserControl: { close: async () => events.push("control closed") },
+    start: async () => { throw new Error("Browser idle document did not commit within 10000ms"); },
+    app: { getPath: () => "/unused", whenReady: async () => {},
+      relaunch: options => events.push(["relaunch", options.args]), exit: code => events.push(["exit", code]) },
+    fs: { appendFileSync() {} }, path,
+    createStateStore: () => ({ read: () => ({ language: "ko" }) }),
+    nativeCopyFor: language => {
+      assert.equal(language, "ko");
+      return { startupTitle: "시작 오류", startupDetail: "다시 시작", startupCleanupFailed: "정리 실패", retry: "다시 시도", quit: "종료" };
+    },
+    launchEnvironment: { CODEX_CHATGPT_WEB_HOME: undefined, CODEX_HOME: "original-codex-home" },
+    process: { argv: ["launcher", "--hidden"], env: { CODEX_CHATGPT_WEB_HOME: "dev-home", CODEX_HOME: "dev-codex-home" } },
+    dialog: {
+      showErrorBox: () => { answer.opened(); },
+      showMessageBox: (owner, options) => {
+        assert.equal(options.title, "시작 오류");
+        assert.deepEqual(Array.from(options.buttons), ["다시 시도", "종료"]);
+        events.push(["dialog", owner === window, options.message]);
+        answer.opened();
+        return new Promise(resolve => { answer.resolve = resolve; });
+      },
+    },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox);
+  await dialogOpened;
+  assert.equal(visible, true, "the failed startup must expose its error owner without renderer readiness");
+  assert.deepEqual(events.slice(0, 2), ["destroy", "control closed"]);
+  visible = false;
+  sandbox.showMainWindow();
+  assert.equal(visible, true, "a second launch must restore the existing startup error window");
+  assert.equal(events.some(event => Array.isArray(event) && event[0] === "exit"), false);
+  answer.resolve({ response: 0 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(events.at(-2)[0], "relaunch");
+  assert.deepEqual(Array.from(events.at(-2)[1]), []);
+  assert.deepEqual(events.at(-1), ["exit", 1]);
+  assert.deepEqual(sandbox.process.env, { CODEX_HOME: "original-codex-home" });
+});
+
 test("packaged runtime is verified before launcher browser surfaces can bind ports", () => {
   const start = electronMain.indexOf("async function start()");
   const runtimeValidation = electronMain.indexOf("installedRuntimeRoot = runtimeRootProvider();", start);

@@ -89,7 +89,7 @@ test("daemon streams browser lifecycle through the real helper process", async (
       traceId: "abcdef123456",
       modelId: "gpt-5.6-sol",
       reasoning: "high",
-      capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+      capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
       prepare: async () => ({
         text: "inspect", images: [],
         multipart: { parts: ["part one", "part two", "part three"], commit: "inspect" },
@@ -196,7 +196,7 @@ test("accepted compaction retires through the helper as completed without hiding
       const prepare = async () => ({ text: "checkpoint instruction", images: [], release: () => { released = true; } });
       await expect(client.run({
         traceId, modelId: "gpt-5.6-sol", reasoning: "high",
-        capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+        capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
         nativeConnector: true, conversationKey: "a".repeat(64), requireRetainedConversation: true,
         prepare, prepareResume: prepare, abortSignal: controller.signal,
         onSubmitted: () => { controller.abort(reason); }, onTextDelta() {},
@@ -267,7 +267,7 @@ test("launcher helper protocol preserves multipart context and the compaction fl
     traceId: "multipart-123",
     modelId: "gpt-5.6-sol",
     reasoning: "high",
-    capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     compaction: true,
     prepare: async () => ({
       text: "commit",
@@ -330,7 +330,7 @@ test("an abort dispatched during run submission cannot overtake the run frame", 
     traceId: "abort-order-123",
     modelId: "gpt-5.6-sol",
     reasoning: "high",
-    capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
     abortSignal: controller.signal,
     prepare: async () => ({
       text: "inspect",
@@ -371,7 +371,7 @@ test("structured helper errors preserve the ChatGPT adapter failure contract", a
       turn: {
         traceId: "rate-limit-123",
         modelId: "chatgpt-web/medium",
-        capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
+        capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
         prepare: async () => ({ text: "inspect", images: [], release() {} }),
         onTextDelta() {},
       },
