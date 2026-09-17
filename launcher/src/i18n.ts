@@ -1012,11 +1012,7 @@ const zhTW: Record<keyof typeof en, string> = {
 
 export type Copy = typeof en;
 
-export function copyFor(language: Language): Copy {
-  if (language === "zh-CN") return zh as Copy;
-  if (language === "ja") return ja as Copy;
-  if (language === "ko") return ko as Copy;
-  if (language === "zh-TW") return zhTW as Copy;
+export function copyFor(_language: Language): Copy {
   return en;
 }
 
