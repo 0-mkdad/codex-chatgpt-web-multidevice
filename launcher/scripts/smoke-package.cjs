@@ -144,11 +144,18 @@ try {
     if (macAppBundle) {
       const launchServices =
         "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
-      run(
-        launchServices,
-        ["-u", macAppBundle],
-      );
-      run(launchServices, ["-gc"]);
+      // The staged app may already be absent from LaunchServices after the
+      // smoke launch. Cleanup is best-effort and must not mask the smoke result.
+      try {
+        run(launchServices, ["-u", macAppBundle]);
+      } catch (error) {
+        process.stderr.write(`LaunchServices unregister cleanup skipped: ${error.message}\n`);
+      }
+      try {
+        run(launchServices, ["-gc"]);
+      } catch (error) {
+        process.stderr.write(`LaunchServices garbage collection skipped: ${error.message}\n`);
+      }
     }
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
