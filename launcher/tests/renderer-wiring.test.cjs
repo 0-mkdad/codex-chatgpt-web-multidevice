@@ -132,18 +132,18 @@ test("startup failure stays visible on another launch and Retry exits the failed
     app: { getPath: () => "/unused", whenReady: async () => {},
       relaunch: options => events.push(["relaunch", options.args]), exit: code => events.push(["exit", code]) },
     fs: { appendFileSync() {} }, path,
-    createStateStore: () => ({ read: () => ({ language: "ko" }) }),
+    createStateStore: () => ({ read: () => ({ language: "en" }) }),
     nativeCopyFor: language => {
-      assert.equal(language, "ko");
-      return { startupTitle: "시작 오류", startupDetail: "다시 시작", startupCleanupFailed: "정리 실패", retry: "다시 시도", quit: "종료" };
+      assert.equal(language, "en");
+      return { startupTitle: "Startup error", startupDetail: "Restart", startupCleanupFailed: "Cleanup failed", retry: "Retry", quit: "Quit" };
     },
     launchEnvironment: { CODEX_CHATGPT_WEB_HOME: undefined, CODEX_HOME: "original-codex-home" },
     process: { argv: ["launcher", "--hidden"], env: { CODEX_CHATGPT_WEB_HOME: "dev-home", CODEX_HOME: "dev-codex-home" } },
     dialog: {
       showErrorBox: () => { answer.opened(); },
       showMessageBox: (owner, options) => {
-        assert.equal(options.title, "시작 오류");
-        assert.deepEqual(Array.from(options.buttons), ["다시 시도", "종료"]);
+        assert.equal(options.title, "Startup error");
+        assert.deepEqual(Array.from(options.buttons), ["Retry", "Quit"]);
         events.push(["dialog", owner === window, options.message]);
         answer.opened();
         return new Promise(resolve => { answer.resolve = resolve; });

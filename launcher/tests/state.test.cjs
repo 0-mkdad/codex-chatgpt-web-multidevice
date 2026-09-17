@@ -36,7 +36,7 @@ test("launcher state persists onboarding, language, and autostart atomically", (
       sessionRefreshReminderAt: null,
     });
     store.update({
-      language: "zh-CN",
+      language: "en",
       onboardingComplete: true,
       keepRunningOnClose: false,
       browserSmokePassed: true,
@@ -44,7 +44,7 @@ test("launcher state persists onboarding, language, and autostart atomically", (
     });
     assert.deepEqual(createStateStore(file).read(), {
       version: 1,
-      language: "zh-CN",
+      language: "en",
       onboardingComplete: true,
       githubOpened: false,
       xOpened: false,
@@ -107,7 +107,7 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
   try {
     fs.writeFileSync(file, JSON.stringify({
       version: 1,
-      language: "zh-CN",
+      language: "en",
       onboardingComplete: "yes",
       autoStart: "yes",
       bridgeEnabled: false,
@@ -121,7 +121,7 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
     }));
     assert.deepEqual(createStateStore(file).read(), {
       version: 1,
-      language: "zh-CN",
+      language: "en",
       onboardingComplete: false,
       githubOpened: false,
       xOpened: false,
