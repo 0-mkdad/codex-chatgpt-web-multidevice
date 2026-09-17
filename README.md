@@ -7,10 +7,6 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a>
-</p>
-
-<p align="center">
   <img src="assets/demo.gif" width="960" alt="A live ChatGPT Web turn using the native Codex harness">
 </p>
 
@@ -176,16 +172,6 @@ bun run app:package
 `dev:launcher` uses a separate profile and account under `~/.codex-chatgpt-web-dev`. `dev:chat` exercises the real browser and compaction paths with explicit simulated tool results, without changing your normal Codex route. See the [DEV chat harness](docs/dev-chat.md) for setup and commands.
 
 </details>
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=0-mkdad%2Fcodex-chatgpt-web-multidevice&type=date&legend=top-left">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=0-mkdad/codex-chatgpt-web-multidevice&type=date&theme=dark&legend=top-left">
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=0-mkdad/codex-chatgpt-web-multidevice&type=date&legend=top-left">
-    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=0-mkdad/codex-chatgpt-web-multidevice&type=date&legend=top-left">
-  </picture>
-</a>
 
 ---
 
