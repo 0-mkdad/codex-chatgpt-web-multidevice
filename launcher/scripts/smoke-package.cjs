@@ -83,7 +83,7 @@ try {
     fs.mkdirSync(stage);
     run("ditto", ["-x", "-k", archive, stage]);
     macAppBundle = path.join(stage, "Codex Web GPT MultiDevice.app");
-    executable = path.join(macAppBundle, "Contents", "MacOS", "Codex Web GPT");
+    executable = path.join(macAppBundle, "Contents", "MacOS", launcherManifest.build.productName);
     command = executable;
     args = ["--launcher-smoke-test"];
   } else if (process.platform === "linux") {

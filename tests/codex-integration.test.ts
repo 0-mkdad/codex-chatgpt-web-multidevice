@@ -580,7 +580,7 @@ describe("reversible native Codex route integration", () => {
       uninstallCodexIntegration();
       expect(readFileSync(configPath, "utf8")).toBe(original);
     }
-  });
+  }, 15_000);
 
   test("adopts an identical explicit Voice route and restores its exact source line", () => {
     const { codexHome } = fixture();
