@@ -135,6 +135,17 @@ ChatGPT turn. Common causes include an account-side rate limit, ChatGPT's own "S
 state, a changed UI control, a closed browser surface, a conflicting route, or a tool that exceeded
 its bounded MCP deadline.
 
+For an automatic browser turn, a client-side disconnect does not submit the prompt again blindly.
+Once ChatGPT has accepted the submission, the bridge keeps a journal of the active round, sends
+stream heartbeats while the browser is working, and lets the next native retry replay the recorded
+events or continue the same browser session. This also covers tool-capable turns and subagent
+notifications. If the disconnect happened before ChatGPT confirmed the send, the bridge will not
+guess whether the prompt was accepted; retry from a fresh task to avoid duplicate work.
+
+For long-running subagent work, start with one concurrent agent thread per session and increase it
+only after the account remains stable. Multiple browser streams can trigger ChatGPT-side limits
+even when the local bridge is healthy.
+
 - Read the final detailed error after the reconnect attempts; do not report only the word
   `Reconnecting`.
 - Retry once in a fresh Codex task. State whether the fresh task works and whether the failure is
