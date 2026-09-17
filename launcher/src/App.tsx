@@ -1241,6 +1241,7 @@ function McpSurface({
   );
   const [tunnelId, setTunnelId] = useState("");
   const [runtimeKey, setRuntimeKey] = useState("");
+  const [connectorName, setConnectorName] = useState(snapshot.connectorNames.automatic);
   const [credentialsConfigured, setCredentialsConfigured] = useState(
     interactionMode === snapshot.state.browserInteractionMode
       ? snapshot.mcpCredentialsConfigured
@@ -1290,6 +1291,7 @@ function McpSurface({
     try {
       await api!.setupMcp({
         interactionMode,
+        connectorName: connectorName.trim(),
         ...(credentialsConfigured && !replacingCredentials
           ? { replace: false }
           : { tunnelId, runtimeKey, replace: true }),
@@ -1381,6 +1383,16 @@ function McpSurface({
                   {copy.openKeys}
                 </SecondaryButton>
               </div>
+            ) : null}
+            {step === 1 ? (
+              <FieldRow label={copy.connectorName}>
+                <input
+                  autoCorrect="off"
+                  disabled={busy}
+                  onChange={(event) => setConnectorName(event.target.value)}
+                  value={connectorName}
+                />
+              </FieldRow>
             ) : null}
             {step === 1 ? (
               credentialsConfigured && !replacingCredentials ? (

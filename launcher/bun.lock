@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "codex-web-gpt-launcher",
+      "name": "codex-web-gpt-multidevice-launcher",
       "dependencies": {
         "motion": "^12.42.2",
         "react": "^19.0.0",

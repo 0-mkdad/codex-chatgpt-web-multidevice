@@ -23,6 +23,16 @@ export const CHATGPT_CONNECTOR_NAME = "Codex Native2";
 export const DEV_CHATGPT_CONNECTOR_NAME = `${CHATGPT_CONNECTOR_NAME} DEV`;
 export const ZERO_RISK_CHATGPT_CONNECTOR_NAME = "Codex Zero Risk";
 export const LEGACY_CHATGPT_CONNECTOR_NAMES = ["Codex Native"] as const;
+export const MAX_CONNECTOR_NAME_LENGTH = 80;
+
+export function normalizeConnectorName(value: unknown, label = "connector name"): string {
+  if (typeof value !== "string") throw new Error(`Invalid ${label}`);
+  const normalized = value.trim();
+  if (!normalized || normalized.length > MAX_CONNECTOR_NAME_LENGTH || /[\u0000-\u001F\u007F]/.test(normalized)) {
+    throw new Error(`Invalid ${label}`);
+  }
+  return normalized;
+}
 
 export function isLegacyChatGptConnectorName(value: string): boolean {
   return (LEGACY_CHATGPT_CONNECTOR_NAMES as readonly string[]).includes(value);
@@ -44,8 +54,11 @@ export interface InteractionConnectorIdentities {
 export function resolveInteractionConnectorIdentities(
   interactionMode: BrowserInteractionMode,
   profile: "production" | "development" = "production",
+  configuredAutomaticName?: string,
 ): InteractionConnectorIdentities {
-  const automaticAppName = profile === "development" ? DEV_CHATGPT_CONNECTOR_NAME : CHATGPT_CONNECTOR_NAME;
+  const automaticAppName = profile === "development"
+    ? DEV_CHATGPT_CONNECTOR_NAME
+    : normalizeConnectorName(configuredAutomaticName ?? CHATGPT_CONNECTOR_NAME, "automatic connector name");
   return {
     appName: interactionMode === "manual" ? ZERO_RISK_CHATGPT_CONNECTOR_NAME : automaticAppName,
     automaticAppName,
@@ -408,21 +421,19 @@ function parseConfig(value: unknown, path: string): AppConfig {
   for (const key of requiredStrings) {
     if (typeof parsed[key] !== "string" || !(parsed[key] as string).trim()) throw new Error(`Missing ${key} in ${path}`);
   }
-  if (parsed.appName!.length > 80) throw new Error(`appName is too long in ${path}`);
+  const configuredAppName = normalizeConnectorName(parsed.appName, "appName");
   const automaticAppName = parsed.automaticAppName
-    ?? (browserInteractionMode === "automatic" ? parsed.appName : CHATGPT_CONNECTOR_NAME);
+    ?? (browserInteractionMode === "automatic" ? configuredAppName : CHATGPT_CONNECTOR_NAME);
+  const normalizedAutomaticAppName = normalizeConnectorName(automaticAppName, "automaticAppName");
   const manualAppName = parsed.manualAppName ?? ZERO_RISK_CHATGPT_CONNECTOR_NAME;
-  if (typeof automaticAppName !== "string" || !automaticAppName.trim() || automaticAppName.length > 80) {
-    throw new Error(`Invalid automaticAppName in ${path}`);
-  }
   if (manualAppName !== ZERO_RISK_CHATGPT_CONNECTOR_NAME) {
     throw new Error(`manualAppName must be ${JSON.stringify(ZERO_RISK_CHATGPT_CONNECTOR_NAME)} in ${path}`);
   }
-  if (automaticAppName === manualAppName) {
+  if (normalizedAutomaticAppName === manualAppName) {
     throw new Error(`Automatic and Zero Risk connector names must differ in ${path}; rerun setup`);
   }
-  const expectedAppName = browserInteractionMode === "manual" ? manualAppName : automaticAppName;
-  if (parsed.appName !== expectedAppName) {
+  const expectedAppName = browserInteractionMode === "manual" ? manualAppName : normalizedAutomaticAppName;
+  if (configuredAppName !== expectedAppName) {
     throw new Error(`Active appName does not match browserInteractionMode in ${path}; rerun setup`);
   }
   if (parsed.browserHost === "launcher"
@@ -527,7 +538,7 @@ function parseConfig(value: unknown, path: string): AppConfig {
   return {
     ...parsed,
     appName: expectedAppName,
-    automaticAppName,
+    automaticAppName: normalizedAutomaticAppName,
     manualAppName,
     browserInteractionMode,
     subagentProtocol,

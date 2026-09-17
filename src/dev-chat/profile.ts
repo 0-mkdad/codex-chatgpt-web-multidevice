@@ -21,7 +21,7 @@ export interface DevProfilePaths {
   configPath: string;
 }
 
-const WINDOWS_LAUNCHER_GUID = "d1a6026a-6210-588e-9a2b-da3936f94e02";
+const WINDOWS_LAUNCHER_GUID = "7f4d5fd5-8b96-4d1d-ae3a-8c3f3c88a2b1";
 
 function registeredWindowsLauncherInstallLocation(): string | undefined {
   try {
@@ -128,8 +128,8 @@ export function installedLauncherCandidates({
   const targetPath = platform === "win32" ? win32 : posix;
   if (platform === "darwin") {
     candidates.push(
-      "/Applications/Codex Web GPT.app/Contents/MacOS/Codex Web GPT",
-      posix.join(homeDirectory, "Applications", "Codex Web GPT.app", "Contents", "MacOS", "Codex Web GPT"),
+      "/Applications/Codex Web GPT MultiDevice.app/Contents/MacOS/Codex Web GPT MultiDevice",
+      posix.join(homeDirectory, "Applications", "Codex Web GPT MultiDevice.app", "Contents", "MacOS", "Codex Web GPT MultiDevice"),
     );
   } else if (platform === "win32") {
     const registeredLocation = windowsInstallLocation?.trim()

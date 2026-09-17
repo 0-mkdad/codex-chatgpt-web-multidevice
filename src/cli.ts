@@ -72,6 +72,7 @@ Setup options:
                                Re-read the authenticated account's available Web models
   --tunnel-id ID               Existing OpenAI tunnel id (full mode)
   --runtime-key-file PATH      File containing a Tunnels Read+Use runtime key
+  --connector-name NAME        Automatic ChatGPT connector name (default: Codex Native2)
   --replace-codex-route        Reversibly replace existing Responses or Voice route settings
   --subagent-protocol MODE     compatibility-v1 (default) or native (advanced)
   --restart-service            Explicitly restart this project's daemon after an update
@@ -290,6 +291,7 @@ async function setupCommand(args: string[]): Promise<void> {
   }
   const tunnelId = takeOption(args, "--tunnel-id");
   const runtimeKeyFile = takeOption(args, "--runtime-key-file");
+  const connectorName = takeOption(args, "--connector-name");
   const chrome = takeOption(args, "--chrome");
   const browserHostDescriptorPath = takeOption(args, "--browser-host-descriptor");
   if (chrome) options.chromeExecutablePath = chrome;
@@ -297,6 +299,7 @@ async function setupCommand(args: string[]): Promise<void> {
   options.refreshAccountCapabilities = takeFlag(args, "--refresh-account-capabilities");
   if (tunnelId) options.tunnelId = tunnelId;
   if (runtimeKeyFile) options.runtimeKeyFile = runtimeKeyFile;
+  if (connectorName !== undefined) options.automaticAppName = connectorName;
   options.forceLogin = takeFlag(args, "--login");
   options.autoApproveToolCalls = takeFlag(args, "--auto-approve-tool-calls");
   const skillAttachments = takeFlag(args, "--skill-attachments");

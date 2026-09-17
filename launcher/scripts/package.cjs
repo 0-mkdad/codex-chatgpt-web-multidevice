@@ -65,7 +65,12 @@ function verifySignedMacArchive() {
   try {
     runChecked("ditto", ["-x", "-k", path.join(staging, archives[0]), verificationRoot]);
     const appBundle = path.join(verificationRoot, `${launcherManifest.build.productName}.app`);
-    runChecked("codesign", ["--verify", "--deep", "--strict", appBundle]);
+    // Signed releases must use codesign --verify --deep --strict. PR builds are
+    // intentionally unsigned, and macOS can reject verification of the
+    // ad-hoc bundle produced by electron-builder even though packaging worked.
+    if (env.CSC_LINK || env.CSC_NAME) {
+      runChecked("codesign", ["--verify", "--deep", "--strict", appBundle]);
+    }
     validateRuntimeBundle(path.join(appBundle, "Contents", "Resources", "runtime"), {
       version: launcherManifest.version,
       platform: "darwin",

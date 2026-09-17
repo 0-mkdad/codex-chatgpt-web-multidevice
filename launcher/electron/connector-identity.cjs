@@ -3,7 +3,7 @@ const DEV_CONNECTOR_NAME = `${CURRENT_CONNECTOR_NAME} DEV`;
 const LEGACY_CONNECTOR_NAMES = Object.freeze(["Codex Native"]);
 
 function validateConnectorName(value) {
-  if (typeof value !== "string" || !value.trim() || value.length > 80) {
+  if (typeof value !== "string" || !value.trim() || value.trim().length > 80 || /[\u0000-\u001F\u007F]/.test(value)) {
     throw new Error("Connector name is invalid");
   }
   return value.trim();

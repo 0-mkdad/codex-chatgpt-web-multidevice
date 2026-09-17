@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -13,6 +13,7 @@ import {
   installedBunExecutable,
   loadConfig,
   loadConfigForSetup,
+  normalizeConnectorName,
   providerConfig,
   resolveBrokerEndpoint,
   resolveInteractionConnectorIdentities,
@@ -30,6 +31,30 @@ const roots: string[] = [];
 afterEach(() => {
   delete process.env.CODEX_CHATGPT_WEB_HOME;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+test("connector identities normalize safely and preserve custom automatic names", () => {
+  expect(normalizeConnectorName("  Mohammad Laptop Connector  ")).toBe("Mohammad Laptop Connector");
+  expect(() => normalizeConnectorName("   ")).toThrow("Invalid connector name");
+  expect(() => normalizeConnectorName("bad\nname")).toThrow("Invalid connector name");
+  expect(() => normalizeConnectorName("x".repeat(81))).toThrow("Invalid connector name");
+  expect(resolveInteractionConnectorIdentities("automatic", "production", "Mohammad Laptop Connector"))
+    .toMatchObject({ appName: "Mohammad Laptop Connector", automaticAppName: "Mohammad Laptop Connector" });
+});
+
+test("configuration reload preserves a custom automatic connector across setup", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-custom-connector-"));
+  roots.push(root);
+  process.env.CODEX_CHATGPT_WEB_HOME = root;
+  const config = defaultConfig("browser-only");
+  config.appName = "Mohammad Laptop Connector";
+  config.automaticAppName = config.appName;
+  writeFileSync(join(root, "config.json"), JSON.stringify(config));
+  expect(loadConfigForSetup()).toMatchObject({
+    appName: "Mohammad Laptop Connector",
+    automaticAppName: "Mohammad Laptop Connector",
+    manualAppName: ZERO_RISK_CHATGPT_CONNECTOR_NAME,
+  });
 });
 
 test("managed runtime commands reject every ephemeral path component", () => {

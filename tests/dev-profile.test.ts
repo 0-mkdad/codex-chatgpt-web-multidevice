@@ -73,8 +73,8 @@ test("installed launcher discovery has explicit platform candidates", () => {
     homeDirectory: "/Users/tester",
     environment: {},
   })).toEqual([
-    "/Applications/Codex Web GPT.app/Contents/MacOS/Codex Web GPT",
-    "/Users/tester/Applications/Codex Web GPT.app/Contents/MacOS/Codex Web GPT",
+    "/Applications/Codex Web GPT MultiDevice.app/Contents/MacOS/Codex Web GPT MultiDevice",
+    "/Users/tester/Applications/Codex Web GPT MultiDevice.app/Contents/MacOS/Codex Web GPT MultiDevice",
   ]);
   expect(installedLauncherCandidates({
     platform: "linux",
