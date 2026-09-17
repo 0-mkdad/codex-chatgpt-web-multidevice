@@ -396,6 +396,22 @@ test("launcher update transaction upgrades its owned full runtime with saved con
   });
 });
 
+test("launcher runtime upgrade preserves a custom automatic connector name", async () => {
+  const fixture = hostFor({
+    mode: "full",
+    browserHost: "launcher",
+    appName: "My Codex Connector",
+    automaticAppName: "My Codex Connector",
+    releaseVersion: "1.1.1",
+  });
+  fixture.host.bridgeStatus = async () => ({ installed: true, active: true, errors: [] });
+
+  await fixture.host.upgradeManagedRuntime();
+
+  assert.equal(fixture.invocation().args.at(-2), "--connector-name");
+  assert.equal(fixture.invocation().args.at(-1), "My Codex Connector");
+});
+
 test("launcher migrates the legacy connector identity even when the release version is unchanged", async () => {
   const fixture = hostFor({
     mode: "full",

@@ -29,7 +29,7 @@ const en = {
   chooseLanguageHint: "You can change this later in Settings.",
   continue: "Continue",
   supportTitle: "Before we start",
-  supportBody: "Star the repository and open my X profile to help more developers find Codex Web GPT. I share product updates and useful Codex tips on X.",
+  supportBody: "Star the repository and open my X profile to help more developers find Codex Web GPT. I share project updates and useful Codex tips on X.",
   star: "Star on GitHub",
   starred: "GitHub opened",
   follow: "Open my X",

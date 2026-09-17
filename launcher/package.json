@@ -1,9 +1,9 @@
 {
   "name": "codex-web-gpt-multidevice-launcher",
-  "version": "5.0.9",
+  "version": "5.0.10",
   "private": true,
   "description": "Desktop control center for the Codex ChatGPT Web MultiDevice fork",
-  "author": "miuuyy",
+  "author": "0-mkdad",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {

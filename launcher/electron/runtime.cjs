@@ -910,7 +910,7 @@ class RuntimeHost {
     }
     return this.launcherProfile === "development"
       ? connectorNameForDevSetup(current.config?.appName)
-      : requireCurrentRuntimeConnectorName(current.config?.appName);
+      : requireCurrentRuntimeConnectorName(current.config?.automaticAppName ?? current.config?.appName);
   }
 
   browserConnectorName() {
@@ -1207,6 +1207,13 @@ class RuntimeHost {
       "--acknowledge-unofficial",
       "--restart-service",
     ];
+    const configuredConnectorName = existing.config?.automaticAppName ?? existing.config?.appName;
+    if (existing.mode === "full"
+      && typeof configuredConnectorName === "string"
+      && configuredConnectorName !== CURRENT_CONNECTOR_NAME
+      && !isLegacyConnectorName(configuredConnectorName)) {
+      args.push("--connector-name", configuredConnectorName);
+    }
     const result = await this.runSetup("runtime-upgrade", args, {
       message: tunnelProfileMigrationRequired
         ? `Separating ${interactionMode === "manual" ? "Zero Risk" : "Automatic"} MCP credentials`
