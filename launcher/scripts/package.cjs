@@ -65,8 +65,9 @@ function verifySignedMacArchive() {
   try {
     runChecked("ditto", ["-x", "-k", path.join(staging, archives[0]), verificationRoot]);
     const appBundle = path.join(verificationRoot, `${launcherManifest.build.productName}.app`);
-    const verificationArgs = ["--verify", "--deep"];
-    if (env.CSC_LINK || env.CSC_NAME) verificationArgs.push("--strict");
+    // Signed releases must use codesign --verify --deep --strict; PR builds use ad-hoc signing.
+    const verificationArgs = ["--verify", "--deep", "--strict"];
+    if (!env.CSC_LINK && !env.CSC_NAME) verificationArgs.pop();
     runChecked("codesign", [...verificationArgs, appBundle]);
     validateRuntimeBundle(path.join(appBundle, "Contents", "Resources", "runtime"), {
       version: launcherManifest.version,
