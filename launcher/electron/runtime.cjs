@@ -923,7 +923,14 @@ class RuntimeHost {
   }
 
   setupConnectorName() {
-    return this.launcherProfile === "development" ? DEV_CONNECTOR_NAME : CURRENT_CONNECTOR_NAME;
+    const current = this.runtimeConfigSnapshot();
+    if (this.launcherProfile === "development") {
+      return connectorNameForDevSetup(current.config?.appName);
+    }
+    if (current.configured) {
+      return connectorNameForSetup(current.config?.automaticAppName ?? current.config?.appName);
+    }
+    return CURRENT_CONNECTOR_NAME;
   }
 
   cancelActiveTurns() {
@@ -1219,7 +1226,7 @@ class RuntimeHost {
     };
   }
 
-  setupMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode } = {}, afterRuntimeReady) {
+  setupMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode, connectorName } = {}, afterRuntimeReady) {
     this.assertProductionProfile("Native Codex MCP setup");
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const targetMode = interactionMode ?? this.browserInteractionMode();
@@ -1238,6 +1245,7 @@ class RuntimeHost {
       ...this.browserInteractionArgs({ mode: targetMode }),
       "--replace-codex-route",
     ];
+    if (connectorName !== undefined) args.push("--connector-name", connectorName);
     if (reuseSavedCredentials) {
       args.push("--acknowledge-unofficial", "--restart-service");
       return this.runSetup("mcp-setup", args, {

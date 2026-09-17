@@ -82,7 +82,7 @@ try {
     const stage = path.join(scratch, "stage");
     fs.mkdirSync(stage);
     run("ditto", ["-x", "-k", archive, stage]);
-    macAppBundle = path.join(stage, "Codex Web GPT.app");
+    macAppBundle = path.join(stage, "Codex Web GPT MultiDevice.app");
     executable = path.join(macAppBundle, "Contents", "MacOS", "Codex Web GPT");
     command = executable;
     args = ["--launcher-smoke-test"];

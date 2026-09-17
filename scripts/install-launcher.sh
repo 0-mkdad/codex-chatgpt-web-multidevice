@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPOSITORY="${CODEX_WEB_GPT_REPOSITORY:-miuuyy/codex-chatgpt-web}"
+REPOSITORY="${CODEX_WEB_GPT_REPOSITORY:-0-mkdad/codex-chatgpt-web-multidevice}"
 VERSION="${CODEX_WEB_GPT_VERSION:-}"
 OS="$(uname -s)"
 MACHINE="$(uname -m)"
@@ -47,7 +47,7 @@ case "$VERSION" in
   *[!A-Za-z0-9._-]*) echo "Invalid release version: $VERSION" >&2; exit 1 ;;
 esac
 
-ASSET="codex-web-gpt-$VERSION-$PLATFORM-$ARCH.$EXTENSION"
+ASSET="codex-web-gpt-multidevice-$VERSION-$PLATFORM-$ARCH.$EXTENSION"
 BASE_URL="https://github.com/$REPOSITORY/releases/download/v$VERSION"
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-web-gpt-launcher.XXXXXX")"
 trap 'rm -rf "$TEMP_DIR"' EXIT HUP INT TERM
@@ -76,8 +76,8 @@ if [ "$OS" = "Darwin" ]; then
   STAGE_DIR="$TEMP_DIR/stage"
   mkdir "$STAGE_DIR"
   ditto -x -k "$TEMP_DIR/$ASSET" "$STAGE_DIR"
-  SOURCE_APP="$STAGE_DIR/Codex Web GPT.app"
-  if [ ! -d "$SOURCE_APP" ] || [ ! -x "$SOURCE_APP/Contents/MacOS/Codex Web GPT" ]; then
+  SOURCE_APP="$STAGE_DIR/Codex Web GPT MultiDevice.app"
+  if [ ! -d "$SOURCE_APP" ] || [ ! -x "$SOURCE_APP/Contents/MacOS/Codex Web GPT MultiDevice" ]; then
     echo "Launcher archive is incomplete" >&2
     exit 1
   fi
@@ -85,12 +85,12 @@ if [ "$OS" = "Darwin" ]; then
     INSTALL_DIR="$HOME/Applications"
     mkdir -p "$INSTALL_DIR"
   fi
-  TARGET_APP="$INSTALL_DIR/Codex Web GPT.app"
-  if pgrep -x "Codex Web GPT" >/dev/null 2>&1; then
-    echo "Quit Codex Web GPT before updating it" >&2
+  TARGET_APP="$INSTALL_DIR/Codex Web GPT MultiDevice.app"
+  if pgrep -x "Codex Web GPT MultiDevice" >/dev/null 2>&1; then
+    echo "Quit Codex Web GPT MultiDevice before updating it" >&2
     exit 1
   fi
-  BACKUP_APP="$TEMP_DIR/Codex Web GPT.previous.app"
+  BACKUP_APP="$TEMP_DIR/Codex Web GPT MultiDevice.previous.app"
   if [ -e "$TARGET_APP" ]; then mv "$TARGET_APP" "$BACKUP_APP"; fi
   if ! ditto "$SOURCE_APP" "$TARGET_APP"; then
     rm -rf "$TARGET_APP"

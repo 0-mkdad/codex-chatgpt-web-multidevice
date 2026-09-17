@@ -154,6 +154,7 @@ export interface LauncherApi {
     runtimeKey?: string;
     replace?: boolean;
     interactionMode?: BrowserInteractionMode;
+    connectorName?: string;
   }): Promise<{ ok: boolean; stdout: string }>;
   setMcpStep(step: number): Promise<LauncherState>;
   setAutostart(enabled: boolean): Promise<{ state: LauncherState; supported: boolean; enabled: boolean }>;
