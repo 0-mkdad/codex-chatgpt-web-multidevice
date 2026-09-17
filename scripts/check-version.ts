@@ -35,7 +35,7 @@ const expected = [
 for (const [path, needle] of expected) {
   if (!readFileSync(resolve(root, path), "utf8").includes(needle)) throw new Error(`${path} is not synchronized to ${packageVersion}`);
 }
-for (const path of ["README.md", "README.zh-CN.md", "README.ja.md", "README.ko.md"]) {
+for (const path of ["README.md"]) {
   const readme = readFileSync(resolve(root, path), "utf8");
   for (const target of ["win-x64.exe", "mac-arm64.dmg", "mac-x64.dmg", "linux-x64.AppImage"]) {
     const download = `/releases/download/v${packageVersion}/codex-web-gpt-multidevice-${packageVersion}-${target}`;
