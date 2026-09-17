@@ -3,17 +3,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/download/v5.0.8/codex-web-gpt-multidevice-5.0.8-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/download/v5.0.8/codex-web-gpt-multidevice-5.0.8-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/download/v5.0.8/codex-web-gpt-multidevice-5.0.8-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases">Downloads and releases</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/download/v5.0.8/codex-web-gpt-multidevice-5.0.8-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/latest">All releases</a>
-</p>
-
-<p align="center">
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ko.md">한국어</a>
+  <a href="README.md">English</a>
 </p>
 
 <p align="center">
@@ -27,6 +21,14 @@
 Use the ChatGPT Web models available on your account, including Pro, from Codex’s native model picker—with ChatGPT Web’s separate usage limits, without spending your Work or Codex quota. Keep the same interface, tasks, images, and streaming.
 
 Full harness mode connects ChatGPT to the current task’s files, terminal, tools, and approvals through MCP. Conversations stay tied to your Codex task, so you can keep working as the context grows.
+
+## Project relationship
+
+This repository is an independent fork and ongoing extension of the existing open-source
+[miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web) project. It is not an
+original implementation created from scratch by the current maintainer. Upstream attribution,
+the original license, and the upstream project’s terms remain applicable; the changes maintained
+here are documented in [FORK_CHANGES.md](FORK_CHANGES.md).
 
 <div id="get-started"><a id="quick-start"></a></div>
 
@@ -46,17 +48,7 @@ The app includes its browser and runtime. No separate Chrome, Node, or Bun insta
 
 Quit the launcher before updating. These installers select the platform and architecture, verify the published checksums, and preserve your ChatGPT profile and launcher settings.
 
-**macOS / Linux**
-
-```bash
-curl -fsSL https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/latest/download/install-launcher.sh | sh
-```
-
-**Windows PowerShell**
-
-```powershell
-irm https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/latest/download/install-launcher.ps1 | iex
-```
+Download the installer for your platform from the [latest release page](https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/latest). The release page is the source of truth for currently published assets; do not assume that every platform asset exists in every release.
 
 </details>
 
@@ -165,7 +157,7 @@ and workspace policies; it does not bypass authentication or access controls.
 
 ```bash
 git clone https://github.com/0-mkdad/codex-chatgpt-web-multidevice.git && \
-cd codex-chatgpt-web && \
+cd codex-chatgpt-web-multidevice && \
 bun run app
 ```
 

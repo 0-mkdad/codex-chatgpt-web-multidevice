@@ -1,6 +1,9 @@
 # MultiDevice fork
 
-This public fork keeps upstream attribution and the MIT license while adding a safe per-install connector identity and isolated desktop packaging.
+This public fork is an independent extension of the existing open-source
+[miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web) project. It keeps upstream
+attribution and the MIT license while adding a safe per-install connector identity and isolated
+desktop packaging. It does not claim authorship of the original application.
 
 ## Connector identity
 
@@ -17,6 +20,7 @@ The launcher uses a distinct Electron app ID, NSIS GUID, product name, artifact 
 ## Upstream synchronization
 
 ```text
+git remote add upstream https://github.com/miuuyy/codex-chatgpt-web.git
 git fetch upstream
 git merge upstream/main
 ```

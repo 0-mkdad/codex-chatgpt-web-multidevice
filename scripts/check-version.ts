@@ -34,12 +34,13 @@ const expected = [
 for (const [path, needle] of expected) {
   if (!readFileSync(resolve(root, path), "utf8").includes(needle)) throw new Error(`${path} is not synchronized to ${packageVersion}`);
 }
-for (const path of ["README.md"]) {
-  const readme = readFileSync(resolve(root, path), "utf8");
-  for (const target of ["win-x64.exe", "mac-arm64.dmg", "mac-x64.dmg", "linux-x64.AppImage"]) {
-    const download = `/releases/download/v${packageVersion}/codex-web-gpt-multidevice-${packageVersion}-${target}`;
-    if (!readme.includes(download)) throw new Error(`${path} download for ${target} is not synchronized to ${packageVersion}`);
-  }
+const readme = readFileSync(resolve(root, "README.md"), "utf8");
+const releasePage = "https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/latest";
+if (!readme.includes(releasePage)) {
+  throw new Error("README.md must link to the repository's latest release page");
+}
+if (readme.includes("/releases/download/")) {
+  throw new Error("README.md must not claim platform download assets that may not be published");
 }
 const releaseWorkflow = readFileSync(resolve(root, ".github/workflows/release.yml"), "utf8");
 if (releaseWorkflow.split(`bun-version: ${bunVersion}`).length - 1 !== 2) {
