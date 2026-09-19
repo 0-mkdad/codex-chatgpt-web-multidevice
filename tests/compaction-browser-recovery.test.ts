@@ -1,14 +1,17 @@
 import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
+import { chatGptBrowserTabClosedError } from "../src/adapters/chatgpt-web/adapter-error";
 import { resolveChatGptWebModelMode } from "../src/adapters/chatgpt-web/model";
 import { ChatGptExternalTurnProgress } from "../src/adapters/chatgpt-web/turn-progress";
 
 test.each([[true, false, true], [false, false, true], [true, true, true], [true, false, false]])("browser turns preserve recovery, ordering and final-only tools (owned=%s, tools=%s, multipart=%s)", async (owned, tools, multipart) => {
   const diagnostics = mkdtempSync(join(tmpdir(), "compaction-observation-"));
-  const finalResponse = new Error("fixture reached final response observation");
+  const cancellationCase = owned && !tools && !multipart;
+  const finalResponse = cancellationCase ? chatGptBrowserTabClosedError() : new Error("fixture reached final response observation");
   const capabilities = { localToolsEnabled: tools, solAvailable: true, extraHighAvailable: true, proAvailable: true };
   const progress = tools ? new ChatGptExternalTurnProgress() : undefined;
   const recoveryCallbacks: unknown[] = [];
@@ -16,7 +19,9 @@ test.each([[true, false, true], [false, false, true], [true, true, true], [true,
   const sendBudgets: number[] = [];
   let stage = "";
   let released = false;
-  const page = { evaluate: async () => ({}), isClosed: () => false };
+  let activated = 0;
+  const frame = {};
+  const page = Object.assign(new EventEmitter(), { evaluate: async () => ({}), isClosed: () => false, mainFrame: () => frame });
   const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
     config: { appName: "Codex Native2", browserDiagnosticsPath: diagnostics, ...(owned ? { browserHostDescriptorPath: "owned-descriptor" } : {}) },
     runStage: async (_trace: string, name: string, timeout: number, action: (signal: AbortSignal) => Promise<unknown>) => {
@@ -42,7 +47,18 @@ test.each([[true, false, true], [false, false, true], [true, true, true], [true,
     sendAttachedPrompt: async (...args: unknown[]) => {
       // Context ingestion cannot mistake tool activity for acknowledgement of a part.
       expect(args[4]).toBe(stage === "send" ? progress : undefined);
-      if (stage !== "send") expect(args[5]).toBeUndefined();
+      const lifecycle = args[5] as { onSendActivated(): Promise<void>; onSubmitted?: () => void };
+      if (stage !== "send") expect(lifecycle.onSubmitted).toBeUndefined();
+      await lifecycle.onSendActivated();
+      if (cancellationCase) {
+        // An observed size rejection must not replace the user's explicit tab-close verdict.
+        const request = { method: () => "POST", url: () => "https://chatgpt.com/backend-api/f/conversation", frame: () => frame };
+        page.emit("request", request);
+        page.emit("response", {
+          request: () => request, status: () => 413, headers: () => ({ "content-type": "application/json" }),
+          json: async () => ({ detail: { code: "message_length_exceeds_limit" } }),
+        });
+      }
       recoveryCallbacks.push(args[7]);
       actions.push("send");
       return "user_turn";
@@ -61,6 +77,7 @@ test.each([[true, false, true], [false, false, true], [true, true, true], [true,
       traceId: "compaction_recovery_fixture",
       modelId: "gpt-5.6-sol",
       reasoning: "high",
+      onSendActivated: () => { activated += 1; },
       capabilities,
       compaction: !tools,
       externalProgress: progress,
@@ -84,6 +101,9 @@ test.each([[true, false, true], [false, false, true], [true, true, true], [true,
     ]);
     expect(sendBudgets).toEqual(multipart ? [180_000, 180_000, 180_000] : [20_000]);
     expect(released).toBe(true);
+    expect(activated).toBe(1);
+    expect(page.listenerCount("request")).toBe(0);
+    expect(page.listenerCount("response")).toBe(0);
   } finally {
     rmSync(diagnostics, { recursive: true, force: true });
   }

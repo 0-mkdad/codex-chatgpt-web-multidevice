@@ -41,6 +41,18 @@ test("multipart selection accounts for whole-record and composer fit before subm
         .toEqual([...contents]);
     }
   }
+  // Low-token text can still exceed the reasoning model's server character ceiling.
+  // Stage the complete record instead of sending it inline or dropping its contents.
+  const sparsePro = request("x".repeat(600_000));
+  expect(resolveBiggerContextMultipartParts(sparsePro, capabilities)).toBe(2);
+  const stagedPro = compileChatGptWebPrompt(sparsePro, capabilities, undefined, { experimentalMultipartParts: 2 });
+  expect(stagedPro.multipart!.parts.flatMap(part => JSON.parse(part).records).map(record => record.message.content))
+    .toEqual([sparsePro.context.messages[0]!.content]);
+  const proMessages = compiledChatGptWebMessages(stagedPro);
+  expect(proMessages[1]!.length).toBeLessThanOrEqual(500_000);
+  expect(resolveChatGptWebMultipartStagingMode(
+    "gpt-5.6-sol", capabilities, estimateTokens(proMessages[0]!), proMessages[0]!.length,
+  ).effort).toBe("max");
 }, 60_000);
 
 test("Bigger Context compaction selects three parts before the legacy inline byte budget", () => {
