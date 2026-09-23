@@ -20,7 +20,7 @@ import {
 import { namespacedToolName, type AdapterEvent, type CodexContentPart, type CodexParsedRequest, type CodexProviderConfig, type CodexToolResultMessage, type CodexUsage } from "../../types";
 import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
-import { ChatGptWebAdapterError } from "./adapter-error";
+import { ChatGptRecoveryExhaustedError, ChatGptWebAdapterError } from "./adapter-error";
 import { ChatGptBrowserWorker } from "./browser-worker";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity, priorChatGptAbortedTurnIds } from "./environment";
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
@@ -29,7 +29,7 @@ import { createChatGptStructuredOutputValidator } from "./output-validation";
 import { classifyChatGptRecovery } from "./recovery-classification";
 import { chatGptWebTurnRetryPolicy } from "./retry-policy";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult, type TurnBrokerOwner } from "./turn-broker";
-import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnRoundKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
+import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnLifecycleProgress, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnRoundKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
 import { estimateChatGptWebUsage, resolveBiggerContextMultipartParts } from "./usage";
 import { ChatGptThreadEnvironmentStore } from "./thread-environment";
 import {
@@ -303,6 +303,10 @@ function submittedTurnFailure(session: ChatGptTurnSession, error: unknown): Erro
   // after Send activation cannot prove that ChatGPT rejected the prompt, so retrying it could
   // duplicate side effects. Preserve only explicitly terminal provider classifications.
   if (!phase || phase === "prepared") return normalized;
+  // The browser worker emits this only after bounded same-owner recovery has already been
+  // exhausted. Keep the structured classification intact so the outer lifecycle retires the
+  // unrecoverable owner/tools explicitly instead of misreporting them as preservable.
+  if (normalized instanceof ChatGptRecoveryExhaustedError) return normalized;
   if (normalized instanceof ChatGptWebAdapterError) {
     if (normalized.submissionRejected || !normalized.retryable) return normalized;
     if (normalized.status === 429 || normalized.code === "rate_limit_exceeded") {
@@ -414,11 +418,10 @@ export function createChatGptWebAdapter(
       ? resolve(expandUserPath(provider.chatgptWeb.lunaCheckpointStatePath))
       : undefined,
   );
-  const turnJournal = new ChatGptTurnJournal(
-    provider.chatgptWeb?.turnJournalStatePath
-      ? resolve(expandUserPath(provider.chatgptWeb.turnJournalStatePath))
-      : undefined,
-  );
+  const turnJournalStatePath = provider.chatgptWeb?.turnJournalStatePath
+    ? resolve(expandUserPath(provider.chatgptWeb.turnJournalStatePath))
+    : undefined;
+  const turnJournal = new ChatGptTurnJournal(turnJournalStatePath);
   const currentUsageInput = (parsed: CodexParsedRequest): CodexParsedRequest => (
     parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID && !parsed._compactionRequest
       ? lunaCheckpointStore.apply(parsed).parsed
@@ -433,7 +436,10 @@ export function createChatGptWebAdapter(
     hooks: {
       onCompactionProgress?: () => void;
       onSubmissionActivated?: (conversationKey?: string) => void;
+      onSendDispatchAttempted?: () => void;
       onSubmissionAccepted?: (conversationKey?: string) => void;
+      beforePhysicalSubmission?: () => void | Promise<void>;
+      onRateLimitPressure?: (error: ChatGptWebAdapterError) => void | Promise<void>;
     } = {},
   ): ChatGptTurnRuntime => {
     const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
@@ -510,6 +516,21 @@ export function createChatGptWebAdapter(
     });
     const trace = new ChatGptTraceFeed();
     const text = new ChatGptTextFeed();
+    const lifecycleProgress = new ChatGptTurnLifecycleProgress();
+    const recordBrowserProgress = () => lifecycleProgress.record("browser");
+    const recordRecovery = () => lifecycleProgress.record("recovery");
+    const pushReasoning = (value: string, continuation?: boolean) => {
+      lifecycleProgress.record("response");
+      trace.push({ kind: "reasoning", text: value, ...(continuation ? { continuation: true } : {}) });
+    };
+    const pushCommentary = (value: string, continuation?: boolean) => {
+      lifecycleProgress.record("response");
+      trace.push({ kind: "commentary", text: value, ...(continuation ? { continuation: true } : {}) });
+    };
+    const pushText = (delta: string) => {
+      lifecycleProgress.record("response");
+      text.push(delta);
+    };
     const observedCapabilityTokens = new Set<string>();
     const observeCapabilityRetirement = (
       turnToken: string,
@@ -541,6 +562,7 @@ export function createChatGptWebAdapter(
           hooks.onSubmissionActivated?.(conversationKey);
           submission.phase = "send_activated" as const;
         },
+        onSendDispatchAttempted: () => hooks.onSendDispatchAttempted?.(),
       } : {}),
       onSubmitted: () => {
         if (!parsed._compactionRequest) submission.phase = "accepted";
@@ -734,12 +756,16 @@ export function createChatGptWebAdapter(
           release: () => {},
         }),
         abortSignal: browserAbort.signal,
+        ...hooks.beforePhysicalSubmission ? { beforePhysicalSubmission: hooks.beforePhysicalSubmission } : {},
+        ...hooks.onRateLimitPressure ? { onRateLimitPressure: hooks.onRateLimitPressure } : {},
         ...(parsed._compactionRequest ? { compaction: true } : {}),
         ...submissionLifecycle,
         ...multipartProgressLifecycle,
-        onReasoningSummary: (text, continuation) => trace.push({ kind: "reasoning", text, ...(continuation ? { continuation: true } : {}) }),
-        onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
-        onTextDelta: delta => text.push(delta),
+        onHeartbeat: recordBrowserProgress,
+        onRecovery: recordRecovery,
+        onReasoningSummary: pushReasoning,
+        onCommentary: pushCommentary,
+        onTextDelta: pushText,
         ...(captureLunaCheckpoint ? {
           captureLunaCheckpoint: true,
           onLunaCheckpoint: captureCheckpoint,
@@ -751,6 +777,7 @@ export function createChatGptWebAdapter(
         physicalSettlement: browserTurn.physicalSettlement,
         trace,
         text,
+        lifecycleProgress,
         usageInput: checkpointInput.parsed,
         submission,
         cancel: browserTurn.cancel,
@@ -799,12 +826,16 @@ export function createChatGptWebAdapter(
       ...(resumeInput ? { prepareResume: () => prepareWith(resumeInput) } : {}),
       ...(retainConversation ? { retainConversation: true, conversationKey } : {}),
       abortSignal: browserAbort.signal,
+      ...hooks.beforePhysicalSubmission ? { beforePhysicalSubmission: hooks.beforePhysicalSubmission } : {},
+      ...hooks.onRateLimitPressure ? { onRateLimitPressure: hooks.onRateLimitPressure } : {},
       ...(parsed._compactionRequest ? { compaction: true } : {}),
       ...submissionLifecycle,
       ...multipartProgressLifecycle,
-      onReasoningSummary: (text, continuation) => trace.push({ kind: "reasoning", text, ...(continuation ? { continuation: true } : {}) }),
-      onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
-      onTextDelta: delta => text.push(delta),
+      onHeartbeat: recordBrowserProgress,
+      onRecovery: recordRecovery,
+      onReasoningSummary: pushReasoning,
+      onCommentary: pushCommentary,
+      onTextDelta: pushText,
       externalProgress,
       completionFence: {
         begin: async () => broker.beginCompletionFence(await token.promise),
@@ -829,6 +860,7 @@ export function createChatGptWebAdapter(
       physicalSettlement: browserTurn.physicalSettlement,
       trace,
       text,
+      lifecycleProgress,
       usageInput: checkpointInput.parsed,
       ...(conversationKey ? { conversationKey } : {}),
       ...(releaseRetainedConversation ? { releaseRetainedConversation } : {}),
@@ -1213,18 +1245,33 @@ export function createChatGptWebAdapter(
           );
         }
         let session: ChatGptTurnSession;
+        let schedulerRateLimitPressureRecorded = false;
         try {
           session = await chatGptTurnSessions.getOrCreateAfterOwnerRetirement(
             executionKey,
             ownerKey,
             () => startRuntime(parsed, environment, traceId, turnCapabilities, {
-              onSubmissionActivated: conversationKey => turnJournal.recordSubmission(executionKey, "send_activated", {
-                traceId,
-                nativeThreadId: nativeIdentity.threadId,
-                nativeTurnId,
-                conversationKey,
-                retryCount: retryGate?.retryNumber ?? 0,
-              }),
+              beforePhysicalSubmission: () => chatGptWebTurnRetryPolicy.waitForAttempt(retryKey, incoming.abortSignal).then(() => undefined),
+              onRateLimitPressure: error => {
+                chatGptWebTurnRetryPolicy.recordRateLimitPressure(retryKey, error.retryAfterMs);
+                schedulerRateLimitPressureRecorded = true;
+              },
+              onSubmissionActivated: conversationKey => {
+                turnJournal.recordSubmission(executionKey, "send_activated", {
+                  traceId,
+                  nativeThreadId: nativeIdentity.threadId,
+                  nativeTurnId,
+                  conversationKey,
+                  retryCount: retryGate?.retryNumber ?? 0,
+                });
+                console.info(`[chatgpt-web] send_safety_checkpoint ${JSON.stringify({
+                  traceId,
+                  durable: turnJournalStatePath !== undefined,
+                })}`);
+              },
+              onSendDispatchAttempted: () => {
+                console.info(`[chatgpt-web] send_dispatch_attempted ${JSON.stringify({ traceId })}`);
+              },
               onSubmissionAccepted: conversationKey => {
                 turnJournal.recordSubmission(executionKey, "accepted", {
                   traceId,
@@ -1233,6 +1280,7 @@ export function createChatGptWebAdapter(
                   conversationKey,
                   retryCount: retryGate?.retryNumber ?? 0,
                 });
+                console.info(`[chatgpt-web] submission_accepted ${JSON.stringify({ traceId })}`);
                 chatGptWebTurnRetryPolicy.recordSubmissionAccepted(retryKey);
               },
             }),
@@ -1351,6 +1399,7 @@ export function createChatGptWebAdapter(
                 }
                 for (const message of results) {
                   await broker.completeTool(turnToken, message.toolCallId, brokerResult(message));
+                  session.recordProgress("tool");
                   session.runtime.externalProgress.recordToolResult();
                   session.markResultDelivered(message.toolCallId);
                   try { turnJournal.recordToolResult(executionKey, message.toolCallId); } catch (error) {
@@ -1387,6 +1436,7 @@ export function createChatGptWebAdapter(
                     throw new Error("ChatGPT broker returned tools for a read-only browser turn");
                   }
                   if (requests.length > 0) {
+                    session.recordProgress("mcp");
                     const revision = externalProgress.recordToolBatch(requests.length);
                     if (!session.runtime.manualControl) {
                       // The browser outcome is in the same race below and owns the semantic DOM and
@@ -1525,8 +1575,13 @@ export function createChatGptWebAdapter(
           let handledError: Error = turnError;
           if (turnError instanceof ChatGptWebAdapterError && recovery.class === "CHATGPT_RATE_LIMITED") {
             if (safeRetry) {
-              handledError = chatGptWebTurnRetryPolicy.recordRetryableFailure(retryKey, turnError);
-            } else {
+              handledError = chatGptWebTurnRetryPolicy.recordRetryableFailure(
+                retryKey,
+                turnError,
+                undefined,
+                { rateLimitPressureAlreadyRecorded: schedulerRateLimitPressureRecorded },
+              );
+            } else if (!schedulerRateLimitPressureRecorded) {
               chatGptWebTurnRetryPolicy.recordRateLimitPressure(retryKey, turnError.retryAfterMs);
             }
           } else if (safeRetry && turnError instanceof ChatGptWebAdapterError) {

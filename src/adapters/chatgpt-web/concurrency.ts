@@ -5,6 +5,16 @@
  */
 export const MAX_CHATGPT_BROWSER_TABS = 5;
 
+/**
+ * Pending logical turns are cheaper than physical ChatGPT tabs, but they still retain request,
+ * cancellation, and replay state. Keep the queue bounded well below the 256-entry session registry
+ * while allowing ordinary main-task + subagent fan-out to wait safely for physical capacity.
+ */
+export const MAX_CHATGPT_LOGICAL_PENDING_TURNS = 64;
+
+/** Retained logical sessions, including terminal replay state. */
+export const MAX_CHATGPT_TURN_SESSIONS = 256;
+
 export type ChatGptOperationalConcurrencyMode = "safe" | "balanced" | "aggressive" | "maximum";
 
 export const DEFAULT_CHATGPT_OPERATIONAL_CONCURRENCY = 2;

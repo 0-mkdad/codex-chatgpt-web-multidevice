@@ -33,6 +33,20 @@ export class ChatGptWebAdapterError extends Error {
   }
 }
 
+export type ChatGptRecoveryExhaustedClass = "CDP_SESSION_LOST" | "DOM_TEMPORARILY_UNRESPONSIVE";
+
+/** Same-owner recovery was attempted and exhausted. The accepted prompt must not be resubmitted. */
+export class ChatGptRecoveryExhaustedError extends Error {
+  constructor(
+    readonly recoveryClass: ChatGptRecoveryExhaustedClass,
+    message: string,
+    cause?: unknown,
+  ) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "ChatGptRecoveryExhaustedError";
+  }
+}
+
 // Only the compaction owner may signal this after the broker accepts its one-shot handoff.
 // It cancels browser observation, while the accepted summary remains the native result.
 export class ChatGptCompactionHandoffAccepted extends DOMException {

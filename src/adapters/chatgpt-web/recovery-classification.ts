@@ -1,4 +1,4 @@
-import { ChatGptWebAdapterError } from "./adapter-error";
+import { ChatGptRecoveryExhaustedError, ChatGptWebAdapterError } from "./adapter-error";
 
 export type ChatGptSubmissionPhase = "prepared" | "send_activated" | "accepted";
 
@@ -49,16 +49,17 @@ function decision(
   } = {},
 ): ChatGptRecoveryDecision {
   const sent = postSend(phase);
+  const terminal = options.terminal ?? true;
   return {
     class: recoveryClass,
     retryable: options.retryable ?? false,
     mayResubmit: options.mayResubmit ?? false,
     mayReconnectObserver: options.mayReconnectObserver ?? false,
     mayReconnectCdp: options.mayReconnectCdp ?? false,
-    preserveBrowserOwner: options.preserveBrowserOwner ?? sent,
-    preserveTools: options.preserveTools ?? sent,
+    preserveBrowserOwner: options.preserveBrowserOwner ?? (sent && !terminal),
+    preserveTools: options.preserveTools ?? (sent && !terminal),
     cooldownRequired: options.cooldownRequired ?? false,
-    terminal: options.terminal ?? true,
+    terminal,
   };
 }
 
@@ -137,6 +138,18 @@ export function classifyChatGptRecovery(
     });
   }
 
+  if (error instanceof ChatGptRecoveryExhaustedError) {
+    return decision(error.recoveryClass, phase, {
+      retryable: false,
+      mayResubmit: false,
+      mayReconnectObserver: false,
+      mayReconnectCdp: false,
+      preserveBrowserOwner: false,
+      preserveTools: false,
+      terminal: true,
+    });
+  }
+
   if (error instanceof ChatGptWebAdapterError) {
     if (error.code === "rate_limit_exceeded" || error.status === 429) {
       const safeResubmit = !sent || error.submissionRejected;
@@ -180,16 +193,10 @@ export function classifyChatGptRecovery(
   }
 
   if (phase === "send_activated") {
-    return decision("SUBMISSION_AMBIGUOUS", phase, {
-      preserveBrowserOwner: true,
-      preserveTools: true,
-    });
+    return decision("SUBMISSION_AMBIGUOUS", phase);
   }
   if (phase === "accepted") {
-    return decision("TURN_ACCEPTED", phase, {
-      preserveBrowserOwner: true,
-      preserveTools: true,
-    });
+    return decision("TURN_ACCEPTED", phase);
   }
   return decision("PRE_SUBMISSION_FAILURE", phase, {
     retryable: true,

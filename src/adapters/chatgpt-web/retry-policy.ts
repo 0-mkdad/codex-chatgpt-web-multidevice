@@ -105,6 +105,7 @@ export class ChatGptWebTurnRetryPolicy {
     key: string,
     error: ChatGptWebAdapterError,
     now = this.now(),
+    options: { rateLimitPressureAlreadyRecorded?: boolean } = {},
   ): ChatGptWebAdapterError {
     this.prune(now);
     const previous = this.entries.get(key);
@@ -127,7 +128,9 @@ export class ChatGptWebTurnRetryPolicy {
       },
     };
     this.entries.set(key, entry);
-    if (rateLimited) this.openRateLimitCircuit(key, error.retryAfterMs, now);
+    if (rateLimited && !options.rateLimitPressureAlreadyRecorded) {
+      this.openRateLimitCircuit(key, error.retryAfterMs, now);
+    }
     else {
       const scope = this.scopeFor(key);
       const circuit = this.circuitForScope(scope);

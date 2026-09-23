@@ -41,6 +41,11 @@ const MAX_TURN_JOURNAL_ENTRIES = 256;
 const TURN_JOURNAL_TTL_MS = 24 * 60 * 60_000;
 const SHA256_RE = /^[a-f0-9]{64}$/;
 
+function isSafetyCriticalRunningCheckpoint(checkpoint: ChatGptTurnJournalCheckpoint): boolean {
+  return checkpoint.completion === "running"
+    && (checkpoint.submissionPhase === "send_activated" || checkpoint.submissionPhase === "accepted");
+}
+
 function hash(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -136,7 +141,9 @@ export class ChatGptTurnJournal {
     if (!this.path) return;
     this.load();
     const key = hash(executionKey);
+    this.prune();
     const previous = this.entries.get(key);
+    if (!previous) this.ensureCapacityForSafetyCheckpoint();
     const checkpoint: ChatGptTurnJournalCheckpoint = {
       executionKeyHash: key,
       traceId: identity.traceId,
@@ -213,6 +220,7 @@ export class ChatGptTurnJournal {
     checkpoint.outstandingToolCallHashes = [];
     if (options.response !== undefined) checkpoint.responseHash = hash(options.response);
     if (options.errorCode) checkpoint.errorCode = options.errorCode.slice(0, 128);
+    this.prune();
     this.persist();
   }
 
@@ -231,12 +239,11 @@ export class ChatGptTurnJournal {
     if (parsed.version !== 1 || !parsed.entries || typeof parsed.entries !== "object" || Array.isArray(parsed.entries)) {
       throw new Error(`Invalid ChatGPT turn journal: ${this.path}`);
     }
-    const cutoff = this.now() - this.ttlMs;
     for (const [key, value] of Object.entries(parsed.entries)) {
       if (!SHA256_RE.test(key)) throw new Error(`Invalid ChatGPT turn journal key: ${this.path}`);
       const checkpoint = validateCheckpoint(value);
       if (checkpoint.executionKeyHash !== key) throw new Error(`Mismatched ChatGPT turn journal key: ${this.path}`);
-      if (checkpoint.updatedAt >= cutoff) this.entries.set(key, checkpoint);
+      this.entries.set(key, checkpoint);
     }
     this.prune();
   }
@@ -244,20 +251,46 @@ export class ChatGptTurnJournal {
   private prune(): void {
     const cutoff = this.now() - this.ttlMs;
     for (const [key, checkpoint] of this.entries) {
-      if (checkpoint.updatedAt < cutoff) this.entries.delete(key);
+      if (!isSafetyCriticalRunningCheckpoint(checkpoint) && checkpoint.updatedAt < cutoff) {
+        this.entries.delete(key);
+      }
     }
     while (this.entries.size > MAX_TURN_JOURNAL_ENTRIES) {
       let oldestKey: string | undefined;
       let oldestAt = Number.POSITIVE_INFINITY;
       for (const [key, checkpoint] of this.entries) {
+        if (isSafetyCriticalRunningCheckpoint(checkpoint)) continue;
         if (checkpoint.updatedAt < oldestAt) {
           oldestAt = checkpoint.updatedAt;
           oldestKey = key;
         }
       }
-      if (!oldestKey) break;
+      if (!oldestKey) {
+        throw new Error(
+          `ChatGPT turn journal safety capacity exhausted (${MAX_TURN_JOURNAL_ENTRIES} running post-Send checkpoints); manual recovery or explicit clearing is required`,
+        );
+      }
       this.entries.delete(oldestKey);
     }
+  }
+
+  private ensureCapacityForSafetyCheckpoint(): void {
+    if (this.entries.size < MAX_TURN_JOURNAL_ENTRIES) return;
+    let oldestTerminalKey: string | undefined;
+    let oldestTerminalAt = Number.POSITIVE_INFINITY;
+    for (const [key, checkpoint] of this.entries) {
+      if (isSafetyCriticalRunningCheckpoint(checkpoint)) continue;
+      if (checkpoint.updatedAt < oldestTerminalAt) {
+        oldestTerminalAt = checkpoint.updatedAt;
+        oldestTerminalKey = key;
+      }
+    }
+    if (!oldestTerminalKey) {
+      throw new Error(
+        `ChatGPT turn journal safety capacity exhausted (${MAX_TURN_JOURNAL_ENTRIES} running post-Send checkpoints); refusing to evict duplicate-suppression state`,
+      );
+    }
+    this.entries.delete(oldestTerminalKey);
   }
 
   private persist(): void {
