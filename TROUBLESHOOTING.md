@@ -54,6 +54,35 @@ Do not hand-edit the launcher's route journal. It exists so setup and removal ca
 of silently destroying another provider's configuration. First-class external-router composition is
 tracked in the [repository issue tracker](https://github.com/0-mkdad/codex-chatgpt-web-multidevice/issues), but is not supported today.
 
+## Native models stop after closing the launcher
+
+While the integration is installed, native Codex models also use the local bridge. Keep the launcher
+running, or use **Settings → Remove Codex integration** before quitting it. Then fully quit Codex,
+including background processes, and reopen it to load the restored route.
+
+CLI users can temporarily restore the previous route with `codex-chatgpt-web route disconnect`.
+Fully restart Codex after a route change. Starting the launcher reconnects an installed integration.
+
+## Codex's usage-limit banner disables Send for Web models
+
+If Codex shows **You're out of Codex and Work usage** and disables Send even with a Web model
+selected, sign out of **Codex** and sign in with another account you own that can send messages.
+A free account with Codex access and no blocking usage banner can be used.
+
+Keep your intended ChatGPT account signed in inside **Codex Web GPT**; these are separate sessions.
+Changing the Codex login does not reset or increase the launcher's ChatGPT Web account limits.
+
+## Encrypted content cannot be verified after switching models
+
+If switching from ChatGPT Web to a native Codex model fails with `Encrypted content could not be
+decrypted or parsed`, check the route owner. The launcher's native route already converts Web
+checkpoints into readable context and preserves native encrypted history. An external router that
+sends native requests directly to OpenAI bypasses that conversion.
+
+Use one route owner as described above. If the error persists through the launcher, export a safe log
+and include both model names and whether compaction preceded the switch. Do not delete checkpoints
+or strip encrypted history; this can lose task context. External-router composition remains unsupported.
+
 ## ChatGPT sign-in does not complete
 
 The launcher must own the ChatGPT session used for model turns. Signing in to an unrelated browser
@@ -89,6 +118,12 @@ mean that the ChatGPT UI did not expose a structure the bridge can safely prove.
 Free and Go accounts normally expose Luna and Think without the paid-account effort selector. A
 missing paid selector on those accounts is not itself a sign-in failure.
 
+## Personalization or connector controls are not found
+
+In ChatGPT, open **Settings → General → Language** and choose **English** explicitly, then reload
+ChatGPT inside the launcher and retry once. Some browser controls depend on English labels;
+changing the launcher language does not change the ChatGPT website language.
+
 ## Full harness or MCP verification fails
 
 Video walkthroughs:
@@ -98,20 +133,54 @@ Video walkthroughs:
 
 Browser-only mode needs no connector. Full harness mode requires all of the following:
 
-- a newly created connector named exactly **Codex Native2**;
+- a newly created connector named exactly as the launcher's **Connector name** (default: **Codex Native2**);
 - **Developer Mode** enabled in ChatGPT;
 - the exact Tunnel selected with **Authentication: None**;
 - the connector and Tunnel on the same OpenAI account as the ChatGPT workspace;
 - **Allow all actions** under the connector's permissions; and
 - **Connect harness** completed before **Verify runtime**.
 
+Each computer should have its own Tunnel and regular API key, plus a distinct automatic connector
+name entered in the launcher's MCP setup. This keeps separate computers' local credentials and
+connector identities from being confused. The fixed Zero Risk connector remains **Codex Zero Risk**.
 Do not rename or refresh an old **Codex Native** connector. ChatGPT caches the public MCP contract by
-connector identity, so create **Codex Native2** as a new connector.
+connector identity, so create the selected name as a new connector.
 
 After updating, if `codex_exec` still does not expose `sandbox_permissions`, `justification`, and
 `prefix_rule`, recreate the current mode's connector so ChatGPT loads the updated tool schema.
 These fields only forward a permission request to Codex; its sandbox and approval policy still
 decide whether the command can run. Ordinary commands do not require these optional fields.
+
+### Tools disappear on follow-up messages
+
+If local tools work on the first message but disappear on a follow-up, check the same ChatGPT tab
+in **Launcher → Browser**. ChatGPT may not retain the connector for the next message in a reused
+conversation. The model saying it has no tools alone does not establish this.
+
+In 6.0, enable **Settings → New browser chat for each turn** in automatic browser mode for this
+case: the same Codex task continues, but each turn attaches the connector in a
+fresh ChatGPT conversation. It resends more context and can be slower. In stock v5.0.8, close the
+task's **completed** browser tab before sending the next message; closing a running tab cancels it.
+
+Also try recreating the connector under the launcher's selected name with the same Tunnel and **Allow
+all actions**, then run **Verify runtime**. If tools are already missing in a fresh chat, report that
+separately with a safe log and the browser's actual connector/tool state.
+
+### Windows: `unable to verify the first certificate`
+
+For this error during **Connect harness**, check the affected host with Windows `curl.exe -Iv`
+(for example, `curl.exe -Iv https://api.openai.com/`). If it uses Schannel and receives an HTTP
+response, Windows trusts that connection. Fully quit the launcher, then start it from PowerShell:
+
+```powershell
+$env:NODE_USE_SYSTEM_CA = "1"
+$install = (Get-ItemProperty "HKCU:\Software\d1a6026a-6210-588e-9a2b-da3936f94e02").InstallLocation
+Start-Process (Join-Path $install "Codex Web GPT.exe")
+```
+
+For a portable copy, use its executable path instead. Retry **Connect harness** once. This enables
+[Node's system CA support](https://nodejs.org/api/cli.html#node_use_system_ca1); certificate verification
+stays enabled. If it still fails, export a safe log. Do not set `NODE_TLS_REJECT_UNAUTHORIZED=0`.
 
 ### ChatGPT shows `Error creating connector`
 
@@ -119,9 +188,23 @@ decide whether the command can run. Ordinary commands do not require these optio
    same OpenAI account.
 2. Confirm that the launcher has connected the local harness and the Tunnel is running before you
    create the connector in ChatGPT.
-3. ChatGPT can reject the first **Create** attempt once even when the Tunnel is healthy, usually
-   after 5–10 seconds. Press **Create** one more time. If the second attempt also fails, stop
-   retrying and recheck the account, Tunnel ID, and running Tunnel first.
+3. Confirm the runtime is locally healthy and ready before creating the connector. If Create fails,
+   recheck the account and Tunnel once, then inspect the exact error rather than retrying repeatedly.
+
+#### HTTP 424 after a successful local discovery response
+
+The official tunnel-client repository currently tracks a v0.0.14 report where ChatGPT connector
+creation returns HTTP 424 with `MCP server/discover response was inconsistent from openai.org`, even
+though `server/discover` reached the local MCP runtime and an HTTP 200 `text/event-stream` response
+was forwarded to the Control Plane. See [openai/tunnel-client issue #71](https://github.com/openai/tunnel-client/issues/71)
+for the report and its platform/account details. This is evidence of a failure at the hosted
+connector-creation boundary, not proof that every 424 has the same cause.
+
+If the launcher reports a ready tunnel and a safe log confirms the successful local response, do
+not rewrite the local MCP response or disable protocol checks. Save the failure time and redacted
+doctor/tunnel diagnostics, check the linked issue for updates, and report the hosted response through
+the project's support channel. The launcher cannot repair a rejection that occurs after the response
+has reached OpenAI's Control Plane.
 
 If tool calls work until native Codex quota is exhausted and then edits are denied by **Automatic
 approval review**, disable that optional Codex review setting and restart Codex. The outer Codex
@@ -187,6 +270,8 @@ max_concurrent_threads_per_session = 1
 ```
 
 If the table already exists, add or change only the key; do not create a second `[agents]` table.
+If it contains `max_threads`, replace that old name with `max_concurrent_threads_per_session`;
+do not keep both. Codex treats them as aliases and may reject the configuration as a duplicate field.
 Bigger Context can make one turn larger and longer, but does not increase safe account concurrency.
 
 ## Images from earlier turns are attached again

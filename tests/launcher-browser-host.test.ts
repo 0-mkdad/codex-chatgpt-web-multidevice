@@ -25,6 +25,26 @@ import type { Browser, BrowserContext, Page } from "playwright-core";
 
 const roots: string[] = [];
 
+test("startup waits beyond five seconds and distinguishes its deadline from caller cancellation", async () => {
+  let calls = 0;
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch() {
+    calls++;
+    await Bun.sleep(calls === 1 ? 5_100 : 80);
+    return Response.json({ surfaceId: "a".repeat(32), reused: false, connectorBound: false });
+  } });
+  try {
+    const descriptor = descriptorFile(`http://127.0.0.1:${server.port}`);
+    const activity = { phase: "start" as const, traceId: "bounded-start", helperPid: process.pid };
+    await expect(notifyLauncherTurn(descriptor, activity)).resolves.toMatchObject({ reused: false });
+    await expect(notifyLauncherTurn(descriptor, activity, 10)).rejects.toThrow("start timed out after 10ms");
+    const controller = new AbortController();
+    const pending = notifyLauncherTurn(descriptor, activity, undefined, controller.signal);
+    setTimeout(() => controller.abort(), 10);
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(calls).toBe(3);
+  } finally { server.stop(true); }
+}, 10_000);
+
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -112,6 +132,7 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
       surfaceId: "launcher_surface_id_0123456789AB",
       reused: true,
       connectorBound: true,
+      trackUsage: false,
     });
     expect(received.authorization).toBe("Bearer launcher-control-token-0123456789abcdefghijklmnop");
     expect(received.body).toEqual({

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
-import { ChatGptCompactionHandoffAccepted, chatGptRetainedConversationUnavailableError } from "../src/adapters/chatgpt-web/adapter-error";
+import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError, chatGptRetainedConversationUnavailableError } from "../src/adapters/chatgpt-web/adapter-error";
 import {
   MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
   cancelAllStructuredCompactions,
@@ -1234,7 +1234,7 @@ test.each([false, true])("structured compact rebuilds canonical context when its
     expect(contextText).toContain("Original task");
     expect(contextText).toContain("Continue with the next step");
     if (experimentalBiggerContext) {
-      expect(prepared.multipart!.parts).toHaveLength(3);
+      expect(prepared.multipart!.parts).toHaveLength(6);
       expect(prepared.trimmedCompactionMessages).toBeUndefined();
       const lastRecord = prepared.multipart!.parts.flatMap(part => JSON.parse(part).records).at(-1);
       expect(lastRecord.message.content).toBe(compact.context.messages.at(-1)!.content);
@@ -1264,7 +1264,57 @@ test.each([false, true])("structured compact rebuilds canonical context when its
   }
 });
 
-test("fresh multipart compaction gives each acknowledged phase its own handoff budget", async () => {
+test.each([false, true])("configured fresh compaction waits for cleanup and preserves committed final=%s", async committed => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-fresh-owner-"));
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web", baseUrl: `browser://fresh-owner-${root}`,
+    chatgptWeb: { browserHost: "launcher", browserHostDescriptorPath: join(root, "launcher.json"),
+      brokerSocketPath: defaultBrokerEndpoint(root), localToolsEnabled: true, solAvailable: true,
+      experimentalFreshConversationPerTurn: true },
+  };
+  const compact = request(true);
+  const sourceKey = `${chatGptWebExecutionNamespace(provider)}:${chatGptCompactionSourceExecutionKey(compact)}`;
+  let finishSource!: (answer: string) => void;
+  let releaseSource!: () => void;
+  let cancelled = false;
+  const cleanup = new Promise<void>(resolve => { releaseSource = resolve; });
+  const source = chatGptTurnSessions.getOrCreate(sourceKey, () => ({
+    mode: "read-only", browser: new Promise<string>(resolve => { finishSource = resolve; }),
+    physicalSettlement: cleanup, trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(),
+    cancel: () => { cancelled = true; finishSource("retired source"); },
+  }));
+  if (committed) {
+    finishSource("committed final");
+    await source.browserOutcome;
+  }
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run;
+  let starts = 0;
+  worker.run = async () => { starts += 1; return "Fresh checkpoint"; };
+  const events: AdapterEvent[] = [];
+  let pending: Promise<void> | undefined;
+  try {
+    pending = createChatGptWebAdapter(provider).runTurn!(compact, { headers: new Headers() }, event => events.push(event));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(cancelled).toBe(!committed);
+    expect(starts).toBe(0);
+    releaseSource();
+    await pending;
+    expect(starts).toBe(1);
+    expect(chatGptTurnSessions.find(sourceKey)).toBe(committed ? source : undefined);
+    expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
+  } finally {
+    finishSource("cleanup");
+    releaseSource();
+    await pending;
+    worker.run = originalRun;
+    chatGptTurnSessions.clear();
+    await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each([false, true])("fresh multipart compaction preserves phase budgets with fresh mode=%s", async freshConversation => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-phased-fallback-compact-"));
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
@@ -1277,16 +1327,20 @@ test("fresh multipart compaction gives each acknowledged phase its own handoff b
       solAvailable: true,
       extraHighAvailable: true, proAvailable: true,
       turnTimeoutMs: 40,
+      experimentalFreshConversationPerTurn: freshConversation,
     },
   };
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const originalRun = worker.run.bind(worker);
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    expect(turn.traceId.endsWith(freshConversation ? "_fresh" : "_fallback")).toBeTrue();
     expect(turn.onMultipartStageAcknowledged).toBeDefined();
     expect(turn.onSubmitted).toBeDefined();
-    mock.timers.tick(25);
-    expect(turn.abortSignal?.aborted).toBeFalse();
-    await turn.onMultipartStageAcknowledged!(1);
+    for (let part = 1; part <= 5; part++) {
+      mock.timers.tick(25);
+      expect(turn.abortSignal?.aborted).toBeFalse();
+      await turn.onMultipartStageAcknowledged!(part);
+    }
     mock.timers.tick(25);
     expect(turn.abortSignal?.aborted).toBeFalse();
     turn.onSubmitted!();
@@ -1439,7 +1493,7 @@ test("a timed-out fresh compaction retains its owner until helper cleanup comple
   }
 });
 
-test("structured compact rebuilds canonical context when its retained browser disappeared", async () => {
+test.each([false, true])("structured compact rebuild after retained browser loss preserves rate limit=%s", async rateLimited => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-stale-retained-compact-"));
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
@@ -1477,6 +1531,9 @@ test("structured compact rebuilds canonical context when its retained browser di
     const prepared = await turn.prepare();
     expect(prepared.text).toContain("Original task");
     prepared.release();
+    if (rateLimited) throw new ChatGptWebAdapterError("ChatGPT rate limit: too many requests.", {
+      status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: false,
+    });
     return "Fallback checkpoint after retained browser loss";
   };
   const events: AdapterEvent[] = [];
@@ -1487,6 +1544,14 @@ test("structured compact rebuilds canonical context when its retained browser di
       event => events.push(event),
     );
     expect(browserStarts).toBe(2);
+    if (rateLimited) {
+      expect(events.at(-1)).toMatchObject({
+        type: "error", status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded",
+        retryable: false, message: "ChatGPT rate limit: too many requests.",
+      });
+      expect(events.some(event => event.type === "done")).toBeFalse();
+      return;
+    }
     expect(events.some(event => event.type === "text_delta"
       && event.text.includes("Fallback checkpoint after retained browser loss"))).toBeTrue();
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
@@ -1551,9 +1616,9 @@ test("a disappeared retained source cannot leave its fresh compaction rebuild pa
     expect(browserStarts).toBe(2);
     expect(events.at(-1)).toMatchObject({
       type: "error",
-      code: "compaction_handoff_failed",
+      code: "compaction_handoff_timeout",
       retryable: false,
-      message: "ChatGPT did not complete the context handoff. Retry the task.",
+      message: "ChatGPT compaction did not fully settle within 25ms",
     });
   } finally {
     releaseBrowser?.();

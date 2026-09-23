@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Feature requests and ideas
+    url: https://github.com/0-mkdad/codex-chatgpt-web-multidevice/discussions
+    about: Propose new features and discuss product changes in Ideas before implementation.
   - name: Troubleshooting guide
     url: https://github.com/0-mkdad/codex-chatgpt-web-multidevice/blob/main/TROUBLESHOOTING.md
     about: Resolve common setup, routing, sign-in, model, MCP, rate-limit, image, and streaming failures first.

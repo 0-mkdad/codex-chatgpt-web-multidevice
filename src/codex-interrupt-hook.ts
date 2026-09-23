@@ -136,6 +136,16 @@ function hookTextPattern(text: string): string {
     .join("(?:\\r\\n|\\n|\\r)");
 }
 
+function definitionTextPattern(text: string): string {
+  // Native TOML serialization can remove separator blank lines without changing a definition.
+  // Match one canonical form, consuming at most the original separators for exact restoration.
+  const leading = text.match(/^[\r\n]+/)?.[0] ?? "";
+  const trailing = text.match(/[\r\n]+$/)?.[0] ?? "";
+  const separator = (value: string) => `(?:\\r\\n|\\n|\\r){0,${value.match(/\r\n|\n|\r/g)?.length ?? 0}}`;
+  return separator(leading) + hookTextPattern(text.slice(leading.length, text.length - trailing.length))
+    + separator(trailing);
+}
+
 function locateCodexInterruptHook(text: string, installed: InstalledCodexInterruptHook): Array<{
   start: number; end: number;
 }> {
@@ -149,8 +159,29 @@ function locateCodexInterruptHook(text: string, installed: InstalledCodexInterru
   const stateOffset = stateHeader.index + stateHeader[0].length - stateHeader[1].length;
   // The native TOML writer can insert unrelated tables between the hook and its trust state.
   // Locate the two owned definitions separately, retaining exact command/field matching.
-  const ranges = [ownedPrefix.slice(0, stateOffset), ownedPrefix.slice(stateOffset)].map(fragment => {
-    const pattern = new RegExp(hookTextPattern(fragment), "g");
+  // It also rewrites Windows trust keys as literal strings. Decode only candidate headers;
+  // the complete document and the exact owned fields are still checked below.
+  const stateHeaders = [...text.matchAll(/^\[hooks\.state\.[^\r\n]+\]/gm)]
+    .map(match => match[0])
+    .filter(header => {
+      try {
+        const parsed = Bun.TOML.parse(header) as { hooks: { state: Record<string, unknown> } };
+        const keys = Object.keys(parsed.hooks.state);
+        return keys.length === 1 && keys[0] === installed.stateKey;
+      } catch {
+        return false;
+      }
+    });
+  const patterns = [
+    definitionTextPattern(ownedPrefix.slice(0, stateOffset)),
+    `(?:${stateHeaders.map(hookTextPattern).join("|")})`
+      + definitionTextPattern(ownedPrefix.slice(stateOffset + stateHeader[1].length)),
+  ];
+  if (stateHeaders.length === 0) {
+    throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
+  }
+  const ranges = patterns.map(source => {
+    const pattern = new RegExp(source, "g");
     const match = pattern.exec(text);
     if (!match || pattern.exec(text)) {
       throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
@@ -158,7 +189,9 @@ function locateCodexInterruptHook(text: string, installed: InstalledCodexInterru
     return { start: match.index, end: match.index + match[0].length };
   });
   const [hook, state] = ranges;
-  if (!hook || !state || state.start < hook.end) {
+  const overlapStart = hook && state ? Math.max(hook.start, state.start) : 0;
+  const overlapEnd = hook && state ? Math.min(hook.end, state.end) : 0;
+  if (!hook || !state || (overlapStart < overlapEnd && /[^\r\n]/.test(text.slice(overlapStart, overlapEnd)))) {
     throw new Error("Codex interrupt lifecycle hook changed after setup; refusing to overwrite it");
   }
   if (interruptGroupCount(text.slice(0, hook.start)) !== installed.groupIndex) {
@@ -200,7 +233,11 @@ function locateCodexInterruptHook(text: string, installed: InstalledCodexInterru
   }
   const trailing = installed.fragment.slice(marker + MANAGED_INTERRUPT_HOOK_END.length);
   const trailingLength = new RegExp("^" + hookTextPattern(trailing)).exec(text.slice(end))?.[0].length ?? 0;
-  return [...ranges, { start: endMarker, end: end + trailingLength }];
+  // Reordered adjacent definitions can share separator newlines; remove their union only once.
+  const definitionsToRemove = overlapStart < overlapEnd
+    ? [{ start: Math.min(hook.start, state.start), end: Math.max(hook.end, state.end) }]
+    : ranges;
+  return [...definitionsToRemove, { start: endMarker, end: end + trailingLength }];
 }
 
 export function verifyCodexInterruptHook(text: string, installed: InstalledCodexInterruptHook): void {

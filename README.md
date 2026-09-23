@@ -34,7 +34,7 @@ here are documented in [FORK_CHANGES.md](FORK_CHANGES.md).
 
 1. **Install the launcher** using the download for your system above.
 2. **Sign in to ChatGPT** in the embedded browser and run the browser smoke test.
-3. **Install models**, restart Codex once, and choose a **ChatGPT Web — …** model.
+3. **Install models**, restart Codex once, and choose a ChatGPT Web model ending in **(Web)**. Pro modes have separate entries; Sol's Effort comes from Codex's native Effort control. Zero Risk keeps its dedicated entry.
 4. **For coding with tools**, open **MCP** in the launcher and complete the Full harness setup below.
 
 The app includes its browser and runtime. No separate Chrome, Node, or Bun installation is needed.
@@ -61,7 +61,11 @@ Automatic modes offer Luna/Think when the account has no reasoning selector; oth
 | **Full harness (With Automation)** | Automatic | Yes, through MCP |
 | **Zero Risk** | Paste and send manually | Yes, through a separate MCP connector |
 
-Zero Risk does not read or operate the ChatGPT page. Choose the model and `Codex Zero Risk` connector yourself, paste and send the prepared prompt, then confirm **Sent** in the launcher. Automatic model entries each select a fixed ChatGPT mode; Codex’s Effort and Speed rows do not override it.
+Zero Risk does not read or operate the ChatGPT page. Choose the model and `Codex Zero Risk` connector yourself, paste and send the prepared prompt, then confirm **Sent** in the launcher. Automatic model entries ending in **(Web)** expose supported Effort choices in Codex; Instant and each Pro mode have separate entries. Existing saved model entries retain their original mode.
+
+The launcher can track estimated usage through its own browser for Pro $100 and Pro $200 plans. It records accepted sends on this device, shows rolling 24-hour and 7-day counts, and flags when observed usage reaches 75% of a published reference limit. Activity outside this launcher is excluded, and these estimates do not show the account's remaining allowance or reset time. Tracking is unavailable in Zero Risk.
+
+**Bigger Context (experimental)** sends large turns in up to six ordered parts and raises the advertised context and compaction thresholds to 3×. Small turns stay on the usual single-message path. Multi-part turns resend more context and can increase rate limits or cooldowns; this setting is off by default.
 
 <a id="full-harness"></a>
 
@@ -82,11 +86,11 @@ The launcher's **MCP** page guides the complete setup. For the exact clicks, see
 > up to 270,000 tokens with experimental **3× context** enabled, with native Codex compaction
 > supported throughout.
 
-1. Finish the required setup, open **MCP**, create the Tunnel and regular API key, then press
-   **Connect harness**.
-2. Enable ChatGPT **Developer Mode** and create a new Tunnel connector named exactly
-   **Codex Native2**, with **Authentication: None** and **Allow all actions**.
-3. Run **Verify runtime** to confirm that **Codex Native2** is attached and available.
+1. Finish the required setup, open **MCP**, create a Tunnel and regular API key for this computer, then press **Connect harness**.
+2. In the launcher, set this computer's **Connector name**. Use a different name on each computer; the default is **Codex Native2**. Enable ChatGPT **Developer Mode** and create a new Tunnel connector with that exact name, **Authentication: None**, and **Allow all actions**.
+3. Run **Verify runtime** to confirm that the selected connector is attached and available.
+
+Each computer keeps its launcher settings, browser login, runtime configuration, Tunnel credentials, and connector name in its own local profile. For multiple computers, create a separate Tunnel and regular API key on each, and assign each a distinct connector name. The fixed **Codex Zero Risk** identity stays separate. The launcher preserves the chosen automatic name across setup and restart; the CLI also accepts `setup --connector-name "Laptop Connector"`.
 
 Write/modify actions also require the ChatGPT workspace and its administrator policy to permit
 them. See
@@ -102,7 +106,7 @@ that option clicks **Allow once**, never a permanent grant.
 <a id="operations"></a>
 
 Use **Activity** for safe local diagnostics and **Settings → Run doctor** for end-to-end health.
-Settings can also cancel a retained browser turn or remove the Codex integration before uninstall.
+Settings also includes **New browser chat for each turn**, which is off by default and available in Automatic mode. It starts each turn from the same Codex task in a fresh ChatGPT conversation, reattaches the connector, and may resend more context. **Save chats in ChatGPT** is also off by default; it keeps task conversations in account history, where ChatGPT memory and custom instructions may apply. Settings can also cancel a retained browser turn or remove the Codex integration before uninstall.
 Set `CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS=1` only when every browser checkpoint needs a screenshot.
 
 New installs use **Compatibility V1** for cross-backend subagents. **Native** preserves Codex's own
@@ -126,7 +130,7 @@ codex-chatgpt-web subagents native
   drift fails explicitly instead of silently switching model or transport.
 - Browser state is a sensitive login artifact, and the loopback listener is reachable by processes
   running as the same local user. Never share the launcher profile; use a trusted workstation.
-- Release packages currently target macOS 13+ (arm64/x64), Windows x64, and Linux x64. Runtime,
+- Release packages currently target macOS 13+ (arm64/x64), Windows x64, and Linux x64/arm64. Runtime,
   tests, and packaging are gated on all three in CI; account-bound browser and MCP flows use the
   separate [release validation](docs/release-validation.md).
 - Builds are not yet platform-signed, so Gatekeeper or SmartScreen may warn. The installers verify
