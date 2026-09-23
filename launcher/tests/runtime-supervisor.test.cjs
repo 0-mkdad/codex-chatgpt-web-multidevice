@@ -725,7 +725,9 @@ test("tunnel readiness accepts the official tmux status without inventing a PID"
     });
     assert.equal(health.ready, true);
     assert.equal(health.pid, null);
-    await supervisor.waitForTunnel({ tunnel: { alias: "codex-chatgpt-web" } }, 1);
+    // This tests PID-less tmux readiness, not deadline expiry. A 1ms budget can elapse
+    // before the first health read on a loaded CI runner.
+    await supervisor.waitForTunnel({ tunnel: { alias: "codex-chatgpt-web" } }, 1_000);
     assert.equal(supervisor.tunnel?.managed, true);
     assert.equal(supervisor.tunnel?.pid, null);
   } finally {
