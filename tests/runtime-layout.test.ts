@@ -281,6 +281,39 @@ test("manual provider configuration preserves a distinct backend without guessin
   });
 });
 
+test("conversation preferences survive reload; saved chats also apply to Zero Risk", () => {
+  const root = join(tmpdir(), `codex-web-fresh-config-${process.pid}-${Date.now()}`);
+  roots.push(root);
+  process.env.CODEX_CHATGPT_WEB_HOME = root;
+  mkdirSync(root, { recursive: true });
+  const config: Record<string, unknown> = { ...defaultConfig("browser-only") };
+  const persist = () => writeFileSync(join(root, "config.json"), JSON.stringify(config));
+  expect(config.experimentalFreshConversationPerTurn).toBe(false);
+  expect(config.useSavedChats).toBe(false);
+  delete config.useSavedChats;
+  delete config.experimentalFreshConversationPerTurn;
+  persist();
+  expect(loadConfig()!.experimentalFreshConversationPerTurn).toBe(false);
+  expect(loadConfig()!.useSavedChats).toBe(false);
+  config.useSavedChats = true;
+  config.experimentalFreshConversationPerTurn = true;
+  persist();
+  const loaded = loadConfig()!;
+  expect(providerConfig(loaded).chatgptWeb!.useSavedChats).toBe(true);
+  expect(providerConfig({ ...loaded, browserInteractionMode: "manual" }).chatgptWeb!.useSavedChats).toBe(true);
+  expect(providerConfig(loaded).chatgptWeb!.experimentalFreshConversationPerTurn).toBe(true);
+  expect(providerConfig({ ...loaded, browserInteractionMode: "manual" })
+    .chatgptWeb!.experimentalFreshConversationPerTurn).toBe(false);
+  expect(loaded.experimentalFreshConversationPerTurn).toBe(true);
+  config.experimentalFreshConversationPerTurn = "true";
+  persist();
+  expect(() => loadConfig()).toThrow("experimentalFreshConversationPerTurn");
+  config.experimentalFreshConversationPerTurn = false;
+  config.useSavedChats = "true";
+  persist();
+  expect(() => loadConfig()).toThrow("useSavedChats");
+});
+
 test("skill attachments config defaults off, reaches the adapter, and rejects invalid/manual settings", () => {
   const root = join(tmpdir(), `codex-skills-config-${process.pid}-${Date.now()}`);
   roots.push(root);

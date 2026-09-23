@@ -20,11 +20,13 @@ interface RunMessage {
     browserDiagnosticsPath?: string;
     turnTimeoutMs: number;
     autoApproveToolCalls: boolean;
+    useSavedChats?: boolean;
   };
   turn: {
     traceId: string;
     modelId: string;
     reasoning?: string;
+    modelFamily?: "5.6" | "6";
     capabilities: ChatGptWebCapabilities;
     nativeConnector?: boolean;
     resumeAvailable?: boolean;
@@ -59,7 +61,13 @@ interface SmokeMessage {
   config: VerifyMessage["config"];
 }
 
-type MaintenanceMessage = VerifyMessage | InspectMessage | SmokeMessage;
+interface LimitsMessage {
+  type: "limits";
+  id: string;
+  config: VerifyMessage["config"];
+}
+
+type MaintenanceMessage = VerifyMessage | InspectMessage | SmokeMessage | LimitsMessage;
 type InputMessage = RunMessage
   | MaintenanceMessage
   | { type: "prepared_selected_ack"; id: string; prepared: CompiledChatGptWebPrompt }
@@ -188,6 +196,7 @@ async function run(message: RunMessage): Promise<void> {
       browserDiagnosticsPath: message.config.browserDiagnosticsPath,
       turnTimeoutMs: message.config.turnTimeoutMs,
       autoApproveToolCalls: message.config.autoApproveToolCalls,
+      useSavedChats: message.config.useSavedChats === true,
     },
   };
   const abortController = new AbortController();
@@ -211,6 +220,7 @@ async function run(message: RunMessage): Promise<void> {
     traceId: message.turn.traceId,
     modelId: message.turn.modelId,
     reasoning: message.turn.reasoning,
+    ...(message.turn.modelFamily ? { modelFamily: message.turn.modelFamily } : {}),
     capabilities: message.turn.capabilities,
     ...(message.turn.nativeConnector ? { nativeConnector: true } : {}),
     prepare: prepareSelected,
@@ -362,7 +372,7 @@ function maintenanceWorker(message: MaintenanceMessage): ChatGptBrowserWorker {
   return ChatGptBrowserWorker.forProvider(provider);
 }
 
-async function maintain(message: InspectMessage | SmokeMessage): Promise<void> {
+async function maintain(message: InspectMessage | SmokeMessage | LimitsMessage): Promise<void> {
   if (abortControllers.has(message.id)) throw new Error(`Browser helper maintenance operation already exists: ${message.id}`);
   const abortController = new AbortController();
   abortControllers.set(message.id, abortController);
@@ -370,6 +380,7 @@ async function maintain(message: InspectMessage | SmokeMessage): Promise<void> {
     const worker = maintenanceWorker(message);
     const value = message.type === "inspect"
       ? await worker.inspectSession(message.detectCapabilities)
+      : message.type === "limits" ? await worker.inspectLimitsPlan()
       : await worker.smokeTest(abortController.signal);
     writeProtocol({ type: "result", id: message.id, value });
   } catch (error) {
@@ -492,7 +503,7 @@ input.on("line", line => {
       id: message.id,
       message: error instanceof Error ? error.message : String(error),
     }));
-  } else if (message.type === "inspect" || message.type === "smoke") {
+  } else if (message.type === "inspect" || message.type === "smoke" || message.type === "limits") {
     void maintain(message).catch(error => writeProtocol({
       type: "error",
       id: message.id,

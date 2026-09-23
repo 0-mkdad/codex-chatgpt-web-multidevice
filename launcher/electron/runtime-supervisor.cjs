@@ -261,6 +261,10 @@ function validateConfig(config, descriptorPath, platform = process.platform, lau
     && typeof config.experimentalBiggerContext !== "boolean") {
     throw new Error("Runtime configuration has an invalid experimentalBiggerContext");
   }
+  if (config.experimentalFreshConversationPerTurn !== undefined
+    && typeof config.experimentalFreshConversationPerTurn !== "boolean") {
+    throw new Error("Runtime configuration has an invalid experimentalFreshConversationPerTurn");
+  }
   if (config.stallTimeoutSec !== undefined
     && (!Number.isFinite(config.stallTimeoutSec) || config.stallTimeoutSec <= 0)) {
     throw new Error("Runtime configuration has an invalid stallTimeoutSec");
@@ -329,6 +333,7 @@ class RuntimeSupervisor {
     launcherProfile = "production",
     publishOperation,
     runtimeInvocationFactory = runtimeInvocation,
+    onConfigRead,
   }) {
     this.app = app;
     this.logger = logger;
@@ -343,6 +348,7 @@ class RuntimeSupervisor {
     this.launcherProfile = launcherProfile;
     this.publishOperation = publishOperation;
     this.runtimeInvocationFactory = runtimeInvocationFactory;
+    this.onConfigRead = onConfigRead;
     this.configPath = path.join(coreHome, "config.json");
     this.statePath = path.join(coreHome, "runtime", "launcher-supervisor.json");
     this.daemon = null;
@@ -367,12 +373,14 @@ class RuntimeSupervisor {
 
   readConfig() {
     if (!fs.existsSync(this.configPath)) return null;
-    return validateConfig(
+    const config = validateConfig(
       readJson(this.configPath),
       this.browserDescriptorPath,
       this.platform,
       this.launcherProfile,
     );
+    this.onConfigRead?.(config);
+    return config;
   }
 
   readSetupConfig() {

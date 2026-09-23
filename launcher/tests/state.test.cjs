@@ -27,6 +27,8 @@ test("launcher state persists onboarding, language, and autostart atomically", (
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
       experimentalSkillAttachments: false,
+      experimentalFreshConversationPerTurn: false,
+      useSavedChats: false,
       zeroRiskProEnabled: false,
       browserSmokePassed: false,
       browserSmokeVersion: null,
@@ -54,6 +56,8 @@ test("launcher state persists onboarding, language, and autostart atomically", (
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
       experimentalSkillAttachments: false,
+      experimentalFreshConversationPerTurn: false,
+      useSavedChats: false,
       zeroRiskProEnabled: false,
       browserSmokePassed: true,
       browserSmokeVersion: "0.2.0",
@@ -110,6 +114,7 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
       language: "zh-CN",
       onboardingComplete: "yes",
       autoStart: "yes",
+      experimentalFreshConversationPerTurn: "true",
       bridgeEnabled: false,
       browserSmokePassed: "yes",
       browserSmokeVersion: { invalid: true },
@@ -131,6 +136,8 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
       experimentalSkillAttachments: false,
+      experimentalFreshConversationPerTurn: false,
+      useSavedChats: false,
       zeroRiskProEnabled: false,
       browserSmokePassed: false,
       browserSmokeVersion: null,
@@ -153,8 +160,11 @@ test("browser interaction defaults to Automatic and preserves a completed onboar
     store.update({ browserInteractionMode: "manual", onboardingComplete: true });
     assert.equal(createStateStore(file).read().browserInteractionMode, "manual");
     assert.equal(createStateStore(file).read().zeroRiskProEnabled, false);
-    store.update({ coreSetupComplete: true, zeroRiskProEnabled: true });
+    store.update({ coreSetupComplete: true, zeroRiskProEnabled: true, experimentalFreshConversationPerTurn: true });
     assert.equal(createStateStore(file).read().zeroRiskProEnabled, true);
+    assert.equal(createStateStore(file).read().experimentalFreshConversationPerTurn, true);
+    store.update({ browserInteractionMode: "automatic" });
+    assert.equal(createStateStore(file).read().experimentalFreshConversationPerTurn, true);
     fs.writeFileSync(file, JSON.stringify({
       version: 1,
       browserInteractionMode: "manual",

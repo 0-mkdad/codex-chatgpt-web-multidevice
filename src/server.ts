@@ -6,7 +6,7 @@ import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
 import {
   cancelAllStructuredCompactions,
   cancelStructuredCompactionNativeTurn,
-  cancelStructuredCompactionTrace,
+  beginCancelStructuredCompactionTrace,
 } from "./adapters/chatgpt-web/compaction-handoff";
 import { ChatGptWebAdapterError, chatGptBrowserTabClosedError } from "./adapters/chatgpt-web/adapter-error";
 import {
@@ -363,7 +363,9 @@ export interface ResponseRequestOptions {
 }
 
 export function routeChatGptWebRequest(parsed: CodexParsedRequest, config: AppConfig): ChatGptWebModelRoute {
-  const route = requireChatGptWebModelRoute(parsed.modelId, config);
+  const route = requireChatGptWebModelRoute(parsed.modelId, config, parsed.options.reasoning);
+  if (route.interactionMode === "automatic" && route.modelFamily) parsed._chatgptModelFamily = route.modelFamily;
+  else delete parsed._chatgptModelFamily;
   parsed.modelId = route.backendModel;
   // Zero Risk preserves a distinct backend identity. Its immutable Codex effort is only a
   // protocol/catalog value; the manual adapter must never reinterpret it as a ChatGPT selection.
@@ -532,6 +534,7 @@ export async function responseRequest(
   }
 
   const compaction = parsed._compactionRequest === true;
+  const compactionItem = compaction && parsed._compactionResponseFormat !== "message";
   const rememberCompletedResponse = (response: Record<string, unknown>): void => {
     if (!compaction) {
       if (options.rememberState !== false) rememberResponseState(parsed._rawBody, response, { force: true });
@@ -539,10 +542,16 @@ export async function responseRequest(
     }
     if (response.status !== "completed") return;
     const identity = extractChatGptTurnIdentity(parsed);
-    if (!identity.threadId || !identity.turnId || !Array.isArray(response.output) || response.output.length !== 1) return;
-    const item = response.output[0];
-    if (item?.type !== "compaction" || typeof item.encrypted_content !== "string") return;
-    const summary = decodeCompactionSummary(item.encrypted_content);
+    if (!identity.threadId || !identity.turnId || !Array.isArray(response.output)) return;
+    const items = response.output.filter(item => item?.type === (compactionItem ? "compaction" : "message"));
+    if (items.length !== 1 || (compactionItem && response.output.length !== 1)) return;
+    const item = items[0];
+    const summary = compactionItem
+      ? (typeof item?.encrypted_content === "string" ? decodeCompactionSummary(item.encrypted_content) : null)
+      : (item?.role === "assistant" && Array.isArray(item.content)
+        ? item.content.filter((part: { type?: string; text?: unknown }) => part.type === "output_text" && typeof part.text === "string")
+          .map((part: { text: string }) => part.text).join("")
+        : null);
     if (!summary) return;
     const source = extractChatGptCompactionSourceRevision(parsed);
     const body = parsed._rawBody as { input?: unknown[] };
@@ -644,7 +653,7 @@ export async function responseRequest(
         ...(provider.chatgptWeb?.stallTimeoutSec !== undefined
           ? { stallTimeoutSec: provider.chatgptWeb.stallTimeoutSec }
           : {}),
-        ...(compaction ? { compaction: true } : {}),
+        ...(compactionItem ? { compaction: true } : {}),
         onCompletedResponse: rememberCompletedResponse,
       },
     );
@@ -665,7 +674,7 @@ export async function responseRequest(
     toolNsMap: maps.toolNsMap,
     freeformToolNames: maps.freeformToolNames,
     toolSearchToolNames: maps.toolSearchToolNames,
-    ...(compaction ? { compaction: true } : {}),
+    ...(compactionItem ? { compaction: true } : {}),
   });
   rememberCompletedResponse(json);
   return Response.json(json);
@@ -882,19 +891,21 @@ export function startServer(
           : chatGptBrowserTabClosedError();
         // Revoke the owner first. This prevents a compaction callback that observes its retained
         // source being cancelled below from starting a fresh fallback during operator shutdown.
-        const compactionCancellation = cancelStructuredCompactionTrace(traceId, reason);
-        const browserCancellation = chatGptTurnSessions.cancelTrace(traceId, reason);
-        const [cancelledBrowserTurns, cancelledCompactionRuns] = await Promise.all([
-          browserCancellation,
-          compactionCancellation,
-        ]);
+        const compactionCancellation = beginCancelStructuredCompactionTrace(traceId, reason);
+        const browserCancellation = chatGptTurnSessions.beginCancelTrace(traceId, reason);
         const cancelledBrokerTurns = turnBroker?.revokeTrace(traceId, reason) ?? 0;
+        const settlement = Promise.all([browserCancellation.settlement, compactionCancellation.settlement]);
+        // Explicit tab close acknowledges revoked authority, then destroys its document. Waiting
+        // for that document's helper first can deadlock the UI behind a stalled browser operation.
+        // Lease cleanup still requires physical settlement before declaring the runtime idle.
+        if (leaseFailure) await settlement;
+        else void settlement.catch(error => console.error(`[chatgpt-web] cancelled turn cleanup failed: ${error instanceof Error ? error.message : String(error)}`));
         return Response.json({
           status: "ok",
           trace_id: traceId,
-          cancelled_browser_turns: cancelledBrowserTurns,
+          cancelled_browser_turns: browserCancellation.cancelled,
           cancelled_broker_turns: cancelledBrokerTurns,
-          cancelled_compaction_runs: cancelledCompactionRuns,
+          cancelled_compaction_runs: compactionCancellation.cancelled,
           ...activity(),
         });
       }

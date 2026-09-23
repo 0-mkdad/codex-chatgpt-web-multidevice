@@ -277,11 +277,13 @@ export class LauncherBrowserHelperClient {
             browserDiagnosticsPath: this.config.browserDiagnosticsPath,
             turnTimeoutMs: this.config.turnTimeoutMs,
             autoApproveToolCalls: this.config.autoApproveToolCalls,
+            useSavedChats: this.config.useSavedChats,
           },
           turn: {
             traceId: turn.traceId,
             modelId: turn.modelId,
             reasoning: turn.reasoning,
+            ...(turn.modelFamily ? { modelFamily: turn.modelFamily } : {}),
             capabilities: turn.capabilities,
             ...(turn.nativeConnector ? { nativeConnector: true } : {}),
             ...(turn.prepareResume ? { resumeAvailable: true } : {}),

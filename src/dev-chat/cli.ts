@@ -51,7 +51,7 @@ Interactive commands:
   /fill TOKENS         Append deterministic inert context without opening ChatGPT
   /send-fill TOKENS    Send deterministic inert text through the live browser now
   /compact             Run the real browser compaction path now
-  /model MODEL         Select zero-risk, luna, think, light, medium, high, extra-high, or pro
+  /model MODEL         Select gpt-5.6-luna, gpt-5.6-sol-instant, gpt-5.6-sol, gpt-5.6-pro, gpt-6-pro, or zero-risk
   /reset yes           Clear this named DEV chat and create a new thread identity
   /help                Show this command list
   /exit                Exit
@@ -96,7 +96,7 @@ function modelFromCli(value: string | undefined): DevChatModel | undefined {
   const normalized = value.trim().toLowerCase();
   const slug = normalized.startsWith("chatgpt-web/") ? normalized : `chatgpt-web/${normalized}`;
   if (!(DEV_CHAT_MODELS as readonly string[]).includes(slug)) {
-    throw new Error(`Unknown DEV model ${JSON.stringify(value)}; choose zero-risk, luna, think, light, medium, high, extra-high, or pro`);
+    throw new Error(`Unknown DEV model ${JSON.stringify(value)}; choose ${DEV_CHAT_MODELS.map(model => model.replace("chatgpt-web/", "")).join(", ")}`);
   }
   return slug as DevChatModel;
 }
@@ -353,6 +353,14 @@ export async function runDevCommand(args: string[]): Promise<void> {
     const skillAttachments = takeFlag(args, "--skill-attachments");
     const inlineSkills = takeFlag(args, "--inline-skills");
     if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
+    const savedChats = takeFlag(args, "--saved-chats");
+    const temporaryChats = takeFlag(args, "--temporary-chats");
+    if (savedChats && temporaryChats) throw new Error("Choose --saved-chats or --temporary-chats");
+    const freshConversation = takeFlag(args, "--fresh-conversation");
+    const retainedConversation = takeFlag(args, "--retained-conversation");
+    if (freshConversation && retainedConversation) {
+      throw new Error("Choose --fresh-conversation or --retained-conversation");
+    }
     const biggerContext = takeFlag(args, "--bigger-context");
     const standardContext = takeFlag(args, "--standard-context");
     if (biggerContext && standardContext) {
@@ -369,6 +377,8 @@ export async function runDevCommand(args: string[]): Promise<void> {
         : {}),
       ...(biggerContext || standardContext ? { experimentalBiggerContext: biggerContext } : {}),
       ...(skillAttachments || inlineSkills ? { experimentalSkillAttachments: skillAttachments } : {}),
+      ...(freshConversation || retainedConversation ? { experimentalFreshConversationPerTurn: freshConversation } : {}),
+      ...(savedChats || temporaryChats ? { useSavedChats: savedChats } : {}),
       ...(tunnelId ? { tunnelId } : {}),
       ...(runtimeKeyFile ? { runtimeKeyFile } : {}),
     });

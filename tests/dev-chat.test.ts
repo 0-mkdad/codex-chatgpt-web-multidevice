@@ -158,8 +158,8 @@ test("coherent DEV MCP payloads are bounded, deterministic, and distinct", () =>
 });
 
 test("new DEV chats default to the cheapest account-supported browser model", () => {
-  expect(defaultDevChatModel({ ...defaultConfig("full"), solAvailable: true })).toBe("chatgpt-web/light");
-  expect(defaultDevChatModel({ ...defaultConfig("full"), solAvailable: false })).toBe("chatgpt-web/luna");
+  expect(defaultDevChatModel({ ...defaultConfig("full"), solAvailable: true })).toBe("chatgpt-web/gpt-5.6-sol-instant");
+  expect(defaultDevChatModel({ ...defaultConfig("full"), solAvailable: false })).toBe("chatgpt-web/gpt-5.6-luna");
   expect(DEV_CHAT_MODELS).toContain("chatgpt-web/think");
   expect(defaultDevChatModel({
     ...defaultConfig("full"),

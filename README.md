@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.0.0/codex-web-gpt-6.0.0-win-x64.exe"><img src="assets/readme/download-windows.svg" width="224" height="64" alt="Windows · x64"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.0.0/codex-web-gpt-6.0.0-mac-arm64.dmg"><img src="assets/readme/download-macos.svg" width="224" height="64" alt="macOS · Apple silicon"></a>&nbsp;
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.0.0/codex-web-gpt-6.0.0-linux-x64.AppImage"><img src="assets/readme/download-linux.svg" width="224" height="64" alt="Linux · x64"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v5.0.8/codex-web-gpt-5.0.8-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">All releases</a>
+  <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/download/v6.0.0/codex-web-gpt-6.0.0-mac-x64.dmg">macOS Intel</a> · <a href="https://github.com/miuuyy/codex-chatgpt-web/releases/latest">All releases</a>
 </p>
 
 <p align="center">
@@ -36,7 +36,7 @@ Full harness mode connects ChatGPT to the current task’s files, terminal, tool
 
 1. **Install the launcher** using the download for your system above.
 2. **Sign in to ChatGPT** in the embedded browser and run the browser smoke test.
-3. **Install models**, restart Codex once, and choose a **ChatGPT Web — …** model.
+3. **Install models** and restart Codex once. In automatic mode, choose a model ending in **(Web)**. Pro versions have separate entries; Sol reasoning is selected through Effort. Zero Risk keeps its dedicated entry.
 4. **For coding with tools**, open **MCP** in the launcher and complete the Full harness setup below.
 
 The app includes its browser and runtime. No separate Chrome, Node, or Bun installation is needed.
@@ -115,6 +115,7 @@ that option clicks **Allow once**, never a permanent grant.
 
 Use **Activity** for safe local diagnostics and **Settings → Run doctor** for end-to-end health.
 Settings can also cancel a retained browser turn or remove the Codex integration before uninstall.
+**Save chats in ChatGPT** keeps task conversations in ChatGPT history. Off by default; independent of **New browser chat for each turn**.
 Set `CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS=1` only when every browser checkpoint needs a screenshot.
 
 New installs use **Compatibility V1** for cross-backend subagents. **Native** preserves Codex's own

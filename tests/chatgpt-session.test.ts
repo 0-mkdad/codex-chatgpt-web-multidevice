@@ -6,8 +6,32 @@ import {
   CHATGPT_EFFORT_MENU_SELECTOR,
   CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
   activateChatGptEffortMenu,
+  assertNewChatPage,
+  chatGptNewChatUrl,
   detectChatGptAccountCapabilities,
 } from "../src/chatgpt-session";
+
+test("saved chats start empty and cannot reuse an arbitrary conversation or a Temporary Chat", async () => {
+  expect(chatGptNewChatUrl()).toBe("https://chatgpt.com/?temporary-chat=true");
+  expect(chatGptNewChatUrl(true)).toBe("https://chatgpt.com/");
+  const prepare = (ChatGptBrowserWorker.prototype as any).prepareChatSurface;
+  for (const saved of [false, true]) {
+    let url = "https://chatgpt.com/c/previous-task";
+    const navigations: string[] = [];
+    const absent: any = { filter: () => absent, last: () => absent, isVisible: async () => false };
+    const composer: any = { count: async () => 1, nth: () => composer, isVisible: async () => true };
+    const page: any = {
+      url: () => url,
+      goto: async (next: string) => { url = next; navigations.push(next); },
+      locator: (selector: string) => selector === CHATGPT_COMPOSER_SELECTOR ? composer : absent,
+    };
+    expect(await prepare.call({ activeComposer: async () => composer }, page, undefined, saved)).toBe(composer);
+    expect(navigations).toEqual([chatGptNewChatUrl(saved)]);
+    await expect(assertNewChatPage(page, !saved)).rejects.toThrow("requested new");
+    url = "https://chatgpt.com/c/previous-task";
+    await expect(assertNewChatPage(page, saved)).rejects.toThrow("requested new");
+  }
+});
 
 test("composer and effort selectors exclude unrelated editable fields and menu buttons", () => {
   const { createDocument } = require("@mixmark-io/domino") as { createDocument(html: string): Document };
@@ -211,7 +235,7 @@ test("a transient effort control does not turn a Luna-only account into Sol", as
   expect(visibilityReads).toBe(2);
 });
 
-function reasoningPicker(options: { max?: string; delay?: number; missing?: boolean; loseSelectionOnClose?: boolean } = {}) {
+function reasoningPicker(options: { max?: string; locks?: Array<string | null>; delay?: number; missing?: boolean; loseSelectionOnClose?: boolean } = {}) {
   let value = 0;
   let opened = true;
   const keys: string[] = [];
@@ -233,6 +257,17 @@ function reasoningPicker(options: { max?: string; delay?: number; missing?: bool
   const container = {
     filter() { return this; }, last() { return this; },
     locator: () => slider,
+    evaluate: async (read: (element: Element) => unknown) => {
+      const { createDocument } = require("@mixmark-io/domino") as { createDocument(html: string): Document };
+      // Captured Plus DOM: the slider root and each tick have data-locked, but only
+      // ticks have data-selected. Its fourth position is a locked Pro upsell.
+      const locks = options.locks ?? Array.from({ length: Number(options.max ?? "4") + 1 }, () => "false");
+      const document = createDocument(`<div data-model-reasoning-effort-slider>
+        <span data-locked="false"><span>${locks.map((lock, index) =>
+          `<span data-selected="${index <= value}"${lock === null ? "" : ` data-locked="${lock}"`}></span>`).join("")}
+        </span></span></div>`);
+      return read(document.querySelector("[data-model-reasoning-effort-slider]")!);
+    },
     isVisible: async () => true,
     waitFor: async ({ state }: { state: string }) => {
       expect(state).toBe("visible");
@@ -284,6 +319,38 @@ test("the authoritative three-step range is non-Pro; a malformed range fails clo
 test("the four-step browser range keeps Extra High available when Pro is unavailable", async () => {
   await expect(detectChatGptAccountCapabilities(reasoningPicker({ max: "3" }).page as never))
     .resolves.toEqual({ solAvailable: true, extraHighAvailable: true, proAvailable: false });
+});
+
+test("capabilities exclude the observed locked Plus upsell and reject unknown lock state", async () => {
+  await expect(detectChatGptAccountCapabilities(reasoningPicker({
+    max: "3", locks: ["false", "false", "false", "true"],
+  }).page as never)).resolves.toEqual({ solAvailable: true, extraHighAvailable: false, proAvailable: false });
+  await expect(detectChatGptAccountCapabilities(reasoningPicker({
+    locks: ["false", "false", "false", "false", "true"],
+  }).page as never)).resolves.toEqual({ solAvailable: true, extraHighAvailable: true, proAvailable: false });
+  for (const locks of [[], ["false", "false", "false", null], ["false", "false", "false", "unknown"]]) {
+    await expect(detectChatGptAccountCapabilities(reasoningPicker({ max: "3", locks }).page as never))
+      .rejects.toThrow("availability");
+  }
+});
+
+test("stale saved capabilities cannot activate a locked effort; High remains selectable", async () => {
+  for (const effort of ["xhigh", "high"] as const) {
+    const fixture = reasoningPicker({ max: "3", locks: ["false", "false", "false", "true"] });
+    const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+      activeComposer: async () => fixture.composer,
+    }) as { selectModelAndEffort(...args: unknown[]): Promise<{ selection: { label: string } }> };
+    const selection = worker.selectModelAndEffort(fixture.page, "gpt-5.6-sol", effort, {
+      localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true,
+    });
+    if (effort === "xhigh") {
+      await expect(selection).rejects.toMatchObject({ code: "chatgpt_effort_locked", retryable: false });
+      expect(fixture.keys).toEqual([]);
+    } else {
+      expect((await selection).selection.label).toBe("High");
+      expect(fixture.keys).toEqual(["ArrowRight", "ArrowRight"]);
+    }
+  }
 });
 
 test("Pro selection verifies the persisted hidden slider through its visible owner, never model rows", async () => {

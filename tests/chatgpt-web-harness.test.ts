@@ -368,7 +368,7 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test("keeps sequential native messages in one retained MCP conversation until compaction", async () => {
+  test.each([false, true])("sequential native messages honor fresh conversation mode=%s", async freshConversation => {
     const socketPath = brokerTestEndpoint(`cgw-retained-messages-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -376,6 +376,7 @@ describe("ChatGPT outer-native harness v4", () => {
       chatgptWeb: {
         browserHost: "launcher",
         browserHostDescriptorPath: join(tempRoot, "retained-launcher.json"),
+        experimentalFreshConversationPerTurn: freshConversation,
         brokerSocketPath: socketPath,
         localToolsEnabled: true,
         solAvailable: true,
@@ -385,11 +386,15 @@ describe("ChatGPT outer-native harness v4", () => {
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
     const preparedPrompts: string[] = [];
-    const conversationKeys: string[] = [];
+    const conversationKeys: (string | undefined)[] = [];
     const tokens: string[] = [];
     let browserMessages = 0;
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
-      const prepared = browserMessages === 0 ? await turn.prepare() : await turn.prepareResume!();
+      if (freshConversation) {
+        expect(turn.prepareResume).toBeUndefined();
+        expect(turn.retainConversation).not.toBe(true);
+      }
+      const prepared = browserMessages === 0 || freshConversation ? await turn.prepare() : await turn.prepareResume!();
       preparedPrompts.push(prepared.text);
       conversationKeys.push(turn.conversationKey!);
       const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
@@ -440,12 +445,18 @@ describe("ChatGPT outer-native harness v4", () => {
       await adapter.runTurn!(second, { headers: new Headers() }, () => {});
 
       expect(browserMessages).toBe(2);
-      expect(conversationKeys[0]).toBe(chatGptConversationKey(first, chatGptWebExecutionNamespace(provider))!);
+      expect(conversationKeys[0]).toBe(freshConversation
+        ? undefined : chatGptConversationKey(first, chatGptWebExecutionNamespace(provider))!);
       expect(conversationKeys[1]).toBe(conversationKeys[0]);
       expect(tokens[1]).not.toBe(tokens[0]);
       expect(preparedPrompts[0]).toContain("Inspect the project");
       expect(preparedPrompts[1]).toContain("Continue in the same repository");
-      expect(preparedPrompts[1]).not.toContain("First retained answer");
+      if (freshConversation) {
+        expect(preparedPrompts[1]).toContain("First retained answer");
+        expect(preparedPrompts[1]).toContain("Inspect the project");
+      } else {
+        expect(preparedPrompts[1]).not.toContain("First retained answer");
+      }
       expect(preparedPrompts[1]).not.toContain(environmentXml);
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
@@ -2481,13 +2492,14 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test("runs Pro through the same turn-bound MCP tool loop as other Full-mode efforts", async () => {
+  test.each([false, true])("Pro keeps one MCP tool loop and replays results with fresh mode=%s", async freshConversation => {
     const socketPath = brokerTestEndpoint(`cgw-h3-pro-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
       baseUrl: "browser://chatgpt-pro-test",
       contextWindow: 256_000,
-      chatgptWeb: { brokerSocketPath: socketPath, turnTimeoutMs: 30_000, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      chatgptWeb: { brokerSocketPath: socketPath, turnTimeoutMs: 30_000, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true,
+        experimentalFreshConversationPerTurn: freshConversation },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);

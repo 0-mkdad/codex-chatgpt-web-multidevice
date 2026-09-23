@@ -758,6 +758,61 @@ test("Bigger Context send activation keeps the outer stage budget instead of res
   expect(pressOptions?.signal).toBeInstanceOf(AbortSignal);
 });
 
+test("two-part saved chats re-prove unchanged effort after the first message creates the conversation URL", async () => {
+  const root = mkdtempSync(join(tmpdir(), "saved-chat-multipart-"));
+  const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+  const prepared = { ...compileChatGptWebPrompt({
+    modelId: CHATGPT_WEB_MODEL_ID, stream: true, options: { reasoning: "low" },
+    context: { systemPrompt: ["Keep literal paths."], messages: [
+      { role: "user", content: "Read the first file.", timestamp: 1 },
+      { role: "user", content: "Compare it with the second file.", timestamp: 2 },
+    ] },
+  }, capabilities, undefined, { experimentalMultipartParts: 2 }), release() {} };
+  const worker: any = ChatGptBrowserWorker.forProvider({
+    adapter: "chatgpt-web", baseUrl: `browser://${root}`,
+    chatgptWeb: { useSavedChats: true, browserDiagnosticsPath: root },
+  });
+  let url = "https://chatgpt.com/";
+  const savedUrl = "https://chatgpt.com/c/00000000-0000-4000-8000-000000000001";
+  const selections: string[] = [];
+  const control = { innerText: async () => "Instant", getAttribute: async () => "false" };
+  const controls: any = { filter: () => controls, count: async () => 1, first: () => control };
+  const composer = { locator: () => ({ locator: () => controls }), isEditable: async () => true };
+  const page = Object.assign(new EventEmitter(), {
+    url: () => url, isClosed: () => false,
+    evaluate: async () => { throw new Error("No real browser in the transport fixture"); },
+  });
+  let sends = 0;
+  const finished = new Error("final send reached with a current effort proof");
+  Object.assign(worker, {
+    prepareChatSurface: async (_page: unknown, _capture: unknown, saved: boolean) => { expect(saved).toBeTrue(); },
+    activeComposer: async () => composer,
+    selectModelAndEffort: async () => {
+      selections.push(url);
+      return { ...resolveChatGptWebMultipartStagingMode(CHATGPT_WEB_MODEL_ID, capabilities, 100, 100),
+        selection: { url, label: "Instant" } };
+    },
+    captureSubmissionBaseline: async () => ({}),
+    attachPrompt: async () => {}, attachPromptWithCompactionRetry: async () => {}, attachFiles: async () => {},
+    waitForNewAssistantTurn: async () => ({}), waitForMultipartAcknowledgement: async () => {},
+    sendAttachedPrompt: async (_page: unknown, _baseline: unknown, _capture: unknown, _signal: unknown,
+      _progress: unknown, lifecycle: { onSendActivated(): Promise<void> }) => {
+      await lifecycle.onSendActivated();
+      if (++sends === 2) throw finished;
+      url = savedUrl;
+      return "user_turn";
+    },
+  });
+  try {
+    await expect(worker.runBrowserTurn({
+      traceId: "saved_multipart", modelId: CHATGPT_WEB_MODEL_ID, reasoning: "low", capabilities,
+      prepare: async () => prepared, onTextDelta() {}, onReasoningSummary() {},
+    }, undefined, page)).rejects.toBe(finished);
+    expect(sends).toBe(2);
+    expect(selections).toEqual(["https://chatgpt.com/", savedUrl]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("submission observation recovery resumes with rebound locators and is strictly bounded", async () => {
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
@@ -1127,7 +1182,7 @@ test("large Markdown-rich context uses one plain-text editing command before exa
     activeComposer: async () => composer,
     insertPromptText,
     assertPromptAttached: async (_page: unknown, value: string) => { asserted = value; },
-  }, {}, prompt, false);
+  }, dialogPage("").page, prompt, false);
 
   expect(calls[0]).toEqual(["fill", ""]);
   expect(calls.filter(call => call[0] === "evaluate")).toEqual([["evaluate", prompt]]);
@@ -1269,6 +1324,7 @@ test("connector selection re-resolves the active composer after ChatGPT replaces
     },
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     getByText: (text: string, options: { exact: boolean }) => {
       expect(text).toBe("Codex Native2");
@@ -1344,6 +1400,7 @@ test("connector selection moves highlight to the exact hidden-viewport row befor
   };
   const selectedComposer = { selected: true };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     getByText: () => ({ exactConnectorLabel: true }),
     locator: () => menuRows,
@@ -1367,6 +1424,7 @@ test("repeated connector verification reuses its selected pill before clearing t
     fill: async () => { fillCalls += 1; },
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     getByText: () => ({ exactConnectorLabel: true }),
     locator: () => ({ filter: () => ({}) }),
@@ -1425,6 +1483,7 @@ test("connector selection retriggers the complete mention after a fresh-page hyd
     },
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     getByText: () => ({ exactConnectorLabel: true }),
     locator: (selector: string) => selector.includes("__menu-item")
@@ -1491,6 +1550,7 @@ test("connector verification preserves the host-refreshed catalog evidence", asy
   };
   const selectedComposer = { selected: true };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     reload: async () => { calls.push("reload"); },
     getByText: () => ({ exactConnectorLabel: true }),
@@ -1528,7 +1588,7 @@ test("connector verification preserves the host-refreshed catalog evidence", asy
   const fixture = {
     config: { appName: "Codex Native2", browserDiagnosticsPath: diagnosticsRoot },
     ensurePage: async () => page,
-    prepareTemporaryChatSurface: async () => {
+    prepareChatSurface: async () => {
       prepared += 1;
       calls.push(`prepare:${prepared}`);
     },
@@ -1588,7 +1648,7 @@ for (const captureScreenshots of [false, true]) test(`connector failure persists
     await expect(verifyConnectorExclusive.call({
       config: { appName: "Codex Native2", browserDiagnosticsPath: diagnosticsRoot },
       ensurePage: async () => page,
-      prepareTemporaryChatSurface: async (_page: unknown, capture: (checkpoint: string) => Promise<void>) => {
+      prepareChatSurface: async (_page: unknown, capture: (checkpoint: string) => Promise<void>) => {
         await capture("composer-ready");
       },
       selectConnector: async (_page: unknown, capture: (checkpoint: string) => Promise<void>) => {
@@ -1643,7 +1703,7 @@ test("successful connector verification clears the proven selection before relea
     const result = await verifyConnectorExclusive.call({
       config: { appName: "Codex Native2 DEV", browserDiagnosticsPath: diagnosticsRoot },
       ensurePage: async () => page,
-      prepareTemporaryChatSurface: async (_page: unknown, capture: (checkpoint: string) => Promise<void>) => {
+      prepareChatSurface: async (_page: unknown, capture: (checkpoint: string) => Promise<void>) => {
         calls.push("prepare");
         await capture("composer-ready");
       },
@@ -1699,7 +1759,8 @@ test("connector catalog refresh stays fail-closed for absent, legacy, and exact 
   const run = async (visibleRows: string[]) => {
     let now = realDateNow();
     const page = {
-      getByRole: personalizedTemporaryChatRole,
+      url: () => "https://chatgpt.com/?temporary-chat=true",
+    getByRole: personalizedTemporaryChatRole,
       getByText: () => ({ exactConnectorLabel: true }),
       locator: () => ({
         filter: (options: { has?: unknown; visible?: boolean }) => options.visible
@@ -1809,9 +1870,10 @@ test("tool-capable prompts use the shared Playwright connector selection before 
     },
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     getByText: () => ({ exactConnectorLabel: true }),
-    locator: (selector: string) => selector.includes("__menu-item")
+    locator: (selector: string) => selector === '[role="dialog"]' ? dialogPage("").page.locator(selector) : selector.includes("__menu-item")
       ? { filter: () => appResult, evaluateAll: async () => [] }
       : (() => { throw new Error(`Unexpected locator: ${selector}`); })(),
   };
@@ -1895,6 +1957,7 @@ test("an aborted connector proof clears its mention before the preflight release
     evaluate: async () => { calls.push("cleanup-read"); return ""; },
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: () => absent,
     getByText: () => ({ exactConnectorLabel: true }),
     locator: (selector: string) => {
@@ -1949,6 +2012,7 @@ test("a lost connector mention cannot be used as evidence to change personalizat
     evaluate: async () => ({ text: "", focused: false }),
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: () => absent,
     getByText: () => ({}),
     locator: (selector: string) => {
@@ -2004,6 +2068,7 @@ test("an aborted real connector selection clears the typed mention before return
     evaluate: async () => { calls.push("cleanup-read"); return composerText.trim(); },
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     getByText: () => ({ exactConnectorLabel: true }),
     locator: (selector: string) => {
@@ -2101,6 +2166,7 @@ test("an abort after connector activation removes the selected pill before retur
     evaluate: async () => composerText.trim(),
   };
   const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     getByText: () => ({ exactConnectorLabel: true }),
     locator: (selector: string) => selector === "body"
@@ -2161,7 +2227,7 @@ test("an abort while inserting a connector prompt clears the selected pill and p
       connectorSelected = false;
       cleanupFinished = true;
     },
-  }, {}, "context", true, undefined, controller.signal);
+  }, dialogPage("").page, "context", true, undefined, controller.signal);
 
   await expect(attachment).rejects.toMatchObject({ name: "AbortError" });
   expect(cleanupFinished).toBeTrue();
@@ -2193,7 +2259,7 @@ test("retained tool turns insert into the connector-bound composer without selec
     selectConnector: async () => { throw new Error("retained connector must not be selected again"); },
     insertPromptText: async (_page: unknown, text: string) => { expect(text).toBe("retained context"); calls.push("insert"); },
     assertPromptAttached: async () => { calls.push("assert"); },
-  }, {}, "retained context", true, undefined, undefined, false, undefined, true);
+  }, dialogPage("").page, "retained context", true, undefined, undefined, false, undefined, true);
   expect(calls).toEqual(["fill", "focus", "insert", "assert"]);
 });
 
@@ -2322,7 +2388,7 @@ function thinkSlashFixture() {
     waitFor: async () => { if (!state.optionCount) throw new Error("Think command is unavailable"); } };
   const rows = { filter: () => rows, first: () => row, count: async () => state.optionCount };
   const popup = { filter: () => popup, locator: () => rows, count: async () => state.popupCount };
-  const page = { locator: () => popup };
+  const page = { locator: (selector: string) => selector === '[role="dialog"]' ? dialogPage("").page.locator(selector) : popup };
   const composer = {
     filter: () => composer, first: () => composer, locator: () => composerForm,
     evaluate: async () => ({ text: state.draft.trim(), connectors: [...state.connectors] }),
@@ -2544,6 +2610,18 @@ test("submission acceptance reports a rate-limit dialog that appears after Enter
     errorType: "rate_limit_error",
     code: "rate_limit_exceeded",
     retryable: false,
+  });
+  expect(fixture.pressed).toEqual(["Enter"]);
+});
+
+test("prompt attachment reports a rate-limit modal before editing the composer", async () => {
+  const fixture = dialogPage("Too many requests. You're making requests too quickly.");
+  const attach = (ChatGptBrowserWorker.prototype as unknown as {
+    attachPrompt(page: Page, prompt: string, localTools: boolean): Promise<void>;
+  }).attachPrompt;
+  await expect(attach.call({ activeComposer: async () => { throw new Error("composer was touched"); } },
+    fixture.page, "next context part", false)).rejects.toMatchObject({
+    status: 429, code: "rate_limit_exceeded", retryable: false,
   });
   expect(fixture.pressed).toEqual(["Enter"]);
 });
@@ -3987,6 +4065,20 @@ test("embedded chart hydration cannot replace Markdown answer content with rende
     .not.toBe(text("<pre><code>one\ntwo</code></pre>"));
   expect(text("<div>A</div><div>B</div>"))
     .toBe(text("<section><div>A</div><div>B</div></section>"));
+
+  const files = createDocument('<p>Report: <span data-state="closed">'
+    + '<button class="behavior-btn entity-underline" href="https://wrong.example/download" aria-label="Download">'
+    + '<svg><text>File icon</text></svg>report.pdf<span hidden>Hidden</span></button></span> '
+    + '<button class="entity-underline behavior-btn">report.pdf</button>'
+    + '<button>Copy</button><button class="entity-underline">Retry</button>'
+    + '<button class="behavior-btn entity-underline" hidden>hidden.pdf</button>'
+    + '<span aria-hidden="true"><button class="behavior-btn entity-underline">also-hidden.pdf</button></span></p>').body;
+  const originalFiles = files.innerHTML;
+  const projectedFiles = contentFor(files);
+  expect(chatGptHtmlToMarkdown(projectedFiles.innerHTML)).toBe("Report: report.pdf report.pdf");
+  expect(textFor(projectedFiles)).toBe("Report: report.pdf report.pdf");
+  expect(projectedFiles.querySelectorAll("button, a, svg").length).toBe(0);
+  expect(files.innerHTML).toBe(originalFiles);
 });
 
 test("proven MCP progress vetoes completion, not only the health verdicts", () => {

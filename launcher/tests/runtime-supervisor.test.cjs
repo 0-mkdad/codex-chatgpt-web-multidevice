@@ -156,6 +156,16 @@ test("launcher runtime ownership cannot cross production and DEV profiles", () =
     validateConfig({ ...production, stallTimeoutSec: 900 }, descriptorPath).stallTimeoutSec,
     900,
   );
+  for (const enabled of [false, true]) {
+    for (const browserInteractionMode of ["automatic", "manual"]) {
+      assert.equal(validateConfig({ ...production, browserInteractionMode,
+        experimentalFreshConversationPerTurn: enabled }, descriptorPath).experimentalFreshConversationPerTurn, enabled);
+    }
+  }
+  for (const invalid of ["true", 1, null]) {
+    assert.throws(() => validateConfig({ ...production,
+      experimentalFreshConversationPerTurn: invalid }, descriptorPath), /invalid experimentalFreshConversationPerTurn/);
+  }
 });
 
 test("DEV runtime supervision ignores launcher version mismatch and starts only the isolated MCP tunnel", async () => {
@@ -2029,4 +2039,63 @@ server.listen(config.port, config.host);
     if (stale.exitCode === null) stale.kill("SIGTERM");
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("observed CLI fresh-conversation changes retire completed tabs once and defer launcher transactions", async () => {
+  const vm = require("node:vm");
+  const { BrowserHost } = require("../electron/browser-host.cjs");
+  const { releaseRetainedConversation } = require("../electron/retained-turn-release.cjs");
+  const main = fs.readFileSync(path.join(__dirname, "../electron/main.cjs"), "utf8");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-fresh-config-"));
+  const descriptorPath = path.join(root, "launcher.json");
+  const configPath = path.join(root, "config.json");
+  const state = { experimentalFreshConversationPerTurn: false, useSavedChats: false };
+  const key = "a".repeat(64);
+  const old = { id: "old", traceId: "old-trace", status: "ready", interactionMode: "automatic", conversationKey: key,
+    connectorIdentity: "Codex Native2", connectorBound: true };
+  const active = { id: "active", traceId: "active-trace", status: "running", interactionMode: "automatic", conversationKey: key };
+  const manual = { id: "manual", status: "ready", interactionMode: "manual", conversationKey: "b".repeat(64) };
+  let operation = null, updates = 0;
+  const removed = [];
+  const browserHost = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null, turnTabs: new Map([[old.id, old], [active.id, active], [manual.id, manual]]),
+    userCancelledTurnOwners: new Map(), logger: { info() {} },
+    removeTurnTab(tab, abort) { assert.equal(abort, false); removed.push(tab.id); this.turnTabs.delete(tab.id); },
+    createTurnTab: async () => ({ id: "new", surfaceId: "new-surface" }),
+    syncViewVisibility() {}, snapshot: () => ({}), publishState() {}, writeDescriptor() {},
+  });
+  const sandbox = {
+    browserHost, releaseRetainedConversation, runtimeHost: { currentOperation: () => operation },
+    stateStore: { read: () => ({ ...state }), update: patch => { updates++; return Object.assign(state, patch); } },
+    send() {},
+  };
+  vm.runInNewContext(main.slice(main.indexOf("function syncFreshConversationPreference("), main.indexOf("function registerIpc(")), sandbox);
+  const supervisor = new RuntimeSupervisor({ coreHome: root, browserDescriptorPath: descriptorPath,
+    onConfigRead: config => sandbox.syncFreshConversationPreference(sandbox.stateStore, config) });
+  const persist = enabled => fs.writeFileSync(configPath, JSON.stringify(launcherConfig(descriptorPath, {
+    solAvailable: true, browserInteractionMode: "automatic", experimentalFreshConversationPerTurn: enabled,
+  })));
+  try {
+    persist(true);
+    operation = "fresh-conversation-per-turn";
+    supervisor.readConfig();
+    assert.deepEqual(removed, [], "an uncommitted setup config must not retire history");
+    persist(false);
+    operation = null;
+    supervisor.readConfig();
+    assert.equal(updates, 0, "rolled-back setup preserves the saved preference");
+    for (const enabled of [true, false]) {
+      persist(enabled); // A separate CLI updates the persisted config.
+      supervisor.readConfig();
+      assert.equal(state.experimentalFreshConversationPerTurn, enabled);
+      supervisor.readConfig();
+      assert.equal(updates, enabled ? 1 : 2, "unchanged observations do not commit or clear twice");
+    }
+    assert.deepEqual(removed, [old.id]);
+    assert.equal(browserHost.turnTabs.get(active.id), active);
+    assert.equal(browserHost.turnTabs.get(manual.id), manual);
+    const lease = await browserHost.beginTurn("new-trace", false, 123, key, "Codex Native2");
+    assert.equal(lease.reused, false);
+    assert.equal(lease.tabId, "new");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

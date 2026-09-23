@@ -612,6 +612,14 @@ export class TurnBroker implements TurnBrokerOwner {
   revoke(token: string, reason = new Error("Codex turn binding was revoked")): void {
     const channel = this.channels.get(token);
     if (!channel) return;
+    console.info(`[chatgpt-web] broker_retired ${JSON.stringify({
+      traceId: channel.traceId,
+      pendingTools: channel.invocations.size,
+      queuedTools: channel.queuedCallIds.length,
+      deliveredTools: channel.deliveredCallIds.size,
+      activeMcpRequests: channel.activities.size,
+      completionCommitted: channel.completionCommitted,
+    })}`);
     this.channels.delete(token);
     this.pending.delete(token);
     if (channel.bindingId) {

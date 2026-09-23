@@ -12,6 +12,7 @@ import {
   extractChatGptThreadSpawnLineage,
   extractChatGptRootThreadMetadata,
   hasCurrentChatGptEnvironmentContext,
+  hasChatGptCalendarEnvironmentDelta,
   hasRawChatGptEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
   isChatGptCompactionContinuation,
@@ -162,7 +163,8 @@ export class ChatGptThreadEnvironmentStore {
         ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
       const steeringClaim = hasCurrentContext && !currentCompaction
         ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
-      if (hasCurrentContext && !currentCompaction && !historicalMessages && !steeringClaim) throw error;
+      const calendarDelta = hasCurrentContext && !currentCompaction && hasChatGptCalendarEnvironmentDelta(parsed);
+      if (hasCurrentContext && !currentCompaction && !historicalMessages && !steeringClaim && !calendarDelta) throw error;
       const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim;
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       // Automatic compaction has a current turn_context; standalone compaction has only its
@@ -180,6 +182,9 @@ export class ChatGptThreadEnvironmentStore {
           tools: parsed.context.tools,
         });
         if (rolloutEnvironment) {
+          if (calendarDelta && rolloutEnvironment.sandboxPolicy.type !== "dangerFullAccess") {
+            throw new Error("Calendar environment delta conflicts with its current Codex rollout");
+          }
           if (currentClaim && !sameAuthority(currentClaim, rolloutEnvironment)) {
             throw new Error(`${currentCompaction ? "Compaction continuation" : "Steering"} environment conflicts with its current Codex rollout`);
           }

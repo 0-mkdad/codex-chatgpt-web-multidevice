@@ -54,6 +54,8 @@ export interface SetupOptions {
   autoApproveToolCalls?: boolean;
   experimentalBiggerContext?: boolean;
   experimentalSkillAttachments?: boolean;
+  experimentalFreshConversationPerTurn?: boolean;
+  useSavedChats?: boolean;
   zeroRiskProEnabled?: boolean;
   replaceCodexRoute?: boolean;
   restartService?: boolean;
@@ -146,6 +148,8 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     proAvailable: before.proAvailable,
     experimentalBiggerContext: before.experimentalBiggerContext,
     experimentalSkillAttachments: before.experimentalSkillAttachments,
+    experimentalFreshConversationPerTurn: before.experimentalFreshConversationPerTurn,
+    useSavedChats: before.useSavedChats,
     zeroRiskProEnabled: before.zeroRiskProEnabled,
     autoApproveToolCalls: before.autoApproveToolCalls,
     controlToken: before.controlToken,
@@ -175,6 +179,8 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     proAvailable: after.proAvailable,
     experimentalBiggerContext: after.experimentalBiggerContext,
     experimentalSkillAttachments: after.experimentalSkillAttachments,
+    experimentalFreshConversationPerTurn: after.experimentalFreshConversationPerTurn,
+    useSavedChats: after.useSavedChats,
     zeroRiskProEnabled: after.zeroRiskProEnabled,
     autoApproveToolCalls: after.autoApproveToolCalls,
     controlToken: after.controlToken,
@@ -273,6 +279,10 @@ function baseConfig(
   if (options.experimentalSkillAttachments !== undefined) {
     config.experimentalSkillAttachments = options.experimentalSkillAttachments;
   }
+  if (options.useSavedChats !== undefined) config.useSavedChats = options.useSavedChats;
+  if (options.experimentalFreshConversationPerTurn !== undefined) {
+    config.experimentalFreshConversationPerTurn = options.experimentalFreshConversationPerTurn;
+  }
   if (options.experimentalBiggerContext !== undefined) {
     config.experimentalBiggerContext = options.experimentalBiggerContext;
   }
@@ -283,6 +293,9 @@ function baseConfig(
     config.zeroRiskProEnabled = options.zeroRiskProEnabled;
   }
   if (config.browserInteractionMode === "manual") {
+    if (options.experimentalFreshConversationPerTurn === true) {
+      throw new Error("Fresh browser conversations per turn is available only in automatic mode");
+    }
     if (options.refreshAccountCapabilities) {
       throw new Error("Zero Risk cannot refresh account capabilities");
     }

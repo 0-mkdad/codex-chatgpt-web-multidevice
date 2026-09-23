@@ -89,11 +89,16 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
       const listener = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response() });
       const port = listener.port!;
       await listener.stop(true);
-      const result = await (development ? setupDevProfile : setup)({ ...options, port });
+      const result = await (development ? setupDevProfile : setup)({ ...options, port,
+        ...(interaction === "automatic" ? { experimentalFreshConversationPerTurn: true } : {}),
+        useSavedChats: true,
+      });
       expect(calls).toEqual(development ? ["save"] : ["save", "integrate"]);
       expect(saved?.tunnel?.alias).toBe(`codex-chatgpt-web${development ? "-dev" : ""}${interaction === "manual" ? "-zero-risk" : ""}`);
       expect(result.tunnelReady).not.toBe(true);
       expect(result.connectorSetupRequired).toBe(true);
+      expect(saved?.experimentalFreshConversationPerTurn).toBe(interaction === "automatic");
+      expect(saved?.useSavedChats).toBe(true);
 
       calls.length = 0;
       mocks.push(spyOn(configModule, "saveConfig").mockImplementation(() => { throw new Error("config commit failed"); }));

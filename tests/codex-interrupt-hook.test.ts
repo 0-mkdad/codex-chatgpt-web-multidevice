@@ -188,6 +188,31 @@ test("keeps foreign TOML tables inserted between the managed hook and its trust 
   }
 });
 
+test("preserves ownership when Codex moves trust state before the hook and normalizes boundary newlines", () => {
+  for (const ending of ["\n", "\r\n", "\r"]) {
+    const original = 'model = "example"\n'.replaceAll("\n", ending);
+    const { text, installed } = installCodexInterruptHook(original, "/Users/test/.codex/config.toml", {
+      runtimeCommand: ["/opt/runtime"],
+    });
+    const state = `[hooks.state.${JSON.stringify(installed.stateKey)}]${ending}trusted_hash = ${JSON.stringify(installed.trustedHash)}${ending}`;
+    const rewritten = text.replace(state, "").replace("# Managed by codex-chatgpt-web:", state + "# Managed by codex-chatgpt-web:")
+      .replace(`timeout = 3${ending}${ending}`, `timeout = 3${ending}`);
+    const parse = (value: string) => Bun.TOML.parse(value.replace(/\r\n?/g, "\n"));
+    expect(parse(rewritten)).toEqual(parse(text));
+    verifyCodexInterruptHook(rewritten, installed);
+    const restored = restoreCodexInterruptHook(rewritten, installed);
+    expect(parse(restored)).toEqual(parse(original));
+    verifyCodexInterruptHookRestored(restored);
+    for (const modified of [
+      rewritten.replace("timeout = 3", "timeout = 2"),
+      rewritten.replace(installed.command, "other-command"),
+      rewritten.replace(installed.trustedHash, "sha256:changed"),
+      rewritten + state,
+      rewritten + `${ending}[hooks.state.${JSON.stringify(installed.stateKey)}.extra]${ending}enabled = true`,
+    ]) expect(() => verifyCodexInterruptHook(modified, installed)).toThrow("changed after setup");
+  }
+});
+
 test("accepts a literal-quoted trust-state key while preserving another config path's trust entry", () => {
   const original = 'model = "example"\n';
   const installed = installCodexInterruptHook(original, "/Users/test/.codex/config.toml", { runtimeCommand: ["/opt/runtime"] });
