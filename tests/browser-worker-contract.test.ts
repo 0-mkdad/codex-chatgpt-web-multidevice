@@ -7,12 +7,14 @@ import { createContext, runInContext } from "node:vm";
 import type { Page } from "playwright-core";
 import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptSubmissionRejectionObserver, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess, chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_MULTIPART_STAGE_MAX_TIMEOUT_MS, resolveChatGptMultipartStageTimeoutMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_STOPPED_THINKING_LABELS } from "../src/adapters/chatgpt-web/ui-labels";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
 import { parseChatGptEffortSliderState } from "../src/chatgpt-session";
 import { ChatGptExternalTurnProgress, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
+import { DEFAULT_CHATGPT_OPERATIONAL_CONCURRENCY, resolveChatGptOperationalConcurrency } from "../src/adapters/chatgpt-web/concurrency";
 import type { CodexProviderConfig } from "../src/types";
 import { compileChatGptWebPrompt, formatChatGptWebMultipartCommit, formatChatGptWebMultipartStage } from "../src/adapters/chatgpt-web/prompt";
 import { estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
@@ -239,13 +241,18 @@ test("a retained MCP conversation reuses its proven connector binding", () => {
   expect(chatGptConnectorAttachmentMode(false, false)).toBe("none");
 });
 
-test("browser turns run concurrently up to the five-tab limit", async () => {
+test("browser turns queue at balanced concurrency while preserving the five-turn hard ceiling", async () => {
   expect(MAX_CHATGPT_BROWSER_TABS).toBe(5);
   const releases = new Map<string, () => void>();
+  const starts: string[] = [];
   const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
     config: { browserHost: "managed-chrome" },
     activeRuns: new Map(),
+    pendingRuns: [],
+    runningRuns: 0,
+    operationalConcurrencyLimit: () => 2,
     runExclusive: (turn: { traceId: string }) => new Promise<string>(resolve => {
+      starts.push(turn.traceId);
       releases.set(turn.traceId, () => resolve(turn.traceId));
     }),
   }) as ChatGptBrowserWorker;
@@ -259,18 +266,34 @@ test("browser turns run concurrently up to the five-tab limit", async () => {
 
   const active = Array.from({ length: 5 }, (_unused, index) => worker.run(browserTurn(`trace_${index + 1}`)));
   await Promise.resolve();
-  expect(releases.size).toBe(5);
+  expect(starts).toEqual(["trace_1", "trace_2"]);
   await expect(worker.run(browserTurn("trace_6"))).rejects.toThrow("at most 5 simultaneous browser turns");
 
   releases.get("trace_1")?.();
-  await active[0];
-  const sixth = worker.run(browserTurn("trace_6"));
+  releases.get("trace_2")?.();
+  await Promise.all(active.slice(0, 2));
   await Promise.resolve();
-  expect(releases.has("trace_6")).toBeTrue();
-  for (const traceId of ["trace_2", "trace_3", "trace_4", "trace_5", "trace_6"]) {
-    releases.get(traceId)?.();
-  }
-  await Promise.all([...active.slice(1), sixth]);
+  await Promise.resolve();
+  expect(starts).toEqual(["trace_1", "trace_2", "trace_3", "trace_4"]);
+  releases.get("trace_3")?.();
+  releases.get("trace_4")?.();
+  await Promise.all(active.slice(2, 4));
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(starts).toEqual(["trace_1", "trace_2", "trace_3", "trace_4", "trace_5"]);
+  releases.get("trace_5")?.();
+  await active[4];
+});
+
+test("operational concurrency modes remain below the hard five-tab ceiling", () => {
+  expect(DEFAULT_CHATGPT_OPERATIONAL_CONCURRENCY).toBe(2);
+  expect(resolveChatGptOperationalConcurrency(undefined)).toBe(2);
+  expect(resolveChatGptOperationalConcurrency("safe")).toBe(1);
+  expect(resolveChatGptOperationalConcurrency("balanced")).toBe(2);
+  expect(resolveChatGptOperationalConcurrency("aggressive")).toBe(3);
+  expect(resolveChatGptOperationalConcurrency("maximum")).toBe(5);
+  expect(resolveChatGptOperationalConcurrency("4")).toBe(4);
+  expect(() => resolveChatGptOperationalConcurrency("6")).toThrow("must be safe, balanced, aggressive, maximum, or 1-5");
 });
 
 test("browser turns have no absolute deadline unless one is explicitly configured", () => {
@@ -2590,7 +2613,7 @@ function dialogPage(text: string, buttonText = "Got it", errorActionVisible = fa
 test.each([
   ["Too many requests. You're making requests too quickly.", "Got it"],
   ["요청을 너무 빠르게 보내고 있습니다. 잠시 후 다시 시도해 주세요.", "알겠습니다"],
-])("rate-limit dialog stops automatic resubmission: %s", async (message, button) => {
+])("rate-limit dialog exposes retryable account pressure for phase-aware recovery: %s", async (message, button) => {
   const fixture = dialogPage(message, button);
 
   await expect(throwIfChatGptRateLimitDialog(fixture.page)).rejects.toMatchObject({
@@ -2598,7 +2621,7 @@ test.each([
     status: 429,
     errorType: "rate_limit_error",
     code: "rate_limit_exceeded",
-    retryable: false,
+    retryable: true,
     message: "ChatGPT rate limit: too many requests. Try again in a few minutes.",
   });
   expect(fixture.pressed).toEqual(["Enter"]);
@@ -2619,7 +2642,7 @@ test("submission acceptance reports a rate-limit dialog that appears after Enter
     status: 429,
     errorType: "rate_limit_error",
     code: "rate_limit_exceeded",
-    retryable: false,
+    retryable: true,
   });
   expect(fixture.pressed).toEqual(["Enter"]);
 });
@@ -2631,7 +2654,7 @@ test("prompt attachment reports a rate-limit modal before editing the composer",
   }).attachPrompt;
   await expect(attach.call({ activeComposer: async () => { throw new Error("composer was touched"); } },
     fixture.page, "next context part", false)).rejects.toMatchObject({
-    status: 429, code: "rate_limit_exceeded", retryable: false,
+    status: 429, code: "rate_limit_exceeded", retryable: true,
   });
   expect(fixture.pressed).toEqual(["Enter"]);
 });
@@ -2644,7 +2667,7 @@ test("the Traditional Chinese ChatGPT rate-limit dialog is acknowledged and retu
     status: 429,
     errorType: "rate_limit_error",
     code: "rate_limit_exceeded",
-    retryable: false,
+    retryable: true,
   });
   expect(fixture.pressed).toEqual(["Enter"]);
 });
@@ -2657,7 +2680,7 @@ test("the Simplified Chinese ChatGPT rate-limit dialog is acknowledged and retur
     status: 429,
     errorType: "rate_limit_error",
     code: "rate_limit_exceeded",
-    retryable: false,
+    retryable: true,
   });
   expect(fixture.pressed).toEqual(["Enter"]);
 });
@@ -2673,7 +2696,7 @@ test("the Japanese ChatGPT rate-limit dialog is acknowledged and returns a struc
     status: 429,
     errorType: "rate_limit_error",
     code: "rate_limit_exceeded",
-    retryable: false,
+    retryable: true,
   });
   expect(fixture.pressed).toEqual(["Enter"]);
 });
@@ -2734,6 +2757,22 @@ test("only a size rejection of the current owned browser submission is non-retry
   expect(await observer.failure()).toBeUndefined();
   respond(current);
   expect(await observer.failure()).toBeUndefined();
+  const rateLimited = makeRequest();
+  page.emit("request", rateLimited);
+  page.emit("response", {
+    request: () => rateLimited,
+    status: () => 429,
+    headers: () => ({ "retry-after": "7" }),
+    json: async () => { throw new Error("429 should not require a JSON body"); },
+  });
+  expect(await observer.failure()).toMatchObject({
+    status: 429,
+    code: "rate_limit_exceeded",
+    errorType: "rate_limit_error",
+    retryable: true,
+    retryAfterMs: 7_000,
+    submissionRejected: true,
+  });
   observer.dispose();
   expect(page.listenerCount("request")).toBe(0);
   expect(page.listenerCount("response")).toBe(0);
@@ -4241,15 +4280,21 @@ test("the bundled helper is adopted only for the packaged runtime layout", () =>
   expect(heartbeat).toBeLessThan(tryStart);
 });
 
-test("a staged Bigger Context part gets an acknowledgement window sized to its payload", () => {
+test("Bigger Context stage budgets adapt to payload and recent acknowledgement latency", () => {
   // A staged part is much larger than an ordinary prompt and ChatGPT reads it before answering.
   expect(CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS).toBeGreaterThan(CHATGPT_RESPONSE_DOM_GRACE_MS);
 
-  // No MCP activity exists while an inert part is being ingested, so the response and send budgets
-  // bound the same exchange.
+  // The v6.0 180-second value remains the floor for ordinary stages.
   expect(CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS).toBe(browserStageTimeouts.multipartStageSend);
   expect(browserStageTimeouts.multipartStageAcknowledgement).toBe(CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS);
+  expect(resolveChatGptMultipartStageTimeoutMs(80_000)).toBe(180_000);
+  expect(resolveChatGptMultipartStageTimeoutMs(80_001)).toBe(210_000);
+  expect(resolveChatGptMultipartStageTimeoutMs(400_000)).toBe(300_000);
 
+  // A slow preceding acknowledgement raises the next stage's budget, but never without bound.
+  expect(resolveChatGptMultipartStageTimeoutMs(10_000, 200_000)).toBe(380_000);
+  expect(resolveChatGptMultipartStageTimeoutMs(10_000, 1_000_000)).toBe(CHATGPT_MULTIPART_STAGE_MAX_TIMEOUT_MS);
+  expect(() => resolveChatGptMultipartStageTimeoutMs(-1)).toThrow("non-negative integer");
 });
 
 test("the suspension clock charges only tick gaps that mean the process was frozen", () => {

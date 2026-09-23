@@ -1030,6 +1030,8 @@ describe("ChatGPT outer-native harness v4", () => {
     const started = new Promise<void>(resolve => { browserStarted = resolve; });
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = turn => {
       browserStarts += 1;
+      turn.onSendActivated?.();
+      turn.onSubmitted?.();
       turn.onTextDelta("Recovered ");
       browserStarted();
       return new Promise<string>(resolve => {
@@ -1087,6 +1089,8 @@ describe("ChatGPT outer-native harness v4", () => {
     let finishBrowser!: () => void;
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = turn => {
       browserStarts += 1;
+      turn.onSendActivated?.();
+      turn.onSubmitted?.();
       turn.onTextDelta("batch-one ");
       turn.onTextDelta("batch-two ");
       return new Promise<string>(resolve => {
@@ -1170,6 +1174,123 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
+  test("a process-style restart fails closed from the durable post-Send journal instead of resubmitting", async () => {
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-restart-journal-${Date.now()}`,
+      chatgptWeb: {
+        localToolsEnabled: false,
+        solAvailable: true,
+        extraHighAvailable: true,
+        proAvailable: true,
+        turnJournalStatePath: join(tempRoot, `restart-journal-${Date.now()}.json`),
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      await turn.onSendActivated?.();
+      throw new Error("local observer disappeared after Send activation");
+    };
+
+    try {
+      const request = rawWireRequest(environmentXml);
+      const firstEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => firstEvents.push(event),
+      );
+      expect(firstEvents.at(-1)).toMatchObject({
+        type: "error",
+        code: "chatgpt_submission_ambiguous",
+        retryable: false,
+      });
+      expect(browserStarts).toBe(1);
+
+      // A new daemon would have no in-memory browser owner. Preserve only the on-disk checkpoint.
+      chatGptTurnSessions.clear();
+      const restartEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => restartEvents.push(event),
+      );
+      expect(restartEvents.at(-1)).toMatchObject({
+        type: "error",
+        code: "chatgpt_restart_recovery_required",
+        status: 409,
+        retryable: false,
+      });
+      expect(browserStarts).toBe(1);
+    } finally {
+      chatGptTurnSessions.clear();
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  });
+
+  test("explicit provider rejection clears the restart tombstone before the one safe resubmission", async () => {
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-rejected-send-journal-${Date.now()}`,
+      chatgptWeb: {
+        localToolsEnabled: false,
+        solAvailable: true,
+        extraHighAvailable: true,
+        proAvailable: true,
+        turnJournalStatePath: join(tempRoot, `rejected-send-journal-${Date.now()}.json`),
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      await turn.onSendActivated?.();
+      if (browserStarts === 1) {
+        throw new ChatGptWebAdapterError("ChatGPT rejected the submission before accepting it.", {
+          status: 502,
+          errorType: "server_error",
+          code: "upstream_server_error",
+          retryable: true,
+          submissionRejected: true,
+        });
+      }
+      await turn.onSubmitted?.();
+      turn.onTextDelta("safe retry completed");
+      return "safe retry completed";
+    };
+
+    try {
+      const request = rawWireRequest(environmentXml);
+      const firstEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => firstEvents.push(event),
+      );
+      expect(firstEvents.at(-1)).toMatchObject({ type: "error", code: "upstream_server_error", retryable: true });
+
+      const retryEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => retryEvents.push(event),
+      );
+      expect(browserStarts).toBe(2);
+      expect(retryEvents.filter((event): event is Extract<AdapterEvent, { type: "text_delta" }> => (
+        event.type === "text_delta" && event.phase === "final_answer"
+      )).map(event => event.text).join(""))
+        .toBe("safe retry completed");
+      expect(retryEvents.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+    } finally {
+      chatGptTurnSessions.clear();
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  }, 10_000);
+
   test("an unclassified browser failure retires its session before the next native retry", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h4-error-retry-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
@@ -1251,9 +1372,8 @@ describe("ChatGPT outer-native harness v4", () => {
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
     let browserStarts = 0;
-    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async () => {
       browserStarts += 1;
-      turn.onSendActivated?.();
       throw new ChatGptWebAdapterError("ChatGPT is temporarily unavailable. Try again in a few minutes.", {
         status: 502,
         errorType: "server_error",
@@ -1279,6 +1399,48 @@ describe("ChatGPT outer-native harness v4", () => {
         }
       }
       expect(browserStarts).toBe(MAX_CHATGPT_WEB_TURN_RETRIES + 1);
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  }, 30_000);
+
+  test("never resubmits a retryable transient error after Send activation", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-post-send-no-retry-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-post-send-no-retry-${Date.now()}`,
+      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      turn.onSendActivated?.();
+      throw new ChatGptWebAdapterError("ChatGPT is temporarily unavailable.", {
+        status: 502,
+        errorType: "server_error",
+        code: "upstream_server_error",
+        retryable: true,
+      });
+    };
+    try {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const events: AdapterEvent[] = [];
+        await createChatGptWebAdapter(provider).runTurn!(
+          rawWireRequest(environmentXml),
+          { headers: new Headers() },
+          event => events.push(event),
+        );
+        expect(events.at(-1)).toMatchObject({
+          type: "error",
+          code: "chatgpt_submission_ambiguous",
+          status: 502,
+          retryable: false,
+        });
+      }
+      expect(browserStarts).toBe(1);
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
       await TurnBroker.forSocket(socketPath).close();
