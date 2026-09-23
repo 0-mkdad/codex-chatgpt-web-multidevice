@@ -620,13 +620,19 @@ export class LauncherBrowserHelperClient {
       }
     })().catch(error => {
       // Ending, aborting, or losing the helper stops the mirror by design and is not a fault.
-      // Anything else leaves the worker on DOM-only health without saying so, which is exactly the
-      // silent degradation this transport exists to remove, so it is surfaced rather than dropped.
       if (stop.aborted || (error instanceof DOMException && error.name === "AbortError")) return;
-      console.warn(
-        `[chatgpt-web] browser turn ${turn.traceId} lost its MCP progress mirror:`
-        + ` ${error instanceof Error ? error.message : String(error)}`,
+      const failure = new Error(
+        `ChatGPT browser turn lost its MCP progress mirror: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
       );
+      const pending = this.pending.get(turn.traceId);
+      if (pending) {
+        // DOM-only continuation can falsely declare a long-running MCP call stalled. Fail the same
+        // physical helper turn instead of silently degrading health semantics or resubmitting it.
+        this.abortWithLocalFailure(turn.traceId, failure, pending);
+        return;
+      }
+      console.warn(`[chatgpt-web] browser turn ${turn.traceId} lost its MCP progress mirror after settlement`);
     });
   }
 

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { skillFileTokens, validateSkillFiles } from "./skill-attachments";
@@ -83,7 +83,8 @@ import {
 } from "../../chatgpt-web-models";
 import { LauncherBrowserHelperClient } from "./launcher-helper-client";
 import { assertChatGptModelFamily, selectChatGptModelFamily } from "./model-selection";
-import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
+import { MAX_CHATGPT_BROWSER_TABS, resolveChatGptOperationalConcurrency } from "./concurrency";
+import { chatGptWebTurnRetryPolicy } from "./retry-policy";
 import {
   ChatGptCompactionHandoffAccepted,
   ChatGptWebAdapterError,
@@ -128,6 +129,35 @@ export const CHATGPT_RESPONSE_DOM_GRACE_MS = 60_000;
  * the bounded staged-send budget.
  */
 export const CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS = 180_000;
+export const CHATGPT_MULTIPART_STAGE_MAX_TIMEOUT_MS = 420_000;
+
+/**
+ * Size one inert Bigger Context stage conservatively. Small/ordinary stages retain the v6.0
+ * 180-second floor; unusually large stages earn additional ingestion time, and a slow preceding
+ * acknowledgement raises the following stage budget without allowing an unbounded wait.
+ */
+export function resolveChatGptMultipartStageTimeoutMs(
+  stageChars: number,
+  previousAcknowledgementMs?: number,
+): number {
+  if (!Number.isSafeInteger(stageChars) || stageChars < 0) {
+    throw new Error("ChatGPT multipart stage character count must be a non-negative integer");
+  }
+  if (previousAcknowledgementMs !== undefined
+    && (!Number.isFinite(previousAcknowledgementMs) || previousAcknowledgementMs < 0)) {
+    throw new Error("ChatGPT multipart acknowledgement latency must be a non-negative finite number");
+  }
+  const largeStageChars = Math.max(0, stageChars - 80_000);
+  const sizeSteps = Math.ceil(largeStageChars / 80_000);
+  const payloadBudget = CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS + Math.min(180_000, sizeSteps * 30_000);
+  const observedBudget = previousAcknowledgementMs === undefined
+    ? 0
+    : Math.ceil(previousAcknowledgementMs * 1.75 + 30_000);
+  return Math.min(
+    CHATGPT_MULTIPART_STAGE_MAX_TIMEOUT_MS,
+    Math.max(CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, payloadBudget, observedBudget),
+  );
+}
 export const CHATGPT_EMPTY_RESPONSE_GRACE_MS = 10_000;
 export const CHATGPT_COMPLETION_ACTION_GRACE_MS = 60_000;
 export const CHATGPT_COMPLETION_SETTLE_MS = 2_000;
@@ -741,6 +771,18 @@ const chatGptRateLimitDialog = (page: Page): Locator => page.locator('[role="dia
   .filter({ hasText: /making requests too quickly|過於頻繁|过于频繁|リクエストの頻度が高すぎます|요청을 너무 빠르게|요청이 너무 많습니다|너무 많은 요청/i })
   .last();
 
+export function chatGptRetryAfterMs(value: string | undefined, now = Date.now()): number | undefined {
+  const normalized = value?.trim();
+  if (!normalized) return undefined;
+  if (/^\d+(?:\.\d+)?$/.test(normalized)) {
+    const seconds = Number(normalized);
+    return Number.isFinite(seconds) ? Math.max(0, Math.ceil(seconds * 1_000)) : undefined;
+  }
+  const retryAt = Date.parse(normalized);
+  if (!Number.isFinite(retryAt)) return undefined;
+  return Math.max(0, retryAt - now);
+}
+
 export async function throwIfChatGptRateLimitDialog(page: Page): Promise<void> {
   const dialog = chatGptRateLimitDialog(page);
   if (!await dialog.isVisible().catch(() => false)) return;
@@ -752,7 +794,7 @@ export async function throwIfChatGptRateLimitDialog(page: Page): Promise<void> {
     } catch (error) {
       throw new ChatGptWebAdapterError(
         `ChatGPT rate limit: too many requests, and the dialog could not be dismissed (${error instanceof Error ? error.message : String(error)}). Try again in a few minutes.`,
-        { status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: false },
+        { status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: true },
       );
     }
   }
@@ -760,7 +802,7 @@ export async function throwIfChatGptRateLimitDialog(page: Page): Promise<void> {
   // replayable in the adapter so native reconnects cannot start more browser submissions.
   throw new ChatGptWebAdapterError(
     "ChatGPT rate limit: too many requests. Try again in a few minutes.",
-    { status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: false },
+    { status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: true },
   );
 }
 
@@ -829,13 +871,35 @@ export class ChatGptSubmissionRejectionObserver {
   };
 
   private readonly onResponse = (response: Response): void => {
-    if (!this.requests.delete(response.request()) || response.status() !== 413
+    if (!this.requests.delete(response.request())) return;
+    if (response.status() === 429) {
+      const retryAfterMs = chatGptRetryAfterMs(response.headers()["retry-after"]);
+      this.checks.push(Promise.resolve(new ChatGptWebAdapterError(
+        "ChatGPT rejected this submission because the account is rate limited. Retry after the cooldown.",
+        {
+          status: 429,
+          errorType: "rate_limit_error",
+          code: "rate_limit_exceeded",
+          retryable: true,
+          ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+          submissionRejected: true,
+        },
+      )));
+      return;
+    }
+    if (response.status() !== 413
       || !response.headers()["content-type"]?.includes("application/json")) return;
     this.checks.push(withChatGptBrowserObservationTimeout(response.json(), 3_000)
       .then(body => body?.detail?.code === "message_length_exceeds_limit"
         ? new ChatGptWebAdapterError(
           "ChatGPT rejected this message because it exceeds the selected mode's input-size limit. Compact the task before retrying.",
-          { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
+          {
+            status: 400,
+            errorType: "invalid_request_error",
+            code: "context_length_exceeded",
+            retryable: false,
+            submissionRejected: true,
+          },
         ) : undefined)
       // Unreadable or unfamiliar responses do not establish a size rejection. The normal
       // bound-response DOM error remains authoritative in that case.
@@ -1336,6 +1400,7 @@ export interface ResolvedBrowserConfig {
   headed: boolean;
   autoApproveToolCalls: boolean;
   useSavedChats: boolean;
+  retryScope?: string;
 }
 
 export function chatGptTurnIsComplete(state: {
@@ -2093,6 +2158,10 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
     headed: configured.headed !== false,
     autoApproveToolCalls: configured.autoApproveToolCalls === true,
     useSavedChats: configured.useSavedChats === true,
+    retryScope: createHash("sha256").update(JSON.stringify({
+      baseUrl: provider.baseUrl,
+      chatgptWeb: provider.chatgptWeb ?? {},
+    })).digest("hex"),
   };
 }
 
@@ -2185,6 +2254,15 @@ export function insertPlainTextIntoComposer(element: HTMLElement, value: string)
   return document.execCommand("insertText", false, value);
 }
 
+interface QueuedBrowserTurn {
+  turn: BrowserTurn;
+  resolve: (value: string) => void;
+  reject: (error: unknown) => void;
+  started: boolean;
+  enqueuedAt: number;
+  onAbort?: () => void;
+}
+
 export class ChatGptBrowserWorker {
   static forProvider(provider: CodexProviderConfig): ChatGptBrowserWorker {
     const config = resolveBrowserConfig(provider);
@@ -2204,6 +2282,8 @@ export class ChatGptBrowserWorker {
   private launcherHelper?: LauncherBrowserHelperClient;
   private maintenanceTail: Promise<void> = Promise.resolve();
   private readonly activeRuns = new Map<string, Promise<string>>();
+  private readonly pendingRuns: QueuedBrowserTurn[] = [];
+  private runningRuns = 0;
 
   private constructor(private readonly config: ResolvedBrowserConfig) {}
 
@@ -2268,16 +2348,68 @@ export class ChatGptBrowserWorker {
         `ChatGPT Web supports at most ${MAX_CHATGPT_BROWSER_TABS} simultaneous browser turns; close or finish a browser tab before starting another`,
       ));
     }
-    const useHelper = this.config.browserHost === "launcher" && process.env.CODEX_CHATGPT_WEB_BROWSER_HELPER_PROCESS !== "1";
-    if (useHelper) {
-      this.launcherHelper ??= new LauncherBrowserHelperClient(this.config);
-    }
-    const run = Promise.resolve().then(() => useHelper ? this.launcherHelper!.run(turn) : this.runExclusive(turn));
+    let queued!: QueuedBrowserTurn;
+    const run = new Promise<string>((resolveRun, rejectRun) => {
+      queued = { turn, resolve: resolveRun, reject: rejectRun, started: false, enqueuedAt: Date.now() };
+    });
     this.activeRuns.set(turn.traceId, run);
+    if (turn.abortSignal) {
+      queued.onAbort = () => {
+        if (queued.started) return;
+        const index = this.pendingRuns.indexOf(queued);
+        if (index >= 0) this.pendingRuns.splice(index, 1);
+        queued.reject(new DOMException("ChatGPT web turn aborted while waiting for a browser slot", "AbortError"));
+      };
+      if (turn.abortSignal.aborted) queued.onAbort();
+      else turn.abortSignal.addEventListener("abort", queued.onAbort, { once: true });
+    }
+    if (!turn.abortSignal?.aborted) this.pendingRuns.push(queued);
+    this.drainBrowserTurnQueue();
     void run.finally(() => {
       if (this.activeRuns.get(turn.traceId) === run) this.activeRuns.delete(turn.traceId);
     }).catch(() => {});
     return run;
+  }
+
+  private drainBrowserTurnQueue(): void {
+    const operationalLimit = this.operationalConcurrencyLimit();
+    while (this.runningRuns < operationalLimit && this.pendingRuns.length > 0) {
+      const queued = this.pendingRuns.shift()!;
+      if (queued.turn.abortSignal?.aborted) {
+        queued.reject(new DOMException("ChatGPT web turn aborted while waiting for a browser slot", "AbortError"));
+        continue;
+      }
+      queued.started = true;
+      if (queued.onAbort) queued.turn.abortSignal?.removeEventListener("abort", queued.onAbort);
+      this.runningRuns += 1;
+      console.info(`[chatgpt-web] browser_queue_admit ${JSON.stringify({
+        traceId: queued.turn.traceId,
+        queueWaitMs: Math.max(0, Date.now() - queued.enqueuedAt),
+        operationalLimit,
+        running: this.runningRuns,
+        queued: this.pendingRuns.length,
+      })}`);
+      const useHelper = this.config.browserHost === "launcher"
+        && process.env.CODEX_CHATGPT_WEB_BROWSER_HELPER_PROCESS !== "1";
+      if (useHelper) this.launcherHelper ??= new LauncherBrowserHelperClient(this.config);
+      const execution = Promise.resolve().then(() => (
+        useHelper ? this.launcherHelper!.run(queued.turn) : this.runExclusive(queued.turn)
+      ));
+      execution.then(queued.resolve, queued.reject).finally(() => {
+        this.runningRuns -= 1;
+        // Let the adapter classify any just-finished 429/5xx before admitting another queued
+        // submission, so shared pressure can lower the next operational slot immediately.
+        queueMicrotask(() => this.drainBrowserTurnQueue());
+      }).catch(() => {});
+    }
+  }
+
+  private operationalConcurrencyLimit(): number {
+    const configuredLimit = resolveChatGptOperationalConcurrency();
+    return Math.min(
+      MAX_CHATGPT_BROWSER_TABS,
+      chatGptWebTurnRetryPolicy.operationalConcurrencyLimit(configuredLimit, this.config.retryScope),
+    );
   }
 
   verifyConnector(traceId = `verify_${randomUUID().replaceAll("-", "")}`): Promise<string> {
@@ -3641,14 +3773,13 @@ export class ChatGptBrowserWorker {
     abortSignal?: AbortSignal,
     externalProgress?: ChatGptTurnProgressReader,
     completionTracker = new ChatGptCompletionTracker(),
+    responseDomGraceMs = CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS,
   ): Promise<void> {
     // A staged message may briefly create an assistant shell and then replace it while ChatGPT
     // ingests the attached context. The ordinary 60-second missing-response verdict would cut the
     // dedicated multipart acknowledgement budget back down after that transient shell appears.
     // Keep DOM absence bounded by the same per-stage budget that owns this protocol step.
-    const domHealthTracker = new ChatGptTurnDomHealthTracker(
-      CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS,
-    );
+    const domHealthTracker = new ChatGptTurnDomHealthTracker(responseDomGraceMs);
     const responseDomCache: ChatGptResponseDomCache = {};
     let responseTurn = initialResponseTurn;
     for (;;) {
@@ -4668,9 +4799,6 @@ export class ChatGptBrowserWorker {
           maxMessageChars,
         );
       }
-      const deadline = this.config.turnTimeoutMs === undefined
-        ? undefined
-        : Date.now() + this.config.turnTimeoutMs;
       let page = await this.runStage(turn.traceId, "browser_page", browserStageTimeouts.browserPage, async (abortSignal) => {
         if (maintenancePage) return maintenancePage;
         if (!launcherSurfaceId) {
@@ -4697,6 +4825,12 @@ export class ChatGptBrowserWorker {
       });
       if (!maintenancePage && !launcherSurfaceId) managedPage = page;
       diagnosticPage = page;
+      // Browser-page acquisition is initialization guarded by browserStageTimeouts.browserPage.
+      // The model-turn budget starts only after a usable page exists, so slow CDP acquisition does
+      // not silently consume reasoning/runtime budget.
+      const deadline = this.config.turnTimeoutMs === undefined
+        ? undefined
+        : Date.now() + this.config.turnTimeoutMs;
       const rebindLauncherPage = async (
         attempt: number,
         cause: Error,
@@ -4868,8 +5002,13 @@ export class ChatGptBrowserWorker {
 
       let finalPrompt = prepared.text;
       if (prepared.multipart && multipartStages && multipartTransactionId && multipartFinalPrompt) {
+        let previousMultipartAcknowledgementMs: number | undefined;
         for (let index = 0; index < multipartStages.length; index += 1) {
           const stage = multipartStages[index]!;
+          const multipartStageTimeoutMs = resolveChatGptMultipartStageTimeoutMs(
+            stage.text.length,
+            previousMultipartAcknowledgementMs,
+          );
           // Each acknowledgement can replace the picker controls. Establish a fresh model/effort
           // proof for the next physical submission, retaining family selection and usage evidence.
           if (index > 0) mode = await this.runStage(
@@ -4896,7 +5035,7 @@ export class ChatGptBrowserWorker {
           const evidence = await this.runStage(
             turn.traceId,
             `multipart_stage_${index + 1}_send`,
-            browserStageTimeouts.multipartStageSend,
+            multipartStageTimeoutMs,
             (stageSignal) => this.sendAttachedPrompt(
               page,
               stageBaseline,
@@ -4918,12 +5057,14 @@ export class ChatGptBrowserWorker {
             ),
           );
           console.info(
-            `[chatgpt-web] browser turn ${turn.traceId} multipart part ${index + 1}/${prepared.multipart.parts.length} submission accepted evidence=${evidence}`,
+            `[chatgpt-web] browser turn ${turn.traceId} multipart part ${index + 1}/${prepared.multipart.parts.length}`
+            + ` submission accepted evidence=${evidence} stageBudgetMs=${multipartStageTimeoutMs}`,
           );
+          const acknowledgementStartedAt = Date.now();
           await this.runStage(
             turn.traceId,
             `multipart_stage_${index + 1}_acknowledgement`,
-            browserStageTimeouts.multipartStageAcknowledgement,
+            multipartStageTimeoutMs,
             async (stageSignal) => {
               const acknowledgementSignal = turn.abortSignal
                 ? AbortSignal.any([stageSignal, turn.abortSignal])
@@ -4936,7 +5077,7 @@ export class ChatGptBrowserWorker {
                 // A part still being ingested has produced no MCP activity, so there is no progress
                 // to consult here; the dedicated acknowledgement stage owns this wait.
                 undefined,
-                CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS,
+                multipartStageTimeoutMs,
                 undefined,
                 launcherObservationRecovery
                   ? async (...args) => {
@@ -4954,12 +5095,15 @@ export class ChatGptBrowserWorker {
                 deadline,
                 acknowledgementSignal,
                 turn.externalProgress,
+                undefined,
+                multipartStageTimeoutMs,
               );
             },
             chatGptSuspensionClock,
           );
           const stageRejection = await submissionRejection.failure();
           if (stageRejection) throw stageRejection;
+          previousMultipartAcknowledgementMs = Date.now() - acknowledgementStartedAt;
           await diagnostics.capture(page, `multipart-stage-${index + 1}-acknowledged`);
           await turn.onMultipartStageAcknowledged?.(index + 1);
         }

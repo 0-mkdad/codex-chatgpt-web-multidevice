@@ -1305,6 +1305,12 @@ export async function callTurnBroker<T>(
         // frame is therefore the terminal boundary; ordinary calls still wait for physical close.
         finishResponse();
         socket.destroy();
+      } else if (isWindowsPipeEndpoint(socketPath)) {
+        // A Windows named pipe is full duplex. After the server has ended its side and the client
+        // has received the complete response frame, leaving the client's writable side open can
+        // keep both peers waiting for a physical close indefinitely. Half-close the client side as
+        // well, then keep the normal close listener as the actual settlement boundary.
+        socket.end();
       }
     });
   });

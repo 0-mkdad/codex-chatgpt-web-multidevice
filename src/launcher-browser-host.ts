@@ -228,15 +228,32 @@ export async function selectLauncherPage(
     // Target metadata belongs to the browser process. Evaluating every page here makes an
     // unrelated busy/paused renderer block acquisition of an already-responsive owned page.
     const inspected = await Promise.all(candidates.map(async candidate => {
-      const session = await candidate.context.newCDPSession(candidate.page).catch(() => undefined);
-      if (!session) return { ...candidate, targetId: undefined };
+      const remainingMs = Math.max(1, deadline - Date.now());
+      // One unrelated renderer can wedge a CDP command indefinitely. Bound each target probe so a
+      // stuck page cannot hold the whole Promise.all beyond the declared acquisition deadline.
+      const probeTimeoutMs = Math.min(1_000, remainingMs);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = new Promise<{ context: BrowserContext; page: Page; targetId: undefined }>(resolveProbe => {
+        timer = setTimeout(() => resolveProbe({ ...candidate, targetId: undefined }), probeTimeoutMs);
+      });
+      const probe = (async () => {
+        const session = await candidate.context.newCDPSession(candidate.page).catch(() => undefined);
+        if (!session) return { ...candidate, targetId: undefined };
+        try {
+          const { targetInfo } = await session.send("Target.getTargetInfo");
+          return { ...candidate, targetId: targetInfo.targetId };
+        } catch {
+          return { ...candidate, targetId: undefined };
+        } finally {
+          // Detach is cleanup, not acquisition evidence. Do not let a wedged transport extend the
+          // probe after its target metadata has already settled.
+          void session.detach().catch(() => {});
+        }
+      })();
       try {
-        const { targetInfo } = await session.send("Target.getTargetInfo");
-        return { ...candidate, targetId: targetInfo.targetId };
-      } catch {
-        return { ...candidate, targetId: undefined };
+        return await Promise.race([probe, timedOut]);
       } finally {
-        await session.detach().catch(() => {});
+        if (timer) clearTimeout(timer);
       }
     }));
     const owned = inspected.filter(candidate => candidate.targetId === targetId);
