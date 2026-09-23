@@ -338,7 +338,9 @@ test("an unbounded broker call fails when the broker closes without answering", 
 }, 10_000);
 
 test("one slow named-pipe broker exchange cannot block or cancel an unrelated turn", async () => {
-  const root = mkdtempSync(join(tmpdir(), "cgw-broker-parallel-pipe-"));
+  // Keep the Unix socket below macOS's 103-byte sun_path ceiling even when
+  // tmpdir() is the long per-runner /var/folders/... path used by GitHub CI.
+  const root = mkdtempSync(join(tmpdir(), "cgw-bp-"));
   const socketPath = defaultBrokerEndpoint(root);
   const broker = TurnBroker.forSocket(socketPath);
   const environment = {
