@@ -205,11 +205,14 @@ test("preserves ownership when Codex moves trust state before the hook and norma
     verifyCodexInterruptHookRestored(restored);
     for (const modified of [
       rewritten.replace("timeout = 3", "timeout = 2"),
-      rewritten.replace(installed.command, "other-command"),
+      rewritten.replace(JSON.stringify(installed.command), JSON.stringify("other-command")),
       rewritten.replace(installed.trustedHash, "sha256:changed"),
       rewritten + state,
       rewritten + `${ending}[hooks.state.${JSON.stringify(installed.stateKey)}.extra]${ending}enabled = true`,
-    ]) expect(() => verifyCodexInterruptHook(modified, installed)).toThrow("changed after setup");
+    ]) {
+      expect(modified).not.toBe(rewritten);
+      expect(() => verifyCodexInterruptHook(modified, installed)).toThrow("changed after setup");
+    }
   }
 });
 
