@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
+import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnLifecycleProgress, ChatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -141,8 +141,8 @@ test("session cache expiry never cancels a still-active long browser turn", asyn
   sessions.clear();
 });
 
-test("five active turns coexist and a sixth fails closed", () => {
-  const sessions = new ChatGptTurnSessions();
+test("logical sessions are bounded independently from the five physical browser tabs", () => {
+  const sessions = new ChatGptTurnSessions(30 * 60_000, 6);
   let cancelled = 0;
   const runtime = () => ({
     mode: "read-only" as const,
@@ -153,19 +153,56 @@ test("five active turns coexist and a sixth fails closed", () => {
     cancel: () => { cancelled += 1; },
   });
 
-  const active = Array.from({ length: 5 }, (_unused, index) => (
+  const active = Array.from({ length: 6 }, (_unused, index) => (
     sessions.getOrCreate(`turn-${index + 1}`, runtime)
   ));
-  expect(sessions.activeCount()).toBe(5);
+  expect(sessions.activeCount()).toBe(6);
   expect(cancelled).toBe(0);
-  expect(() => sessions.getOrCreate("turn-6", runtime)).toThrow("at most 5 simultaneous browser turns");
+  expect(() => sessions.getOrCreate("turn-7", runtime)).toThrow("session registry is full (6 entries)");
 
   expect(sessions.getOrCreate("turn-3", () => {
     throw new Error("an in-flight turn must be reused");
   })).toBe(active[2]);
   expect(cancelled).toBe(0);
   sessions.clear();
-  expect(cancelled).toBe(5);
+  expect(cancelled).toBe(6);
+});
+
+test("parallel turn progress evidence is isolated per physical session", () => {
+  const sessions = new ChatGptTurnSessions();
+  const runtime = (progress: ChatGptTurnLifecycleProgress) => ({
+    mode: "read-only" as const,
+    browser: new Promise<string>(() => {}),
+    physicalSettlement: new Promise<void>(() => {}),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    lifecycleProgress: progress,
+    cancel: () => {},
+  });
+  const a = sessions.getOrCreate("turn-a", () => runtime(new ChatGptTurnLifecycleProgress()), "trace-a");
+  const b = sessions.getOrCreate("turn-b", () => runtime(new ChatGptTurnLifecycleProgress()), "trace-b");
+
+  a.recordProgress("browser", 1_000);
+  a.recordProgress("response", 1_100);
+  a.recordProgress("recovery", 1_200);
+  expect(a.progressSnapshot()).toEqual({
+    lastBrowserProgressAt: 1_000,
+    lastResponseProgressAt: 1_100,
+    lastRecoveryAt: 1_200,
+    lastProgressSource: "recovery",
+  });
+  expect(b.progressSnapshot()).toEqual({});
+
+  b.recordProgress("mcp", 2_000);
+  b.recordProgress("tool", 2_100);
+  expect(b.progressSnapshot()).toEqual({
+    lastMcpProgressAt: 2_000,
+    lastToolProgressAt: 2_100,
+    lastProgressSource: "tool",
+  });
+  expect(a.progressSnapshot().lastMcpProgressAt).toBeUndefined();
+  expect(a.progressSnapshot().lastToolProgressAt).toBeUndefined();
+  sessions.clear();
 });
 
 test("settled replay sessions expire from their last use instead of their creation time", async () => {
@@ -299,6 +336,34 @@ test("an unbounded broker call fails when the broker closes without answering", 
     await broker.close();
   }
 }, 10_000);
+
+test("one slow named-pipe broker exchange cannot block or cancel an unrelated turn", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-broker-parallel-pipe-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  const broker = TurnBroker.forSocket(socketPath);
+  const environment = {
+    cwd: root,
+    roots: [root],
+    writableRoots: [root],
+    sandboxPolicy: { type: "dangerFullAccess" as const },
+    tools: [],
+  };
+  try {
+    const slowToken = await broker.register(environment, 60_000, "slow-turn");
+    const fastToken = await broker.register(environment, 60_000, "fast-turn");
+    const slow = callTurnBroker(socketPath, { method: "owner_next", token: slowToken }, null);
+    const fast = await callTurnBroker<{ protocolVersion: number }>(socketPath, { method: "owner_status" });
+    expect(fast.protocolVersion).toBe(5);
+
+    broker.revoke(slowToken, new Error("cancel only slow turn"));
+    await expect(slow).rejects.toThrow("cancel only slow turn");
+    await expect(callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token: fastToken }))
+      .resolves.toMatchObject({ bindingId: expect.any(String) });
+  } finally {
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("an unbounded broker call outlives the bounded default timeout", async () => {
   const accepted: Socket[] = [];

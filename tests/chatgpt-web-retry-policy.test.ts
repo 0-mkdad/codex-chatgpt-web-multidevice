@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
+import { ChatGptRecoveryExhaustedError, ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { classifyChatGptRecovery } from "../src/adapters/chatgpt-web/recovery-classification";
 import {
   ChatGptWebTurnRetryPolicy,
@@ -108,7 +108,9 @@ test("recovery taxonomy makes submission phase authoritative for resubmission", 
     class: "CHATGPT_TRANSIENT_SERVER_ERROR",
     retryable: false,
     mayResubmit: false,
-    preserveBrowserOwner: true,
+    preserveBrowserOwner: false,
+    preserveTools: false,
+    terminal: true,
   });
   expect(classifyChatGptRecovery(rateLimitError(7_000, true), { submissionPhase: "send_activated" })).toMatchObject({
     class: "CHATGPT_RATE_LIMITED",
@@ -139,5 +141,18 @@ test("recovery taxonomy makes submission phase authoritative for resubmission", 
     mayReconnectObserver: true,
     mayReconnectCdp: true,
     mayResubmit: false,
+  });
+  expect(classifyChatGptRecovery(new ChatGptRecoveryExhaustedError(
+    "CDP_SESSION_LOST",
+    "same-owner CDP recovery exhausted",
+  ), { submissionPhase: "accepted" })).toMatchObject({
+    class: "CDP_SESSION_LOST",
+    retryable: false,
+    mayResubmit: false,
+    mayReconnectObserver: false,
+    mayReconnectCdp: false,
+    preserveBrowserOwner: false,
+    preserveTools: false,
+    terminal: true,
   });
 });

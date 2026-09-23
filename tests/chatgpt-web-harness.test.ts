@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildResponseJSON } from "../src/bridge";
-import { ChatGptWebAdapterError, chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
+import { ChatGptRecoveryExhaustedError, ChatGptWebAdapterError, chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
@@ -1170,6 +1170,156 @@ describe("ChatGPT outer-native harness v4", () => {
       }
       expect(browserStarts).toBe(1);
     } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  });
+
+  test("accepted same-owner recovery exhaustion is terminal and never starts a fresh browser submission", async () => {
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-recovery-exhausted-${Date.now()}`,
+      chatgptWeb: {
+        localToolsEnabled: false,
+        solAvailable: true,
+        extraHighAvailable: true,
+        proAvailable: true,
+        turnJournalStatePath: join(tempRoot, `recovery-exhausted-${Date.now()}.json`),
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    let cancellations = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      await turn.onSendActivated?.();
+      await turn.onSubmitted?.();
+      throw new ChatGptRecoveryExhaustedError(
+        "CDP_SESSION_LOST",
+        "accepted turn exhausted its bounded same-owner CDP recovery",
+      );
+    };
+    const originalCancelTrace = chatGptTurnSessions.beginCancelTrace.bind(chatGptTurnSessions);
+    (chatGptTurnSessions as unknown as { beginCancelTrace: typeof chatGptTurnSessions.beginCancelTrace }).beginCancelTrace = (...args) => {
+      cancellations += 1;
+      return originalCancelTrace(...args);
+    };
+
+    try {
+      const request = rawWireRequest(environmentXml);
+      await expect(createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        () => {},
+      )).rejects.toMatchObject({
+        name: "ChatGptRecoveryExhaustedError",
+        recoveryClass: "CDP_SESSION_LOST",
+      });
+      expect(browserStarts).toBe(1);
+
+      const replayEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => replayEvents.push(event),
+      );
+      expect(replayEvents.at(-1)).toMatchObject({
+        type: "error",
+        code: "chatgpt_restart_recovery_required",
+        retryable: false,
+      });
+      expect(browserStarts).toBe(1);
+      expect(cancellations).toBe(0);
+    } finally {
+      chatGptTurnSessions.clear();
+      (chatGptTurnSessions as unknown as { beginCancelTrace: typeof chatGptTurnSessions.beginCancelTrace }).beginCancelTrace = originalCancelTrace;
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  });
+
+  test("shared browser-host loss fails accepted sibling turns closed without resubmitting either execution", async () => {
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-host-loss-${Date.now()}`,
+      chatgptWeb: {
+        localToolsEnabled: false,
+        solAvailable: true,
+        extraHighAvailable: true,
+        proAvailable: true,
+        turnJournalStatePath: join(tempRoot, `host-loss-${Date.now()}.json`),
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    let accepted = 0;
+    let resolveBothAccepted!: () => void;
+    let failHost!: () => void;
+    const bothAccepted = new Promise<void>(resolve => { resolveBothAccepted = resolve; });
+    const hostFailure = new Promise<void>(resolve => { failHost = resolve; });
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      await turn.onSendActivated?.();
+      await turn.onSubmitted?.();
+      accepted += 1;
+      if (accepted === 2) resolveBothAccepted();
+      await hostFailure;
+      throw new Error("shared browser host exited after acceptance");
+    };
+
+    const makeRequest = (suffix: string): CodexParsedRequest => {
+      const request = rawWireRequest(environmentXml);
+      const threadId = `thread_host_${suffix}`;
+      const turnId = `turn_host_${suffix}`;
+      const raw = request._rawBody as {
+        prompt_cache_key: string;
+        client_metadata: Record<string, unknown>;
+        input: Array<Record<string, unknown>>;
+      };
+      raw.prompt_cache_key = threadId;
+      raw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({ thread_id: threadId, turn_id: turnId });
+      for (const item of raw.input) item.internal_chat_message_metadata_passthrough = { turn_id: turnId };
+      return request;
+    };
+
+    try {
+      const firstEvents: AdapterEvent[] = [];
+      const secondEvents: AdapterEvent[] = [];
+      const first = createChatGptWebAdapter(provider).runTurn!(
+        makeRequest("a"),
+        { headers: new Headers() },
+        event => firstEvents.push(event),
+      );
+      const second = createChatGptWebAdapter(provider).runTurn!(
+        makeRequest("b"),
+        { headers: new Headers() },
+        event => secondEvents.push(event),
+      );
+      await bothAccepted;
+      expect(browserStarts).toBe(2);
+      failHost();
+      await Promise.all([first, second]);
+      expect(firstEvents.at(-1)).toMatchObject({ type: "error", code: "chatgpt_submitted_turn_failed", retryable: false });
+      expect(secondEvents.at(-1)).toMatchObject({ type: "error", code: "chatgpt_submitted_turn_failed", retryable: false });
+
+      // Same-process reconnects replay the terminal session and must not allocate another surface.
+      // Durable process-restart suppression is covered separately by the turn-journal restart test.
+      for (const suffix of ["a", "b"]) {
+        const reconnectEvents: AdapterEvent[] = [];
+        await createChatGptWebAdapter(provider).runTurn!(
+          makeRequest(suffix),
+          { headers: new Headers() },
+          event => reconnectEvents.push(event),
+        );
+        expect(reconnectEvents.at(-1)).toMatchObject({
+          type: "error",
+          code: "chatgpt_submitted_turn_failed",
+          retryable: false,
+        });
+      }
+      expect(browserStarts).toBe(2);
+    } finally {
+      chatGptTurnSessions.clear();
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     }
   });
@@ -3378,8 +3528,16 @@ describe("ChatGPT outer-native harness v4", () => {
     secondEnvironment.tools = [
       { name: "shell_command", description: "Run a legacy Codex command", parameters: { type: "object" } },
     ];
+    const thirdEnvironment = extractChatGptTurnEnvironment(parsed(environmentXml));
+    thirdEnvironment.cwd = "/workspace/third";
+    thirdEnvironment.roots = [thirdEnvironment.cwd];
+    thirdEnvironment.writableRoots = [thirdEnvironment.cwd];
+    thirdEnvironment.tools = [
+      { name: "exec_command", description: "Run a Codex command", parameters: { type: "object" } },
+    ];
     const firstToken = await broker.register(firstEnvironment, 60_000, "first-turn");
     const secondToken = await broker.register(secondEnvironment, 60_000, "second-turn");
+    const thirdToken = await broker.register(thirdEnvironment, 60_000, "third-turn");
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: ["src/cli.ts", "mcp", "--broker-socket", socketPath],
@@ -3398,9 +3556,14 @@ describe("ChatGPT outer-native harness v4", () => {
         name: "codex_exec",
         arguments: { turn_token: secondToken, cmd: "pwd", workdir: secondEnvironment.cwd, yield_time_ms: 2_000 },
       });
-      const [[firstRequest], [secondRequest]] = await Promise.all([
+      const thirdCall = client.callTool({
+        name: "codex_exec",
+        arguments: { turn_token: thirdToken, cmd: "pwd", workdir: thirdEnvironment.cwd, yield_time_ms: 3_000 },
+      });
+      const [[firstRequest], [secondRequest], [thirdRequest]] = await Promise.all([
         broker.nextToolBatch(firstToken),
         broker.nextToolBatch(secondToken),
+        broker.nextToolBatch(thirdToken),
       ]);
 
       expect(firstRequest).toMatchObject({
@@ -3411,19 +3574,34 @@ describe("ChatGPT outer-native harness v4", () => {
         wireName: "shell_command",
         arguments: { command: "pwd", workdir: "/workspace/second", timeout_ms: 2_000 },
       });
+      expect(thirdRequest).toMatchObject({
+        wireName: "exec_command",
+        arguments: { cmd: "pwd", workdir: "/workspace/third", yield_time_ms: 3_000 },
+      });
       expect(JSON.stringify(firstRequest)).not.toContain(firstToken);
       expect(JSON.stringify(firstRequest)).not.toContain(secondToken);
       expect(JSON.stringify(secondRequest)).not.toContain(firstToken);
       expect(JSON.stringify(secondRequest)).not.toContain(secondToken);
+      expect(JSON.stringify(thirdRequest)).not.toContain(firstToken);
+      expect(JSON.stringify(thirdRequest)).not.toContain(secondToken);
+      expect(JSON.stringify(thirdRequest)).not.toContain(thirdToken);
+
+      expect(() => broker.completeTool(secondToken, firstRequest!.callId, toolResult({ output: "wrong-turn" })))
+        .toThrow(`tool call is not pending: ${firstRequest!.callId}`);
 
       broker.completeTool(firstToken, firstRequest!.callId, toolResult({ output: "first" }));
-      broker.completeTool(secondToken, secondRequest!.callId, toolResult({ output: "second" }));
+      broker.revoke(secondToken, new Error("cancel only second turn"));
+      broker.completeTool(thirdToken, thirdRequest!.callId, toolResult({ output: "third" }));
       expect((await firstCall).structuredContent).toEqual({ output: "first" });
-      expect((await secondCall).structuredContent).toEqual({ output: "second" });
+      const secondResult = await secondCall;
+      expect(secondResult.isError).toBeTrue();
+      expect(JSON.stringify(secondResult.content)).toContain("cancel only second turn");
+      expect((await thirdCall).structuredContent).toEqual({ output: "third" });
     } finally {
       await client.close().catch(() => {});
       broker.revoke(firstToken);
       broker.revoke(secondToken);
+      broker.revoke(thirdToken);
       await broker.close();
     }
   }, 30_000);
