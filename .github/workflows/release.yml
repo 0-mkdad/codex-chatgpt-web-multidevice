@@ -128,6 +128,41 @@ jobs:
             mv "$file" "$name"
           done < <(find . -mindepth 2 -type f -print0 | sort -z)
           find . -mindepth 1 -type d -empty -delete
+      - name: Create permanent download aliases
+        run: |
+          version="$(jq -er .version package.json)"
+          copy_download_alias() {
+            local source="$1"
+            local alias="$2"
+            if [[ ! -s "release-assets/$source" ]]; then
+              echo "Required versioned release asset is missing: $source" >&2
+              exit 1
+            fi
+            if [[ -e "release-assets/$alias" ]]; then
+              echo "Permanent download alias already exists: $alias" >&2
+              exit 1
+            fi
+            cp -- "release-assets/$source" "release-assets/$alias"
+            if ! cmp -s -- "release-assets/$source" "release-assets/$alias"; then
+              echo "Permanent download alias differs from its versioned asset: $alias" >&2
+              exit 1
+            fi
+          }
+          copy_download_alias \
+            "codex-web-gpt-multidevice-${version}-win-x64.exe" \
+            "codex-web-gpt-multidevice-windows-x64.exe"
+          copy_download_alias \
+            "codex-web-gpt-multidevice-${version}-mac-arm64.dmg" \
+            "codex-web-gpt-multidevice-macos-arm64.dmg"
+          copy_download_alias \
+            "codex-web-gpt-multidevice-${version}-linux-x64.AppImage" \
+            "codex-web-gpt-multidevice-linux-x64.AppImage"
+          copy_download_alias \
+            "codex-web-gpt-multidevice-${version}-mac-x64.dmg" \
+            "codex-web-gpt-multidevice-macos-x64.dmg"
+          copy_download_alias \
+            "codex-web-gpt-multidevice-${version}-linux-arm64.AppImage" \
+            "codex-web-gpt-multidevice-linux-arm64.AppImage"
       - name: Create checksums
         run: |
           cd release-assets
@@ -152,6 +187,25 @@ jobs:
             echo "checksums.txt is missing entries for:$missing" >&2
             exit 1
           fi
+      - name: Validate permanent download aliases
+        run: |
+          aliases=(
+            "codex-web-gpt-multidevice-windows-x64.exe"
+            "codex-web-gpt-multidevice-macos-arm64.dmg"
+            "codex-web-gpt-multidevice-linux-x64.AppImage"
+            "codex-web-gpt-multidevice-macos-x64.dmg"
+            "codex-web-gpt-multidevice-linux-arm64.AppImage"
+          )
+          for alias in "${aliases[@]}"; do
+            if [[ ! -s "release-assets/$alias" ]]; then
+              echo "Required permanent download alias is missing: $alias" >&2
+              exit 1
+            fi
+            if ! awk -v asset="$alias" '$2 == asset { found = 1 } END { exit found ? 0 : 1 }' release-assets/checksums.txt; then
+              echo "checksums.txt is missing the permanent download alias: $alias" >&2
+              exit 1
+            fi
+          done
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -2,8 +2,18 @@
   <img src="assets/readme/hero.svg" width="960" alt="Switch to web models. Stay in Codex. Your ChatGPT plan. Your workflow. Maximum capabilities.">
 </p>
 
+<h2 align="center">Download</h2>
+
 <p align="center">
-  <a href="https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases">Downloads and releases</a>
+  <a href="https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/latest/download/codex-web-gpt-multidevice-windows-x64.exe"><strong>⬇ Windows x64 (.exe)</strong></a>
+  &nbsp; · &nbsp;
+  <a href="https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/latest/download/codex-web-gpt-multidevice-macos-arm64.dmg"><strong>⬇ macOS Apple Silicon (.dmg)</strong></a>
+  &nbsp; · &nbsp;
+  <a href="https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/latest/download/codex-web-gpt-multidevice-linux-x64.AppImage"><strong>⬇ Linux x64 (.AppImage)</strong></a>
+</p>
+
+<p align="center">
+  <small><a href="https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/latest/download/codex-web-gpt-multidevice-macos-x64.dmg">macOS Intel</a> · <a href="https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/latest/download/codex-web-gpt-multidevice-linux-arm64.AppImage">Linux ARM64</a> · <a href="https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases">All releases</a></small>
 </p>
 
 <p align="center">

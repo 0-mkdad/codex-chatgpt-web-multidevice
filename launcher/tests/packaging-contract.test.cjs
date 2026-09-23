@@ -198,6 +198,7 @@ printf '#!/bin/sh\\nexit 0\\n' > squashfs-root/resources/app.asar.unpacked/asset
 test("CI packages and smoke-launches on macOS, Windows, and Linux", () => {
   const ci = fs.readFileSync(path.join(repositoryRoot, ".github", "workflows", "ci.yml"), "utf8");
   const release = fs.readFileSync(path.join(repositoryRoot, ".github", "workflows", "release.yml"), "utf8");
+  const readme = fs.readFileSync(path.join(repositoryRoot, "README.md"), "utf8");
   assert.match(ci, /macos-15, ubuntu-latest, windows-latest/);
   assert.match(ci, /bun run app:package/);
   assert.match(ci, /bun run app:smoke/);
@@ -219,6 +220,50 @@ test("CI packages and smoke-launches on macOS, Windows, and Linux", () => {
   assert.match(release, /codesign --verify --deep --strict --verbose=2/);
   assert.match(release, /Codex Web GPT MultiDevice\.app/);
   assert.doesNotMatch(release, /gh release create[\s\S]*?--draft/);
+
+  const releaseText = release.replace(/\r\n/g, "\n");
+  const aliasCreationStart = releaseText.indexOf("- name: Create permanent download aliases");
+  const checksumCreationStart = releaseText.indexOf("- name: Create checksums");
+  assert.ok(aliasCreationStart >= 0 && checksumCreationStart > aliasCreationStart);
+  const aliasCreation = releaseText.slice(aliasCreationStart, checksumCreationStart).replace(/\\\n\s*/g, " ");
+  const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const aliasMappings = [
+    ["codex-web-gpt-multidevice-${version}-win-x64.exe", "codex-web-gpt-multidevice-windows-x64.exe"],
+    ["codex-web-gpt-multidevice-${version}-mac-arm64.dmg", "codex-web-gpt-multidevice-macos-arm64.dmg"],
+    ["codex-web-gpt-multidevice-${version}-linux-x64.AppImage", "codex-web-gpt-multidevice-linux-x64.AppImage"],
+    ["codex-web-gpt-multidevice-${version}-mac-x64.dmg", "codex-web-gpt-multidevice-macos-x64.dmg"],
+    ["codex-web-gpt-multidevice-${version}-linux-arm64.AppImage", "codex-web-gpt-multidevice-linux-arm64.AppImage"],
+  ];
+  for (const [source, alias] of aliasMappings) {
+    assert.match(aliasCreation, new RegExp(`copy_download_alias\\s+"${escapeRegex(source)}"\\s+"${escapeRegex(alias)}"`));
+  }
+
+  const aliasValidationStart = releaseText.indexOf("- name: Validate permanent download aliases");
+  const publishStart = releaseText.indexOf("- name: Publish GitHub release");
+  assert.ok(aliasValidationStart >= 0 && publishStart > aliasValidationStart);
+  const aliasValidation = releaseText.slice(aliasValidationStart, publishStart);
+  for (const [, alias] of aliasMappings) assert.ok(aliasValidation.includes(`"${alias}"`));
+  assert.match(aliasValidation, /checksums\.txt/);
+  assert.match(aliasValidation, /-s "release-assets\/\$alias"/);
+
+  assert.match(releaseText, /release_flags=\(--prerelease --latest=false\)/);
+  assert.match(releaseText, /release_flags=\(--prerelease=false --latest\)/);
+
+  assert.match(readme, /<h2 align="center">Download<\/h2>/);
+  for (const [asset, label] of [
+    ["codex-web-gpt-multidevice-windows-x64.exe", "⬇ Windows x64 (.exe)"],
+    ["codex-web-gpt-multidevice-macos-arm64.dmg", "⬇ macOS Apple Silicon (.dmg)"],
+    ["codex-web-gpt-multidevice-linux-x64.AppImage", "⬇ Linux x64 (.AppImage)"],
+  ]) {
+    assert.ok(readme.includes(`/releases/latest/download/${asset}`));
+    assert.ok(readme.includes(label));
+  }
+  for (const asset of [
+    "codex-web-gpt-multidevice-macos-x64.dmg",
+    "codex-web-gpt-multidevice-linux-arm64.AppImage",
+  ]) assert.ok(readme.includes(`/releases/latest/download/${asset}`));
+  assert.ok(readme.includes("All releases"));
+  assert.doesNotMatch(readme, /Downloads and releases/);
 });
 
 test("Linux AppImage fallback uses one owned extraction and removes it on exit", {
