@@ -2,6 +2,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 
+const MACOS_LAUNCHER_EXECUTABLE = "Codex Web GPT MultiDevice";
+
 function appendLog(job, message) {
   try {
     fs.mkdirSync(path.dirname(job.logPath), { recursive: true, mode: 0o700 });
@@ -38,7 +40,7 @@ function requireFile(filePath, label) {
 }
 
 function updateMac(job) {
-  const sourceExecutable = path.join(job.source, "Contents", "MacOS", "Codex Web GPT");
+  const sourceExecutable = path.join(job.source, "Contents", "MacOS", MACOS_LAUNCHER_EXECUTABLE);
   requireFile(sourceExecutable, "Staged macOS launcher");
   const next = `${job.target}.updating-${process.pid}`;
   const previous = `${job.target}.swap-${process.pid}`;
@@ -47,7 +49,7 @@ function updateMac(job) {
   const copied = spawnSync("/usr/bin/ditto", [job.source, next], { encoding: "utf8", timeout: 180_000 });
   if (copied.error) throw copied.error;
   if (copied.status !== 0) throw new Error(`Could not stage the macOS application: ${copied.stderr.trim()}`);
-  requireFile(path.join(next, "Contents", "MacOS", "Codex Web GPT"), "Copied macOS launcher");
+  requireFile(path.join(next, "Contents", "MacOS", MACOS_LAUNCHER_EXECUTABLE), "Copied macOS launcher");
 
   fs.renameSync(job.target, previous);
   try {

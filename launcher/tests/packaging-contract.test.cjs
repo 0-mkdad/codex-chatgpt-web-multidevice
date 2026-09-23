@@ -116,6 +116,8 @@ test("packaged launcher owns a detached checksummed updater for every release pl
   assert.match(updater, /SHA-256 verification failed/);
   assert.match(updater, /detached:\s*true/);
   assert.match(worker, /waitForParent/);
+  assert.ok(worker.includes(`const MACOS_LAUNCHER_EXECUTABLE = "${manifest.build.productName}"`));
+  assert.match(worker, /Contents", "MacOS", MACOS_LAUNCHER_EXECUTABLE/);
   assert.doesNotMatch(worker, /backup/i);
 });
 

@@ -90,38 +90,62 @@ test("installed launcher discovery has explicit platform candidates", () => {
     homeDirectory: "C:\\Users\\tester",
     environment: { LOCALAPPDATA: "C:\\Users\\tester\\AppData\\Local" },
   })).toEqual([
-    "C:\\Users\\tester\\AppData\\Local\\Programs\\Codex Web GPT\\Codex Web GPT.exe",
+    "C:\\Users\\tester\\AppData\\Local\\Programs\\Codex Web GPT MultiDevice\\Codex Web GPT MultiDevice.exe",
   ]);
   expect(installedLauncherCandidates({
     platform: "win32",
     homeDirectory: "C:\\Users\\tester",
     environment: { LOCALAPPDATA: "C:\\Users\\tester\\AppData\\Local" },
-    windowsInstallLocation: "D:\\Apps\\Codex Web GPT",
+    windowsInstallLocation: "D:\\Apps\\Codex Web GPT MultiDevice",
   })).toEqual([
-    "D:\\Apps\\Codex Web GPT\\Codex Web GPT.exe",
+    "D:\\Apps\\Codex Web GPT MultiDevice\\Codex Web GPT MultiDevice.exe",
+  ]);
+  expect(installedLauncherCandidates({
+    platform: "win32",
+    environment: {
+      CODEX_WEB_GPT_LAUNCHER_EXECUTABLE: "E:\\Explicit\\Custom Launcher.exe",
+      LOCALAPPDATA: "C:\\Users\\tester\\AppData\\Local",
+    },
+  })).toEqual([
+    "E:\\Explicit\\Custom Launcher.exe",
+    "C:\\Users\\tester\\AppData\\Local\\Programs\\Codex Web GPT MultiDevice\\Codex Web GPT MultiDevice.exe",
   ]);
 });
 
-test("injected Windows discovery avoids the live registry while ordinary discovery still uses it", () => {
+test("Windows launcher discovery uses the current product and rejects a non-absolute registry location", () => {
   const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
-  const registry = spyOn(childProcess, "execFileSync").mockImplementation((() =>
-    "    InstallLocation    REG_SZ    D:\\Installed\\Codex Web GPT\n"
-  ) as unknown as typeof childProcess.execFileSync);
+  const previousLocalAppData = process.env.LOCALAPPDATA;
+  let registryOutput = "    InstallLocation    REG_SZ    D:\\Installed\\Codex Web GPT MultiDevice\n";
+  const registry = spyOn(childProcess, "execFileSync").mockImplementation(
+    (() => registryOutput) as unknown as typeof childProcess.execFileSync,
+  );
   Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+  process.env.LOCALAPPDATA = "C:\\Fixture\\AppData\\Local";
   try {
     expect(installedLauncherCandidates({
       platform: "win32",
       environment: { LOCALAPPDATA: "C:\\Fixture\\AppData\\Local" },
-    })).toEqual(["C:\\Fixture\\AppData\\Local\\Programs\\Codex Web GPT\\Codex Web GPT.exe"]);
+    })).toEqual([
+      "C:\\Fixture\\AppData\\Local\\Programs\\Codex Web GPT MultiDevice\\Codex Web GPT MultiDevice.exe",
+    ]);
     expect(registry).not.toHaveBeenCalled();
     expect(installedLauncherCandidates({ platform: "win32", environment: process.env }))
-      .toEqual(["D:\\Installed\\Codex Web GPT\\Codex Web GPT.exe"]);
+      .toEqual(["D:\\Installed\\Codex Web GPT MultiDevice\\Codex Web GPT MultiDevice.exe"]);
     expect(registry).toHaveBeenCalledTimes(1);
     expect(installedLauncherCandidates({
       platform: "win32", environment: {}, windowsInstallLocation: "E:\\Explicit",
-    })).toEqual(["E:\\Explicit\\Codex Web GPT.exe"]);
+    })).toEqual(["E:\\Explicit\\Codex Web GPT MultiDevice.exe"]);
     expect(registry).toHaveBeenCalledTimes(1);
+
+    registryOutput = "    InstallLocation    REG_SZ    relative\\launcher\n";
+    expect(installedLauncherCandidates({ platform: "win32", environment: process.env }))
+      .toEqual([
+        "C:\\Fixture\\AppData\\Local\\Programs\\Codex Web GPT MultiDevice\\Codex Web GPT MultiDevice.exe",
+      ]);
+    expect(registry).toHaveBeenCalledTimes(2);
   } finally {
+    if (previousLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = previousLocalAppData;
     Object.defineProperty(process, "platform", platform);
     registry.mockRestore();
   }
