@@ -73,7 +73,7 @@ irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install
 | **Full harness (With Automation)** | 자동 | MCP를 통해 사용 |
 | **Zero Risk** | 직접 붙여넣고 전송 | 별도 MCP 커넥터를 통해 사용 |
 
-Zero Risk는 ChatGPT 페이지를 읽거나 조작하지 않습니다. 모델과 `Codex Zero Risk` 커넥터를 직접 선택하고, 준비된 프롬프트를 붙여넣어 전송한 다음 런처에서 **Sent**를 확인하세요. 자동 모드의 각 모델 항목은 고정된 ChatGPT 모드에 대응하며, Codex의 Effort와 Speed 설정으로 바뀌지 않습니다.
+Zero Risk는 ChatGPT 페이지를 읽거나 조작하지 않습니다. 모델과 `Codex Zero Risk` 커넥터를 직접 선택하고, 준비된 프롬프트를 붙여넣어 전송한 다음 런처에서 **Sent**를 확인하세요. 이름이 **(Web)** 으로 끝나는 자동 모델은 Codex에서 지원하는 Effort를 선택할 수 있습니다. 각 컨텍스트 한도를 유지하기 위해 Instant와 각 Pro 버전은 별도 항목으로 제공됩니다. 기존 작업에 저장된 이전 모델 항목은 원래의 고정 모드를 유지합니다.
 
 <a id="full-harness"></a>
 

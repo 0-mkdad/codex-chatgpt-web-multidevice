@@ -73,7 +73,7 @@ Automatic modes offer Luna/Think when the account has no reasoning selector; oth
 | **Full harness (With Automation)** | Automatic | Yes, through MCP |
 | **Zero Risk** | Paste and send manually | Yes, through a separate MCP connector |
 
-Zero Risk does not read or operate the ChatGPT page. Choose the model and `Codex Zero Risk` connector yourself, paste and send the prepared prompt, then confirm **Sent** in the launcher. Automatic model entries each select a fixed ChatGPT mode; Codex’s Effort and Speed rows do not override it.
+Zero Risk does not read or operate the ChatGPT page. Choose the model and `Codex Zero Risk` connector yourself, paste and send the prepared prompt, then confirm **Sent** in the launcher. Automatic models ending in **(Web)** expose their supported Effort choices in Codex. Instant and each Pro version have separate entries to preserve their context budgets; older saved model entries keep their original fixed mode.
 
 <a id="full-harness"></a>
 

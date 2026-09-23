@@ -73,7 +73,7 @@ irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install
 | **Full harness (With Automation)** | 自动 | 支持，通过 MCP |
 | **Zero Risk** | 手动粘贴并发送 | 支持，通过独立 MCP 连接器 |
 
-Zero Risk 不读取或操作 ChatGPT 页面。请自行选择模型和 `Codex Zero Risk` 连接器，粘贴并发送准备好的提示词，再在启动器中确认 **Sent**。自动模式的每个模型条目对应固定的 ChatGPT 模式；Codex 的 Effort 和 Speed 选项不会覆盖它。
+Zero Risk 不读取或操作 ChatGPT 页面。请自行选择模型和 `Codex Zero Risk` 连接器，粘贴并发送准备好的提示词，再在启动器中确认 **Sent**。名称以 **(Web)** 结尾的自动模型会在 Codex 中提供其支持的 Effort 选项。Instant 和各个 Pro 版本使用独立条目，以保留各自的上下文额度；旧任务中保存的模型条目仍使用原来的固定模式。
 
 <a id="full-harness"></a>
 
