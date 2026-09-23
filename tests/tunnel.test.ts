@@ -42,6 +42,7 @@ test("a failed tunnel stop trusts OS exit evidence, never the inventory's cleare
 
 async function withTunnelInstall(
   platform: "win32" | "darwin",
+  arch: "x64" | "arm64",
   run: (fixture: {
     root: string; executable: string; stale: string; binary: Uint8Array; archive: Uint8Array; asset: string;
     remove: ReturnType<typeof spyOn<typeof fs, "rmSync">>;
@@ -52,13 +53,14 @@ async function withTunnelInstall(
   }) => Promise<void>,
 ): Promise<void> {
   const root = fs.mkdtempSync(join(tmpdir(), "tunnel-install-"));
-  const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const archDescriptor = Object.getOwnPropertyDescriptor(process, "arch")!;
   const name = platform === "win32" ? "tunnel-client.exe" : "tunnel-client";
   const executable = join(root, "bin", name);
   const stale = `${executable}.install-${process.pid}-unrelated`;
   const binary = new TextEncoder().encode("verified fixture binary");
   const archive = zipSync({ [name]: binary });
-  const asset = `tunnel-client-v${TUNNEL_VERSION}-${platform === "win32" ? "windows" : platform}-${process.arch === "arm64" ? "arm64" : "amd64"}.zip`;
+  const asset = `tunnel-client-v${TUNNEL_VERSION}-${platform === "win32" ? "windows" : platform}-${arch === "arm64" ? "arm64" : "amd64"}.zip`;
   const sums = `${createHash("sha256").update(archive).digest("hex")}  ${asset}\n`;
   fs.mkdirSync(join(root, "bin"));
   fs.writeFileSync(stale, "Unrelated previous staging file");
@@ -72,11 +74,13 @@ async function withTunnelInstall(
   const remove = spyOn(fs, "rmSync");
   const verify = spyOn(commands, "runChecked").mockReturnValue({ status: 0, stdout: TUNNEL_VERSION, stderr: "" });
   const write = spyOn(config, "atomicWriteFile");
-  Object.defineProperty(process, "platform", { ...descriptor, value: platform });
   try {
+    Object.defineProperty(process, "platform", { ...platformDescriptor, value: platform });
+    Object.defineProperty(process, "arch", { ...archDescriptor, value: arch });
     await run({ root, executable, stale, binary, archive, asset, remove, download, verify, write, originalRemove, originalWrite });
   } finally {
-    Object.defineProperty(process, "platform", descriptor);
+    Object.defineProperty(process, "arch", archDescriptor);
+    Object.defineProperty(process, "platform", platformDescriptor);
     for (const mock of [home, download, remove, verify, write]) mock.mockRestore();
     originalRemove(root, { recursive: true, force: true });
   }
@@ -86,7 +90,7 @@ test("tunnel installation retries only transient Windows cleanup failures and le
   for (const [platform, code, transient] of [
     ["win32", "EBUSY", true], ["win32", "EPERM", true],
     ["win32", "EBUSY", false], ["win32", "EACCES", false], ["darwin", "EBUSY", false],
-  ] as const) await withTunnelInstall(platform, async fixture => {
+  ] as const) await withTunnelInstall(platform, "x64", async fixture => {
     let attempts = 0;
     const locked = Object.assign(new Error("fixture cleanup failed"), { code });
     fixture.remove.mockImplementation((path, options) => {
@@ -114,7 +118,7 @@ test("tunnel installation retries only transient Windows cleanup failures and le
 }, 10_000);
 
 test("tunnel verification and install errors survive failed cleanup and rollback", async () => {
-  for (const phase of ["verification", "installation", "upgrade"] as const) await withTunnelInstall("win32", async fixture => {
+  for (const phase of ["verification", "installation", "upgrade"] as const) await withTunnelInstall("win32", "x64", async fixture => {
     const primary = new Error(`fixture ${phase} failure`);
     const cleanup = Object.assign(new Error("fixture cleanup failure"), { code: "EACCES" });
     const manifest = join(fixture.root, "bin", "tunnel-client-manifest.json");
@@ -146,7 +150,9 @@ test("tunnel verification and install errors survive failed cleanup and rollback
 });
 
 test("downloads and verifies the pinned Windows x64 release asset", async () => {
-  await withTunnelInstall("win32", async fixture => {
+  await withTunnelInstall("win32", "x64", async fixture => {
+    expect(process.platform).toBe("win32");
+    expect(process.arch).toBe("x64");
     await installTunnelClient();
     const expectedAssetUrl = `https://github.com/openai/tunnel-client/releases/download/v${TUNNEL_VERSION}/${fixture.asset}`;
     const expectedSumsUrl = `https://github.com/openai/tunnel-client/releases/download/v${TUNNEL_VERSION}/SHA256SUMS.txt`;
@@ -167,9 +173,20 @@ test("downloads and verifies the pinned Windows x64 release asset", async () => 
   });
 });
 
+test("maps Windows ARM64 to the pinned ARM64 release asset", async () => {
+  await withTunnelInstall("win32", "arm64", async fixture => {
+    expect(process.platform).toBe("win32");
+    expect(process.arch).toBe("arm64");
+    await installTunnelClient();
+    const expectedAssetUrl = `https://github.com/openai/tunnel-client/releases/download/v${TUNNEL_VERSION}/${fixture.asset}`;
+    expect(fixture.asset).toBe("tunnel-client-v0.0.14-windows-arm64.zip");
+    expect(fixture.download.mock.calls.map(([url]) => String(url))).toContain(expectedAssetUrl);
+  });
+});
+
 test("upgrades trusted previous tunnel-client installs transactionally", async () => {
   for (const installedVersion of ["0.0.10", "0.0.12"]) {
-    await withTunnelInstall("win32", async fixture => {
+    await withTunnelInstall("win32", "x64", async fixture => {
       fs.writeFileSync(fixture.executable, `trusted ${installedVersion} binary`);
       fs.writeFileSync(join(fixture.root, "bin", "tunnel-client-manifest.json"), JSON.stringify({
         version: 1,

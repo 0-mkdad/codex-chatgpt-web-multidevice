@@ -160,7 +160,7 @@ printf '#!/bin/sh\\nexit 0\\n' > squashfs-root/resources/app.asar.unpacked/asset
       const root = path.join(scratch, `${machine}-${valid}`);
       fs.mkdirSync(root);
       fs.writeFileSync(path.join(root, "fixture.AppImage"), appImage);
-      const asset = `codex-web-gpt-1.2.3-linux-${arch}.AppImage`;
+      const asset = `codex-web-gpt-multidevice-1.2.3-linux-${arch}.AppImage`;
       const checksum = valid ? createHash("sha256").update(appImage).digest("hex") : "0".repeat(64);
       fs.writeFileSync(path.join(root, "checksums.txt"), `${checksum}  ${asset}\n`);
       const result = spawnSync("/bin/sh", [path.join(repositoryRoot, "scripts", "install-launcher.sh")], {
