@@ -20,6 +20,7 @@ import {
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt, withoutSupersededModelSwitchContracts } from "../src/adapters/chatgpt-web/prompt";
 import { MAX_CHATGPT_WEB_TURN_RETRIES } from "../src/adapters/chatgpt-web/retry-policy";
 import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
+import { ChatGptTurnJournal } from "../src/adapters/chatgpt-web/turn-journal";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import { ChatGptExternalTurnProgress, ChatGptMirroredTurnProgress, chatGptExternalProgressIsLive, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import { CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, chatGptMcpInvocationTimeout } from "../src/adapters/chatgpt-web/mcp-server";
@@ -1375,6 +1376,109 @@ describe("ChatGPT outer-native harness v4", () => {
         retryable: false,
       });
       expect(browserStarts).toBe(1);
+    } finally {
+      chatGptTurnSessions.clear();
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  });
+
+  test("adapter restart preserves an accepted tombstone through terminal journal saturation", async () => {
+    const journalPath = join(tempRoot, `restart-saturated-journal-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-restart-saturated-${Date.now()}`,
+      chatgptWeb: {
+        localToolsEnabled: false,
+        solAvailable: true,
+        extraHighAvailable: true,
+        proAvailable: true,
+        turnJournalStatePath: journalPath,
+      },
+    };
+    const request = rawWireRequest(environmentXml);
+    const executionKey = `${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(request)}`;
+    const journal = new ChatGptTurnJournal(journalPath, (() => {
+      let now = 1_000;
+      return () => now++;
+    })());
+    journal.recordSubmission(executionKey, "accepted", {
+      traceId: "trace-live-restart",
+      nativeThreadId: "thread_test_123",
+      nativeTurnId: "turn_test_123",
+    });
+    for (let index = 0; index < 300; index += 1) {
+      const key = `historical-terminal-${index}`;
+      journal.recordSubmission(key, "accepted", { traceId: `trace-terminal-${index}` });
+      journal.recordTerminal(key, "final");
+    }
+
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async () => {
+      browserStarts += 1;
+      return "unexpected browser submission";
+    };
+    try {
+      chatGptTurnSessions.clear();
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => events.push(event),
+      );
+      expect(events.at(-1)).toMatchObject({
+        type: "error",
+        code: "chatgpt_restart_recovery_required",
+        status: 409,
+        retryable: false,
+      });
+      expect(browserStarts).toBe(0);
+      expect(new ChatGptTurnJournal(journalPath).checkpoint(executionKey)).toMatchObject({
+        completion: "running",
+        submissionPhase: "accepted",
+      });
+    } finally {
+      chatGptTurnSessions.clear();
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  });
+
+  test("journal safety saturation fails before physical Send dispatch is attempted", async () => {
+    const journalPath = join(tempRoot, `send-saturation-journal-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-send-saturated-${Date.now()}`,
+      chatgptWeb: {
+        localToolsEnabled: false,
+        solAvailable: true,
+        extraHighAvailable: true,
+        proAvailable: true,
+        turnJournalStatePath: journalPath,
+      },
+    };
+    const journal = new ChatGptTurnJournal(journalPath, () => 1_000);
+    for (let index = 0; index < 256; index += 1) {
+      journal.recordSubmission(`safety-critical-${index}`, "accepted", { traceId: `trace-critical-${index}` });
+    }
+
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let sendDispatchAttempts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      await turn.onSendActivated?.();
+      sendDispatchAttempts += 1;
+      await turn.onSendDispatchAttempted?.();
+      return "unexpected dispatch";
+    };
+    try {
+      chatGptTurnSessions.clear();
+      await expect(createChatGptWebAdapter(provider).runTurn!(
+        rawWireRequest(environmentXml),
+        { headers: new Headers() },
+        () => {},
+      )).rejects.toThrow("turn journal safety capacity exhausted");
+      expect(sendDispatchAttempts).toBe(0);
     } finally {
       chatGptTurnSessions.clear();
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;

@@ -1,11 +1,13 @@
 import { expect, spyOn, test } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import {
   ChatGptBrowserWorker,
   MAX_CHATGPT_BROWSER_TABS,
   chatGptCdpRecoverySnapshot,
 } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptWebTurnRetryPolicy } from "../src/adapters/chatgpt-web/retry-policy";
 import {
   ChatGptTextFeed,
   ChatGptTraceFeed,
@@ -40,6 +42,37 @@ async function until(predicate: () => boolean, label: string): Promise<void> {
     await Promise.resolve();
   }
   throw new Error(`deterministic scheduler condition was not reached: ${label}`);
+}
+
+function rateLimitError(retryAfterMs = 15_000): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError("rate limited", {
+    status: 429,
+    errorType: "rate_limit_error",
+    code: "rate_limit_exceeded",
+    retryable: true,
+    retryAfterMs,
+    submissionRejected: true,
+  });
+}
+
+function fakeRetryClock() {
+  let now = 0;
+  const sleepers: Array<{ at: number; resolve: () => void }> = [];
+  const policy = new ChatGptWebTurnRetryPolicy(30 * 60_000, {
+    now: () => now,
+    random: () => 0.5,
+    sleep: ms => new Promise<void>(resolve => sleepers.push({ at: now + ms, resolve })),
+  });
+  const advance = async (ms: number): Promise<void> => {
+    now += ms;
+    for (const sleeper of sleepers.splice(0)) {
+      if (sleeper.at <= now) sleeper.resolve();
+      else sleepers.push(sleeper);
+    }
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+  return { policy, advance, pendingSleeps: () => sleepers.length };
 }
 
 test.each([1, 2, 3, 5])("scheduler stress completes five turns at physical limit %i without starvation", async limit => {
@@ -83,6 +116,233 @@ test.each([1, 2, 3, 5])("scheduler stress completes five turns at physical limit
   expect(state.runningRuns).toBe(0);
   expect(state.pendingRuns).toHaveLength(0);
   expect(state.activeRuns.size).toBe(0);
+});
+
+test("ten logical sessions share balanced physical capacity without restoring the five-tab limit", async () => {
+  const starts: string[] = [];
+  const releases = new Map<string, () => void>();
+  let physicallyRunning = 0;
+  let maxPhysicallyRunning = 0;
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+    config: { browserHost: "managed-chrome" },
+    activeRuns: new Map(),
+    pendingRuns: [],
+    runningRuns: 0,
+    nextQueueSequence: 1,
+    admissionInFlight: false,
+    operationalConcurrencyLimit: () => 2,
+    configuredOperationalConcurrencyLimit: () => 2,
+    runExclusive: (turn: BrowserTurn) => new Promise<string>(resolve => {
+      starts.push(turn.traceId);
+      physicallyRunning += 1;
+      maxPhysicallyRunning = Math.max(maxPhysicallyRunning, physicallyRunning);
+      releases.set(turn.traceId, () => {
+        physicallyRunning -= 1;
+        resolve(turn.traceId);
+      });
+    }),
+  }) as ChatGptBrowserWorker;
+  const sessions = new ChatGptTurnSessions(30 * 60_000, 64);
+  const traces = Array.from({ length: 10 }, (_unused, index) => `logical-${index + 1}`);
+  const owned = traces.map((traceId, index) => {
+    const browser = worker.run(browserTurn(traceId));
+    const key = `execution-${index + 1}`;
+    const session = sessions.getOrCreate(key, () => ({
+      mode: "read-only" as const,
+      browser,
+      physicalSettlement: browser.then(() => undefined, () => undefined),
+      trace: new ChatGptTraceFeed(),
+      text: new ChatGptTextFeed(),
+      lifecycleProgress: new ChatGptTurnLifecycleProgress(),
+      cancel: () => {},
+    }), traceId, `owner-${index + 1}`, `turn-${index + 1}`, `thread-${index + 1}`);
+    return { key, session };
+  });
+
+  expect(sessions.activeCount()).toBe(10);
+  await until(() => starts.length === 2, "first balanced ten-turn slots");
+  expect(starts).toEqual(traces.slice(0, 2));
+  for (const [index, traceId] of traces.entries()) {
+    await until(() => releases.has(traceId), `ten-turn start ${traceId}`);
+    releases.get(traceId)!();
+    await owned[index]!.session.browserOutcome;
+    expect(sessions.retire(owned[index]!.key, owned[index]!.session)).toBeTrue();
+  }
+  await until(() => (worker as unknown as SchedulerState).activeRuns.size === 0, "ten-turn cleanup");
+
+  expect(starts).toEqual(traces);
+  expect(new Set(starts).size).toBe(10);
+  expect(maxPhysicallyRunning).toBe(2);
+  expect(maxPhysicallyRunning).toBeLessThanOrEqual(MAX_CHATGPT_BROWSER_TABS);
+  expect(sessions.activeCount()).toBe(0);
+});
+
+test("accepted sibling survives OPEN while one HALF_OPEN probe succeeds and queued work resumes fairly", async () => {
+  const { policy, advance, pendingSleeps } = fakeRetryClock();
+  const starts: string[] = [];
+  let releaseA!: () => void;
+  let rejectB!: (error: Error) => void;
+  let acceptC!: () => void;
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+    config: { browserHost: "managed-chrome", retryScope: "account" },
+    activeRuns: new Map(),
+    pendingRuns: [],
+    runningRuns: 0,
+    nextQueueSequence: 1,
+    admissionInFlight: false,
+    configuredOperationalConcurrencyLimit: () => 2,
+    operationalConcurrencyLimit: () => policy.operationalConcurrencyLimit(2, "account"),
+    runExclusive: (turn: BrowserTurn) => {
+      starts.push(turn.traceId);
+      if (turn.traceId === "A") return new Promise<string>(resolve => { releaseA = () => resolve("A"); });
+      if (turn.traceId === "B") return new Promise<string>((_resolve, reject) => { rejectB = reject; });
+      if (turn.traceId === "C") {
+        expect(policy.circuitSnapshot("account")).toMatchObject({ state: "HALF_OPEN", probeKey: "account:C" });
+        return new Promise<string>(resolve => {
+          acceptC = () => {
+            policy.recordSubmissionAccepted("account:C");
+            resolve("C");
+          };
+        });
+      }
+      policy.recordSubmissionAccepted("account:D");
+      return Promise.resolve("D");
+    },
+  }) as ChatGptBrowserWorker;
+  const turn = (traceId: string): BrowserTurn => ({
+    ...browserTurn(traceId),
+    beforePhysicalSubmission: () => policy.waitForAttempt(`account:${traceId}`).then(() => undefined),
+    onRateLimitPressure: error => policy.recordRateLimitPressure(`account:${traceId}`, error.retryAfterMs),
+  });
+
+  const a = worker.run(turn("A"));
+  const b = worker.run(turn("B"));
+  const c = worker.run(turn("C"));
+  const d = worker.run(turn("D"));
+  await until(() => starts.length === 2, "A and B start");
+  expect(starts).toEqual(["A", "B"]);
+
+  rejectB(rateLimitError());
+  await expect(b).rejects.toMatchObject({ status: 429, submissionRejected: true });
+  await until(() => pendingSleeps() === 1, "C waits behind OPEN circuit");
+  expect(policy.circuitSnapshot("account")).toMatchObject({ state: "OPEN", failures: 1 });
+  expect(starts).toEqual(["A", "B"]);
+
+  await advance(15_000);
+  await until(() => starts.includes("C"), "C half-open probe starts beside accepted A");
+  expect(starts).toEqual(["A", "B", "C"]);
+  expect(starts.filter(value => value === "A")).toHaveLength(1);
+  expect(starts.includes("D")).toBeFalse();
+
+  acceptC();
+  await expect(c).resolves.toBe("C");
+  await until(() => starts.includes("D"), "D resumes after successful probe");
+  expect(policy.circuitSnapshot("account")).toMatchObject({ state: "CLOSED", failures: 0 });
+  await expect(d).resolves.toBe("D");
+  releaseA();
+  await expect(a).resolves.toBe("A");
+  expect(starts).toEqual(["A", "B", "C", "D"]);
+});
+
+test("a HALF_OPEN probe that is rate limited reopens the circuit and keeps later queued work blocked", async () => {
+  const { policy, advance, pendingSleeps } = fakeRetryClock();
+  const starts: string[] = [];
+  let releaseA!: () => void;
+  let rejectB!: (error: Error) => void;
+  let rejectC!: (error: Error) => void;
+  const dAbort = new AbortController();
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+    config: { browserHost: "managed-chrome", retryScope: "account" },
+    activeRuns: new Map(),
+    pendingRuns: [],
+    runningRuns: 0,
+    nextQueueSequence: 1,
+    admissionInFlight: false,
+    configuredOperationalConcurrencyLimit: () => 2,
+    operationalConcurrencyLimit: () => policy.operationalConcurrencyLimit(2, "account"),
+    runExclusive: (turn: BrowserTurn) => {
+      starts.push(turn.traceId);
+      if (turn.traceId === "A") return new Promise<string>(resolve => { releaseA = () => resolve("A"); });
+      if (turn.traceId === "B") return new Promise<string>((_resolve, reject) => { rejectB = reject; });
+      if (turn.traceId === "C") return new Promise<string>((_resolve, reject) => { rejectC = reject; });
+      return Promise.resolve("D");
+    },
+  }) as ChatGptBrowserWorker;
+  const turn = (traceId: string, abortSignal?: AbortSignal): BrowserTurn => ({
+    ...browserTurn(traceId, abortSignal),
+    beforePhysicalSubmission: () => policy.waitForAttempt(`account:${traceId}`, abortSignal).then(() => undefined),
+    onRateLimitPressure: error => policy.recordRateLimitPressure(`account:${traceId}`, error.retryAfterMs),
+  });
+
+  const a = worker.run(turn("A"));
+  const b = worker.run(turn("B"));
+  const c = worker.run(turn("C"));
+  const d = worker.run(turn("D", dAbort.signal));
+  await until(() => starts.length === 2, "A and B start before repeated 429");
+  rejectB(rateLimitError());
+  await expect(b).rejects.toMatchObject({ status: 429 });
+  await until(() => pendingSleeps() === 1, "C waits for first cooldown");
+  await advance(15_000);
+  await until(() => starts.includes("C"), "C becomes first half-open probe");
+
+  rejectC(rateLimitError(30_000));
+  await expect(c).rejects.toMatchObject({ status: 429 });
+  await until(() => pendingSleeps() === 1, "D waits after probe reopens circuit");
+  expect(policy.circuitSnapshot("account")).toMatchObject({ state: "OPEN", failures: 2 });
+  expect(starts.includes("D")).toBeFalse();
+  expect(starts.filter(value => value === "A")).toHaveLength(1);
+
+  dAbort.abort();
+  await expect(d).rejects.toMatchObject({ name: "AbortError" });
+  releaseA();
+  await expect(a).resolves.toBe("A");
+  expect(starts).toEqual(["A", "B", "C"]);
+});
+
+test("shared browser-host loss settles accepted siblings without losing the queued turn or leaking slots", async () => {
+  const starts: string[] = [];
+  const rejectors = new Map<string, (error: Error) => void>();
+  let hostFailed = false;
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+    config: { browserHost: "managed-chrome" },
+    activeRuns: new Map(),
+    pendingRuns: [],
+    runningRuns: 0,
+    nextQueueSequence: 1,
+    admissionInFlight: false,
+    configuredOperationalConcurrencyLimit: () => 2,
+    operationalConcurrencyLimit: () => 2,
+    runExclusive: (turn: BrowserTurn) => {
+      starts.push(turn.traceId);
+      if (turn.traceId === "C") {
+        expect(hostFailed).toBeTrue();
+        return Promise.resolve("C-safe-pre-send-restart");
+      }
+      return new Promise<string>((_resolve, reject) => rejectors.set(turn.traceId, reject));
+    },
+  }) as ChatGptBrowserWorker;
+
+  const a = worker.run(browserTurn("A"));
+  const b = worker.run(browserTurn("B"));
+  const c = worker.run(browserTurn("C"));
+  await until(() => starts.length === 2, "accepted host-loss siblings occupy both slots");
+  expect(starts).toEqual(["A", "B"]);
+
+  hostFailed = true;
+  rejectors.get("A")!(new Error("shared browser host exited after acceptance"));
+  rejectors.get("B")!(new Error("shared browser host exited after acceptance"));
+  const settledAccepted = await Promise.allSettled([a, b]);
+  expect(settledAccepted.every(result => result.status === "rejected")).toBeTrue();
+  await until(() => starts.includes("C"), "queued pre-send turn retains its position after host loss");
+  await expect(c).resolves.toBe("C-safe-pre-send-restart");
+  await until(() => (worker as unknown as SchedulerState).activeRuns.size === 0, "host-loss scheduler cleanup");
+
+  expect(starts).toEqual(["A", "B", "C"]);
+  const state = worker as unknown as SchedulerState;
+  expect(state.runningRuns).toBe(0);
+  expect(state.pendingRuns).toHaveLength(0);
+  expect(state.activeRuns.size).toBe(0);
+  expect(chatGptCdpRecoverySnapshot()).toEqual({ active: 0, queued: 0 });
 });
 
 test("accelerated parallel soak represents sixty logical minutes and leaves zero runtime residue", async () => {

@@ -66,7 +66,9 @@ test("rate-limit circuit honors Retry-After, permits one half-open probe, and ne
   const probe = await policy.waitForAttempt("scope:probe");
   expect(sleeps).toEqual([45_000]);
   expect(probe).toMatchObject({ circuitState: "HALF_OPEN", halfOpenProbe: true });
-  expect(policy.operationalConcurrencyLimit(2, "scope")).toBe(1);
+  // The one probe is serialized by waitForAttempt(); restore configured physical headroom so an
+  // already-accepted sibling cannot occupy the pressure slot and starve the HALF_OPEN probe.
+  expect(policy.operationalConcurrencyLimit(2, "scope")).toBe(2);
 
   let secondReleased = false;
   const second = policy.waitForAttempt("scope:another").then(value => {

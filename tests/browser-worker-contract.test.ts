@@ -396,6 +396,7 @@ test("a queued turn cannot pass a newly observed 429 pressure callback before sl
     nextQueueSequence: 1,
     admissionInFlight: false,
     operationalConcurrencyLimit: () => 1,
+    configuredOperationalConcurrencyLimit: () => 1,
     runExclusive: (turn: { traceId: string }) => {
       if (turn.traceId === "rate_limited") {
         return new Promise<string>((_resolve, reject) => { failFirst = reject; });
