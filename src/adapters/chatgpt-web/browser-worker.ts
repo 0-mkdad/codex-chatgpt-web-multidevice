@@ -2486,8 +2486,12 @@ export class ChatGptBrowserWorker {
   private drainBrowserTurnQueue(): void {
     if (this.admissionInFlight) return;
     const operationalLimit = this.operationalConcurrencyLimit();
-    while (this.runningRuns < operationalLimit && this.pendingRuns.length > 0) {
+    const configuredLimit = this.configuredOperationalConcurrencyLimit();
+    while (this.pendingRuns.length > 0) {
       const queued = this.pendingRuns[0]!;
+      const mayAwaitAdmissionWithoutSlot = queued.turn.beforePhysicalSubmission !== undefined
+        && this.runningRuns < configuredLimit;
+      if (this.runningRuns >= operationalLimit && !mayAwaitAdmissionWithoutSlot) return;
       if (queued.turn.abortSignal?.aborted) {
         this.pendingRuns.shift();
         queued.reject(new DOMException("ChatGPT web turn aborted while waiting for a browser slot", "AbortError"));

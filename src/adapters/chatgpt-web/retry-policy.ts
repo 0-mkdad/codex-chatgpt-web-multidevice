@@ -246,10 +246,14 @@ export class ChatGptWebTurnRetryPolicy {
       throw new Error("ChatGPT operational concurrency limit must be a positive integer");
     }
     if (!keyOrScope) {
-      return [...this.circuits.values()].some(circuit => circuit.state !== "CLOSED") ? 1 : normalLimit;
+      return [...this.circuits.values()].some(circuit => circuit.state === "OPEN") ? 1 : normalLimit;
     }
     const circuit = this.circuitForScope(this.scopeFor(keyOrScope));
-    return circuit.state === "CLOSED" ? normalLimit : 1;
+    // OPEN suppresses new account-pressure-producing submissions. Once the sole HALF_OPEN probe
+    // has been selected by waitForAttempt(), restore configured headroom so an already-accepted
+    // sibling does not indefinitely occupy the one pressure slot and starve that probe. Other
+    // queued submissions remain serialized behind the probe by waitForAttempt().
+    return circuit.state === "OPEN" ? 1 : normalLimit;
   }
 
   private openRateLimitCircuit(key: string, retryAfterMs: number | undefined, now: number): void {
