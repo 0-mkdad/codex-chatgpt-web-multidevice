@@ -91,7 +91,7 @@ The launcher's **MCP** page guides the complete setup. For the exact clicks, see
 > **Limits**
 >
 > See the [repository discussions](https://github.com/0-mkdad/codex-chatgpt-web-multidevice/discussions) for the current
-> ChatGPT message allowances for **GPT-5.6 Sol Pro** and **GPT-6 Astra**. Context limits depend on
+> ChatGPT message allowances for **GPT-5.6 Sol Pro** and **GPT-6 Pro**. Context limits depend on
 > the account type and selected effort. Plus Medium/High uses a measured 90,000-token window, or
 > up to 270,000 tokens with experimental **3× context** enabled, with native Codex compaction
 > supported throughout.
