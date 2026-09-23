@@ -85,6 +85,9 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
         browserHostDescriptorPath: join(root, "launcher-browser.json"),
         tunnelId: `tunnel_${"a".repeat(32)}`,
         acknowledgedUnofficial: true,
+        ...(!development && interaction === "automatic"
+          ? { automaticAppName: "Codex Native2 Dell" }
+          : {}),
       };
       const listener = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response() });
       const port = listener.port!;
@@ -99,6 +102,10 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
       expect(result.connectorSetupRequired).toBe(true);
       expect(saved?.experimentalFreshConversationPerTurn).toBe(interaction === "automatic");
       expect(saved?.useSavedChats).toBe(true);
+      if (!development && interaction === "automatic") {
+        expect(saved?.automaticAppName).toBe("Codex Native2 Dell");
+        expect(saved?.appName).toBe("Codex Native2 Dell");
+      }
 
       calls.length = 0;
       mocks.push(spyOn(configModule, "saveConfig").mockImplementation(() => { throw new Error("config commit failed"); }));

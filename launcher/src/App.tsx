@@ -5,12 +5,14 @@ import {
   useEffect,
   useLayoutEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import { copyFor, localizeRuntimeMessage, type Copy } from "./i18n";
+import { connectorNameDraftReducer, createConnectorNameDraft } from "./connector-name-draft";
 import { Icon, type IconName } from "./icons";
 import { LimitsSurface } from "./LimitsSurface";
 import { limitsCopyFor } from "./limits-copy";
@@ -101,6 +103,13 @@ export function App() {
       : current);
   }, []);
 
+  const updateSnapshot = useCallback((next: LauncherSnapshot) => {
+    setSnapshot(next);
+    setBrowser(next.browser);
+    setLogs(next.logs);
+    setOperation(next.operation);
+  }, []);
+
   if (!api) return <FatalMessage message="Launcher IPC is unavailable." />;
   if (!snapshot) return <LaunchLoading />;
 
@@ -134,6 +143,7 @@ export function App() {
             operation={operation}
             setError={setError}
             snapshot={snapshot}
+            updateSnapshot={updateSnapshot}
             updateState={updateState}
           />
         )}
@@ -323,6 +333,7 @@ function LauncherShell({
   operation,
   setError,
   snapshot,
+  updateSnapshot,
   updateState,
 }: {
   browser: BrowserState | null;
@@ -332,6 +343,7 @@ function LauncherShell({
   operation: OperationState | null;
   setError: (error: string | null) => void;
   snapshot: LauncherSnapshot;
+  updateSnapshot: (snapshot: LauncherSnapshot) => void;
   updateState: (state: LauncherState) => void;
 }) {
   const interactionSetupComplete = snapshot.state.coreSetupComplete === true
@@ -695,6 +707,7 @@ function LauncherShell({
                 operation={operation}
                 setError={setError}
                 snapshot={snapshot}
+                updateSnapshot={updateSnapshot}
                 updateState={updateState}
               />
             ) : null}
@@ -1252,6 +1265,7 @@ function McpSurface({
   operation,
   setError,
   snapshot,
+  updateSnapshot,
   updateState,
 }: {
   copy: Copy;
@@ -1262,6 +1276,7 @@ function McpSurface({
   operation: OperationState | null;
   setError: (error: string | null) => void;
   snapshot: LauncherSnapshot;
+  updateSnapshot: (snapshot: LauncherSnapshot) => void;
   updateState: (state: LauncherState) => void;
 }) {
   const configuringInactiveMode = interactionMode !== snapshot.state.browserInteractionMode;
@@ -1270,7 +1285,12 @@ function McpSurface({
   );
   const [tunnelId, setTunnelId] = useState("");
   const [runtimeKey, setRuntimeKey] = useState("");
-  const [connectorName, setConnectorName] = useState(snapshot.connectorNames.automatic);
+  const [connectorNameDraft, dispatchConnectorNameDraft] = useReducer(
+    connectorNameDraftReducer,
+    snapshot.connectorNames.automatic,
+    createConnectorNameDraft,
+  );
+  const connectorName = connectorNameDraft.draftName;
   const [credentialsConfigured, setCredentialsConfigured] = useState(
     interactionMode === snapshot.state.browserInteractionMode
       ? snapshot.mcpCredentialsConfigured
@@ -1291,6 +1311,13 @@ function McpSurface({
     },
   ], [copy, manualInteraction]);
   const guideMedia = MCP_GUIDE_MEDIA[step];
+
+  useEffect(() => {
+    dispatchConnectorNameDraft({
+      type: "snapshot",
+      persistedName: snapshot.connectorNames.automatic,
+    });
+  }, [snapshot.connectorNames.automatic]);
 
   const move = async (next: number) => {
     setStep(next);
@@ -1318,9 +1345,10 @@ function McpSurface({
     setLocalBusy(true);
     setError(null);
     try {
+      const submittedConnectorName = connectorName.trim();
       await api!.setupMcp({
         interactionMode,
-        connectorName: connectorName.trim(),
+        connectorName: submittedConnectorName,
         ...(credentialsConfigured && !replacingCredentials
           ? { replace: false }
           : { tunnelId, runtimeKey, replace: true }),
@@ -1329,7 +1357,13 @@ function McpSurface({
       setTunnelId("");
       setCredentialsConfigured(true);
       setReplacingCredentials(false);
-      updateState((await api!.snapshot()).state);
+      const nextSnapshot = await api!.snapshot();
+      updateSnapshot(nextSnapshot);
+      dispatchConnectorNameDraft({
+        type: "saved",
+        persistedName: nextSnapshot.connectorNames.automatic,
+      });
+      updateState(nextSnapshot.state);
       await move(2);
     } catch (cause) {
       setError(messageOf(cause));
@@ -1344,7 +1378,9 @@ function McpSurface({
     setDoctor(null);
     try {
       setDoctor(await api!.verifyMcp());
-      updateState((await api!.snapshot()).state);
+      const nextSnapshot = await api!.snapshot();
+      updateSnapshot(nextSnapshot);
+      updateState(nextSnapshot.state);
     } catch (cause) {
       setError(messageOf(cause));
     } finally {
@@ -1418,10 +1454,16 @@ function McpSurface({
                 <input
                   autoCorrect="off"
                   disabled={busy}
-                  onChange={(event) => setConnectorName(event.target.value)}
+                  onChange={(event) => dispatchConnectorNameDraft({ type: "edit", value: event.target.value })}
                   value={connectorName}
                 />
               </FieldRow>
+            ) : null}
+            {step === 1 ? (
+              <div className="connector-name">
+                <span>{copy.savedAutomaticConnectorName}</span>
+                <code>{connectorNameDraft.persistedName}</code>
+              </div>
             ) : null}
             {step === 1 ? (
               credentialsConfigured && !replacingCredentials ? (

@@ -456,6 +456,7 @@ test("fresh-conversation snapshot uses runtime configuration and mode switching 
   const runtimeHost = {
     currentOperation: () => null,
     runtimeConfigSnapshot: () => ({ config }), browserConnectorName: () => "Codex Native2",
+    snapshotConnectorName: () => "Codex Native2",
     setupConnectorName: () => "Codex Native2", mcpCredentialsConfigured: () => true,
     setBrowserInteractionMode: async mode => { config.browserInteractionMode = mode; return { configured: true }; },
   };

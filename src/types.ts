@@ -266,6 +266,10 @@ export interface CodexProviderConfig {
   chatgptWeb?: {
     /** ChatGPT custom connector attached to tool-capable temporary chats. */
     appName?: string;
+    /** Persisted automatic connector identity; appName is derived from the active mode. */
+    automaticAppName?: string;
+    /** Persisted manual connector identity, fixed to the Zero Risk connector. */
+    manualAppName?: string;
     /** Whether ChatGPT DOM interaction is automatic or explicitly driven by the user. */
     browserInteractionMode?: "automatic" | "manual";
     /** Explicit browser owner. Launcher mode attaches to the embedded Electron ChatGPT surface. */

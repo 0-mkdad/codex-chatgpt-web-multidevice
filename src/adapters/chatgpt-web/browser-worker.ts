@@ -14,6 +14,8 @@ import {
   isLegacyChatGptConnectorName,
   legacyChatGptConnectorMigrationMessage,
   LEGACY_CHATGPT_CONNECTOR_NAMES,
+  normalizeConnectorName,
+  ZERO_RISK_CHATGPT_CONNECTOR_NAME,
 } from "../../config";
 import { estimateTokens } from "../../lib/token-estimate";
 import { CHATGPT_STOPPED_THINKING_LABELS } from "./ui-labels";
@@ -2042,7 +2044,17 @@ class ChatGptBrowserDiagnostics {
 
 export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBrowserConfig {
   const configured = provider.chatgptWeb ?? {};
-  const appName = configured.appName?.trim() || CHATGPT_CONNECTOR_NAME;
+  const interactionMode = configured.browserInteractionMode ?? "automatic";
+  const configuredName = interactionMode === "manual"
+    ? configured.manualAppName ?? configured.appName ?? ZERO_RISK_CHATGPT_CONNECTOR_NAME
+    : configured.automaticAppName ?? configured.appName ?? CHATGPT_CONNECTOR_NAME;
+  const appName = normalizeConnectorName(configuredName, "ChatGPT connector name");
+  if (interactionMode === "manual" && appName !== ZERO_RISK_CHATGPT_CONNECTOR_NAME) {
+    throw new Error("Manual ChatGPT connector must be the Zero Risk connector");
+  }
+  if (interactionMode === "automatic" && appName === ZERO_RISK_CHATGPT_CONNECTOR_NAME) {
+    throw new Error("Automatic ChatGPT connector must differ from the Zero Risk connector");
+  }
   const browserHost = configured.browserHost ?? "managed-chrome";
   const browserHostDescriptorPath = configured.browserHostDescriptorPath?.trim();
   const browserHelperScriptPath = configured.browserHelperScriptPath?.trim();

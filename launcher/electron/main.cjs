@@ -530,7 +530,7 @@ function registerIpc({ logger, stateStore }) {
     },
     state: syncFreshConversationPreference(stateStore, runtimeHost.runtimeConfigSnapshot().config),
     browser: browserHost?.snapshot() ?? null,
-    connectorName: runtimeHost.browserConnectorName(),
+    connectorName: runtimeHost.snapshotConnectorName(),
     connectorNames: {
       automatic: runtimeHost.setupConnectorName(),
       manual: "Codex Zero Risk",

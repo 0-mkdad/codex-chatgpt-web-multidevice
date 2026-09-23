@@ -130,6 +130,32 @@ test("launcher runtime ownership rejects a different browser descriptor", () => 
   );
 });
 
+test("launcher supervision accepts a stale derived appName only when its persisted automatic identity is valid", () => {
+  const descriptorPath = path.join(os.tmpdir(), "launcher-connector-identity.json");
+  const stale = {
+    ...launcherConfig(descriptorPath),
+    mode: "full",
+    appName: "Codex Native2",
+    automaticAppName: "Codex Native2 Dell",
+    manualAppName: "Codex Zero Risk",
+    browserInteractionMode: "automatic",
+    solAvailable: true,
+    tunnel: {
+      binaryPath: process.execPath,
+      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+      runtimeKeyFile: path.join(os.tmpdir(), "launcher-runtime.key"),
+      profileDir: path.join(os.tmpdir(), "launcher-tunnel-profile"),
+      profileName: "codex-chatgpt-web",
+      alias: "codex-chatgpt-web",
+    },
+  };
+  assert.equal(validateConfig(stale, descriptorPath), stale);
+  assert.throws(
+    () => validateConfig({ ...stale, automaticAppName: "" }, descriptorPath),
+    /Connector name is invalid/,
+  );
+});
+
 test("launcher runtime ownership cannot cross production and DEV profiles", () => {
   const descriptorPath = path.join(os.tmpdir(), "launcher.json");
   const production = { ...launcherConfig(descriptorPath), solAvailable: true };

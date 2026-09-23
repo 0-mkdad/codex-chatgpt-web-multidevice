@@ -6,18 +6,28 @@ const path = require("node:path");
 const { CURRENT_CONNECTOR_NAME, DEV_CONNECTOR_NAME } = require("../electron/connector-identity.cjs");
 const { RuntimeHost } = require("../electron/runtime.cjs");
 
-function hostFor(existingConfig, interactionMode = "automatic") {
+function hostFor(
+  existingConfig,
+  interactionMode = "automatic",
+  userDataPath = path.join(os.tmpdir(), "codex-web-gpt-runtime-host-test"),
+) {
+  let config = existingConfig;
+  const logs = [];
   const host = new RuntimeHost({
     app: {
-      getPath: () => path.join(os.tmpdir(), "codex-web-gpt-runtime-host-test"),
+      getPath: () => userDataPath,
       getVersion: () => "1.1.3",
     },
-    logger: { info() {}, warn() {}, error() {} },
+    logger: {
+      info: (event, fields) => logs.push({ event, fields }),
+      warn() {},
+      error() {},
+    },
     sourceRoot: "/source",
     browserDescriptorPath: "/runtime/launcher-browser.json",
     supervisor: {
-      readConfig: () => existingConfig,
-      readSetupConfig: () => existingConfig,
+      readConfig: () => config,
+      readSetupConfig: () => config,
       stopForSetup: async () => ({ status: "stopped" }),
       startIfConfigured: async () => ({ status: "ready" }),
     },
@@ -26,10 +36,25 @@ function hostFor(existingConfig, interactionMode = "automatic") {
   let invocation;
   host.runSetup = async (name, args, options = {}) => {
     invocation = { name, args };
+    if (name === "mcp-setup" || name === "runtime-upgrade") {
+      const connectorIndex = args.indexOf("--connector-name");
+      const automaticAppName = connectorIndex >= 0
+        ? args[connectorIndex + 1]
+        : config?.automaticAppName ?? config?.appName ?? CURRENT_CONNECTOR_NAME;
+      config = {
+        ...config,
+        mode: "full",
+        appName: automaticAppName,
+        automaticAppName,
+        manualAppName: "Codex Zero Risk",
+        browserInteractionMode: "automatic",
+        ...(name === "runtime-upgrade" ? { releaseVersion: "1.1.3" } : {}),
+      };
+    }
     await options.afterRuntimeReady?.();
     return { code: 0, stdout: "", stderr: "" };
   };
-  return { host, invocation: () => invocation };
+  return { host, invocation: () => invocation, config: () => config, logs };
 }
 
 function devHostFor(existingConfig, interactionMode = "automatic") {
@@ -432,6 +457,8 @@ test("launcher migrates the legacy connector identity even when the release vers
     "--refresh-account-capabilities",
     "--acknowledge-unofficial",
     "--restart-service",
+    "--connector-name",
+    CURRENT_CONNECTOR_NAME,
   ]);
   assert.equal(result.updated, true);
   assert.equal(result.connectorMigrated, true);
@@ -538,7 +565,7 @@ test("new MCP setup uses the fixed connector without a CLI name override", async
 });
 
 test("MCP setup and reconnect preserve the selected per-computer connector name", async () => {
-  const connectorName = "Laptop Codex Connector";
+  const connectorName = "Codex Native2 Dell";
   const tunnelId = "tunnel_0123456789abcdef0123456789abcdef";
   const newInstall = hostFor(null);
   await newInstall.host.setupMcp({
@@ -549,6 +576,26 @@ test("MCP setup and reconnect preserve the selected per-computer connector name"
   });
   const newInstallArgs = newInstall.invocation().args;
   assert.equal(newInstallArgs[newInstallArgs.indexOf("--connector-name") + 1], connectorName);
+  assert.equal(newInstall.config().automaticAppName, connectorName);
+  assert.equal(newInstall.host.setupConnectorName(), connectorName);
+  assert.equal(newInstall.host.mcpConnectorName(), connectorName);
+  assert.equal(newInstall.host.browserConnectorName(), connectorName);
+  assert.deepEqual(
+    newInstall.logs.filter(record => record.event.startsWith("connector.setup_")).map(record => record.fields),
+    [
+      {
+        previousConnectorName: CURRENT_CONNECTOR_NAME,
+        requestedConnectorName: connectorName,
+        interactionMode: "automatic",
+      },
+      {
+        previousConnectorName: CURRENT_CONNECTOR_NAME,
+        requestedConnectorName: connectorName,
+        interactionMode: "automatic",
+        persistedConnectorName: connectorName,
+      },
+    ],
+  );
 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-custom-connector-"));
   const keyPath = path.join(root, "tunnel-runtime.key");
@@ -557,19 +604,40 @@ test("MCP setup and reconnect preserve the selected per-computer connector name"
     const savedInstall = hostFor({
       mode: "full",
       browserHost: "launcher",
-      appName: connectorName,
-      automaticAppName: connectorName,
+      appName: CURRENT_CONNECTOR_NAME,
+      automaticAppName: CURRENT_CONNECTOR_NAME,
       tunnel: { tunnelId, runtimeKeyFile: keyPath },
     });
-    assert.equal(savedInstall.host.setupConnectorName(), connectorName);
+    assert.equal(savedInstall.host.setupConnectorName(), CURRENT_CONNECTOR_NAME);
     await savedInstall.host.setupMcp({ replace: false, connectorName });
     const reconnectArgs = savedInstall.invocation().args;
     assert.equal(reconnectArgs[reconnectArgs.indexOf("--connector-name") + 1], connectorName);
     assert.equal(reconnectArgs.includes("--tunnel-id"), false);
     assert.equal(reconnectArgs.includes("--runtime-key-file"), false);
+    assert.equal(savedInstall.config().tunnel.tunnelId, tunnelId);
+    assert.equal(fs.readFileSync(keyPath, "utf8"), "saved-private-runtime-key\n");
+    assert.equal(savedInstall.config().automaticAppName, connectorName);
+    assert.equal(savedInstall.host.setupConnectorName(), connectorName);
+    assert.equal(savedInstall.host.mcpConnectorName(), connectorName);
+    assert.equal(savedInstall.host.browserConnectorName(), connectorName);
+    assert.equal(JSON.stringify(savedInstall.logs).includes("saved-private-runtime-key"), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("automatic runtime and browser identity prefer automaticAppName when appName is stale", () => {
+  const fixture = hostFor({
+    mode: "full",
+    browserHost: "launcher",
+    browserInteractionMode: "automatic",
+    appName: CURRENT_CONNECTOR_NAME,
+    automaticAppName: "Codex Native2 Dell",
+    manualAppName: "Codex Zero Risk",
+  });
+  assert.equal(fixture.host.setupConnectorName(), "Codex Native2 Dell");
+  assert.equal(fixture.host.mcpConnectorName(), "Codex Native2 Dell");
+  assert.equal(fixture.host.browserConnectorName(), "Codex Native2 Dell");
 });
 
 test("MCP credential replacement remains explicit and requires a complete new pair", async () => {
@@ -803,6 +871,133 @@ test("connector verification uses the current identity and rejects a legacy loca
   const dev = devHostFor({ mode: "full", appName: "Codex Native2" });
   assert.equal(dev.host.browserConnectorName(), DEV_CONNECTOR_NAME);
   assert.equal(dev.host.mcpConnectorName(), DEV_CONNECTOR_NAME);
+});
+
+test("fresh setup with no custom name persists and uses the default connector", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-default-connector-"));
+  try {
+    const fixture = hostFor(null, "automatic", root);
+    await fixture.host.setupMcp({
+      replace: true,
+      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+      runtimeKey: "fresh-private-runtime-key",
+    });
+    const args = fixture.invocation().args;
+    assert.equal(args.includes("--connector-name"), false);
+    assert.equal(fixture.config().automaticAppName, CURRENT_CONNECTOR_NAME);
+    assert.equal(fixture.host.setupConnectorName(), CURRENT_CONNECTOR_NAME);
+    assert.equal(fixture.host.browserConnectorName(), CURRENT_CONNECTOR_NAME);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("release upgrade repairs a stale active appName from the persisted automatic connector name", async () => {
+  const config = {
+    mode: "full",
+    browserHost: "launcher",
+    releaseVersion: "1.0.0",
+    appName: CURRENT_CONNECTOR_NAME,
+    automaticAppName: "Codex Native2 Dell",
+    manualAppName: "Codex Zero Risk",
+    browserInteractionMode: "automatic",
+  };
+  const fixture = hostFor(config);
+  const upgrade = await fixture.host.upgradeManagedRuntime();
+  assert.equal(upgrade.updated, true);
+  const args = fixture.invocation().args;
+  assert.equal(args[args.indexOf("--connector-name") + 1], "Codex Native2 Dell");
+  assert.equal(fixture.config().appName, "Codex Native2 Dell");
+  assert.equal(fixture.config().automaticAppName, "Codex Native2 Dell");
+  const restarted = hostFor(fixture.config());
+  assert.equal(restarted.host.setupConnectorName(), "Codex Native2 Dell");
+  assert.equal(restarted.host.browserConnectorName(), "Codex Native2 Dell");
+});
+
+test("invalid persisted automatic name remains editable and is repaired by release setup", async () => {
+  const config = {
+    mode: "full",
+    browserHost: "launcher",
+    releaseVersion: "1.1.3",
+    appName: "Codex Native2 Dell",
+    automaticAppName: "",
+    manualAppName: "Codex Zero Risk",
+    browserInteractionMode: "automatic",
+  };
+  const fixture = hostFor(config);
+  fixture.host.supervisor.readConfig = () => {
+    throw new Error("Automatic connector name is invalid: Connector name is invalid");
+  };
+
+  assert.equal(fixture.host.setupConnectorName(), "");
+  assert.equal(fixture.host.snapshotConnectorName(), "");
+  assert.throws(() => fixture.host.browserConnectorName(), /Automatic connector name is invalid/);
+  assert.throws(() => fixture.host.mcpConnectorName(), /Automatic connector name is invalid/);
+
+  const result = await fixture.host.upgradeManagedRuntime();
+  assert.equal(result.connectorMigrated, true);
+  const args = fixture.invocation().args;
+  assert.equal(args[args.indexOf("--connector-name") + 1], CURRENT_CONNECTOR_NAME);
+  assert.equal(fixture.config().automaticAppName, CURRENT_CONNECTOR_NAME);
+  assert.equal(fixture.host.browserConnectorName(), CURRENT_CONNECTOR_NAME);
+});
+
+test("two devices retain independent connector names through upgrade, reconnect, and launcher restart", async () => {
+  const devices = [
+    ["Codex Native2 Dell", "tunnel_11111111111111111111111111111111"],
+    ["Codex Native2 Laptop", "tunnel_22222222222222222222222222222222"],
+  ];
+  const roots = [];
+  try {
+    for (const [connectorName, tunnelId] of devices) {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-device-identity-"));
+      roots.push(root);
+      const keyPath = path.join(root, "tunnel-runtime-automatic.key");
+      fs.writeFileSync(keyPath, "device-private-runtime-key\n", { mode: 0o600 });
+      const tunnel = {
+        alias: "codex-chatgpt-web",
+        tunnelId,
+        runtimeKeyFile: keyPath,
+        profileDir: path.join(root, "profiles"),
+        profileName: "codex-chatgpt-web",
+        binaryPath: path.join(root, "tunnel-client"),
+      };
+      const original = {
+        mode: "full",
+        browserHost: "launcher",
+        releaseVersion: "1.0.0",
+        appName: CURRENT_CONNECTOR_NAME,
+        automaticAppName: connectorName,
+        manualAppName: "Codex Zero Risk",
+        browserInteractionMode: "automatic",
+        tunnel,
+        automaticTunnel: tunnel,
+      };
+      const beforeUpgrade = hostFor(original);
+      await beforeUpgrade.host.upgradeManagedRuntime();
+      assert.equal(
+        beforeUpgrade.invocation().args[beforeUpgrade.invocation().args.indexOf("--connector-name") + 1],
+        connectorName,
+      );
+
+      const restarted = hostFor(beforeUpgrade.config());
+      assert.equal(restarted.host.setupConnectorName(), connectorName);
+      await restarted.host.setupMcp({ replace: false, connectorName });
+      const reconnectArgs = restarted.invocation().args;
+      assert.equal(reconnectArgs[reconnectArgs.indexOf("--connector-name") + 1], connectorName);
+      assert.equal(reconnectArgs.includes("--tunnel-id"), false);
+      assert.equal(reconnectArgs.includes("--runtime-key-file"), false);
+      assert.equal(restarted.config().tunnel.tunnelId, tunnelId);
+      assert.equal(fs.readFileSync(keyPath, "utf8"), "device-private-runtime-key\n");
+
+      const afterRestart = hostFor(restarted.config());
+      assert.equal(afterRestart.host.setupConnectorName(), connectorName);
+      assert.equal(afterRestart.host.mcpConnectorName(), connectorName);
+      assert.equal(afterRestart.host.browserConnectorName(), connectorName);
+    }
+  } finally {
+    for (const root of roots) fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("launcher-controlled CLI operations use the live descriptor token", () => {

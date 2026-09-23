@@ -1284,7 +1284,17 @@ test("prompt insertion stops before touching the composer when its stage is alre
   expect(resolvedComposer).toBeFalse();
 });
 
-test("connector selection re-resolves the active composer after ChatGPT replaces it", async () => {
+test("connector selection uses persisted automatic identity and re-resolves the active composer after replacement", async () => {
+  const appName = resolveBrowserConfig({
+    adapter: "chatgpt-web",
+    baseUrl: "browser://chatgpt",
+    chatgptWeb: {
+      appName: CHATGPT_CONNECTOR_NAME,
+      automaticAppName: "Codex Native2 Dell",
+      browserInteractionMode: "automatic",
+    },
+  }).appName;
+  expect(appName).toBe("Codex Native2 Dell");
   const calls: Array<[string, string?]> = [];
   let connectorSelected = false;
   const appResult = {
@@ -1304,7 +1314,7 @@ test("connector selection re-resolves the active composer after ChatGPT replaces
       expect(selector).toBe('[data-id^="plugin:"][data-keyword]');
       return {
         filter: (options: { hasText: string; visible: boolean }) => {
-          expect(options).toEqual({ hasText: "Codex Native2", visible: true });
+          expect(options).toEqual({ hasText: appName, visible: true });
           return selectedConnector;
         },
       };
@@ -1327,7 +1337,7 @@ test("connector selection re-resolves the active composer after ChatGPT replaces
     url: () => "https://chatgpt.com/?temporary-chat=true",
     getByRole: personalizedTemporaryChatRole,
     getByText: (text: string, options: { exact: boolean }) => {
-      expect(text).toBe("Codex Native2");
+      expect(text).toBe(appName);
       expect(options).toEqual({ exact: true });
       return { exactConnectorLabel: true };
     },
@@ -1350,7 +1360,7 @@ test("connector selection re-resolves the active composer after ChatGPT replaces
 
   let activeComposerCalls = 0;
   const resolved = await selectConnector.call({
-    config: { appName: "Codex Native2" },
+    config: { appName },
     connectorIsSelected: async () => connectorSelected,
     selectedConnectorControl: () => selectedConnector,
     activeComposer: async () => {

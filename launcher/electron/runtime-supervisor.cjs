@@ -5,6 +5,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
 const { redactText } = require("./logging.cjs");
+const { activeConnectorName, automaticConnectorName } = require("./connector-identity.cjs");
 const {
   DETACH_OWNED_CHILD,
   processRunning,
@@ -231,9 +232,8 @@ function validateConfig(config, descriptorPath, platform = process.platform, lau
   if (!Number.isSafeInteger(config.contextWindow) || config.contextWindow <= 0) {
     throw new Error("Runtime configuration has an invalid context window");
   }
-  if (typeof config.appName !== "string" || !config.appName.trim() || config.appName.length > 80) {
-    throw new Error("Runtime configuration has an invalid connector name");
-  }
+  automaticConnectorName(config);
+  activeConnectorName(config);
   for (const key of ["chromeExecutablePath", "storageStatePath", "brokerSocketPath"]) {
     if (typeof config[key] !== "string" || !config[key].trim()) {
       throw new Error(`Runtime configuration is missing ${key}`);
