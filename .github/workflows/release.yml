@@ -19,6 +19,8 @@ jobs:
             runtime_asset: codex-chatgpt-web-darwin-amd64.tar.gz
           - runner: ubuntu-latest
             runtime_asset: codex-chatgpt-web-linux-amd64.tar.gz
+          - runner: ubuntu-24.04-arm
+            runtime_asset: codex-chatgpt-web-linux-arm64.tar.gz
           - runner: windows-latest
             runtime_asset: codex-chatgpt-web-windows-amd64.zip
     runs-on: ${{ matrix.runner }}
@@ -46,7 +48,7 @@ jobs:
       - run: bun run verify
       - run: bun run app:package
       - name: Verify Linux AppImage ABI on current Arch
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && runner.arch == 'X64'
         run: |
           artifact="$(find launcher/artifacts -maxdepth 1 -name '*-linux-x64.AppImage' -print -quit)"
           test -n "$artifact"
@@ -126,6 +128,41 @@ jobs:
             mv "$file" "$name"
           done < <(find . -mindepth 2 -type f -print0 | sort -z)
           find . -mindepth 1 -type d -empty -delete
+      - name: Create permanent download aliases
+        run: |
+          version="$(jq -er .version package.json)"
+          copy_download_alias() {
+            local source="$1"
+            local alias="$2"
+            if [[ ! -s "release-assets/$source" ]]; then
+              echo "Required versioned release asset is missing: $source" >&2
+              exit 1
+            fi
+            if [[ -e "release-assets/$alias" ]]; then
+              echo "Permanent download alias already exists: $alias" >&2
+              exit 1
+            fi
+            cp -- "release-assets/$source" "release-assets/$alias"
+            if ! cmp -s -- "release-assets/$source" "release-assets/$alias"; then
+              echo "Permanent download alias differs from its versioned asset: $alias" >&2
+              exit 1
+            fi
+          }
+          copy_download_alias \
+            "codex-web-gpt-multidevice-${version}-win-x64.exe" \
+            "codex-web-gpt-multidevice-windows-x64.exe"
+          copy_download_alias \
+            "codex-web-gpt-multidevice-${version}-mac-arm64.dmg" \
+            "codex-web-gpt-multidevice-macos-arm64.dmg"
+          copy_download_alias \
+            "codex-web-gpt-multidevice-${version}-linux-x64.AppImage" \
+            "codex-web-gpt-multidevice-linux-x64.AppImage"
+          copy_download_alias \
+            "codex-web-gpt-multidevice-${version}-mac-x64.dmg" \
+            "codex-web-gpt-multidevice-macos-x64.dmg"
+          copy_download_alias \
+            "codex-web-gpt-multidevice-${version}-linux-arm64.AppImage" \
+            "codex-web-gpt-multidevice-linux-arm64.AppImage"
       - name: Create checksums
         run: |
           cd release-assets
@@ -150,6 +187,25 @@ jobs:
             echo "checksums.txt is missing entries for:$missing" >&2
             exit 1
           fi
+      - name: Validate permanent download aliases
+        run: |
+          aliases=(
+            "codex-web-gpt-multidevice-windows-x64.exe"
+            "codex-web-gpt-multidevice-macos-arm64.dmg"
+            "codex-web-gpt-multidevice-linux-x64.AppImage"
+            "codex-web-gpt-multidevice-macos-x64.dmg"
+            "codex-web-gpt-multidevice-linux-arm64.AppImage"
+          )
+          for alias in "${aliases[@]}"; do
+            if [[ ! -s "release-assets/$alias" ]]; then
+              echo "Required permanent download alias is missing: $alias" >&2
+              exit 1
+            fi
+            if ! awk -v asset="$alias" '$2 == asset { found = 1 } END { exit found ? 0 : 1 }' release-assets/checksums.txt; then
+              echo "checksums.txt is missing the permanent download alias: $alias" >&2
+              exit 1
+            fi
+          done
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -160,7 +216,14 @@ jobs:
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             release_flags=(--prerelease --latest=false)
           fi
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if existing_release="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isPrerelease 2>/dev/null)"; then
+            # A maintainer can stage a final-version tag as a public preview before building it.
+            # Rebuilding its assets must not silently promote that release to old launchers.
+            if jq -e '.isPrerelease == true' <<< "$existing_release" >/dev/null; then
+              release_flags=(--prerelease --latest=false)
+            else
+              release_flags=(--prerelease=false --latest)
+            fi
             gh release upload "$GITHUB_REF_NAME" "${release_files[@]}" \
               --repo "$GITHUB_REPOSITORY" \
               --clobber

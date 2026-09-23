@@ -46,7 +46,9 @@ test("release comparison and platform assets are strict", () => {
   assert.equal(releaseAssetName("1.2.0", "darwin", "x64"), "codex-web-gpt-multidevice-1.2.0-mac-x64.zip");
   assert.equal(releaseAssetName("1.2.0", "win32", "x64"), "codex-web-gpt-multidevice-1.2.0-win-x64.exe");
   assert.equal(releaseAssetName("1.2.0", "linux", "x64"), "codex-web-gpt-multidevice-1.2.0-linux-x64.AppImage");
-  assert.equal(releaseAssetName("1.2.0", "linux", "arm64"), null);
+  assert.equal(releaseAssetName("1.2.0", "linux", "arm64"), "codex-web-gpt-multidevice-1.2.0-linux-arm64.AppImage");
+  assert.equal(releaseAssetName("1.2.0", "linux", "arm"), null);
+  assert.equal(releaseAssetName("1.2.0", "linux", "ia32"), null);
 });
 
 test("checksums and release URLs bind the exact expected asset", () => {
@@ -112,7 +114,37 @@ test("startup check runs once and exposes only a newer complete release", async 
   assert.deepEqual(published.map((state) => state.status), ["checking", "available"]);
 });
 
-test("verified update is handed to one detached worker", async () => {
+test("preview and draft releases stay hidden until promoted, regardless of the version suffix", async () => {
+  for (const tag of ["1.2.0", "1.2.0-rc.1"]) {
+    for (const flags of [{ prerelease: true }, { draft: true }, { prerelease: false, draft: false }]) {
+      const assetName = `codex-web-gpt-multidevice-${tag}-linux-x64.AppImage`;
+      const controller = createUpdateController({
+        currentVersion: "1.1.4",
+        platform: "linux",
+        arch: "x64",
+        packaged: true,
+        dependencies: {
+          fetchRelease: async () => ({
+            tag_name: `v${tag}`,
+            ...flags,
+            assets: [assetName, "checksums.txt"].map(name => ({
+              name,
+              browser_download_url: `https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/download/v${tag}/${name}`,
+            })),
+          }),
+        },
+      });
+      const hidden = flags.prerelease || flags.draft;
+      assert.deepEqual(await controller.checkOnce(), hidden
+        ? { status: "up-to-date" }
+        : { status: "available", version: tag });
+      if (hidden) await assert.rejects(controller.beginInstall(), /No launcher update/);
+    }
+  }
+});
+
+test("verified Linux x64 and arm64 updates are handed to one detached worker", async () => {
+  for (const arch of ["x64", "arm64"]) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "launcher-update-test-"));
   const oldAppImage = path.join(root, "versions", "1.1.4", "Codex Web GPT.AppImage");
   const wrapper = path.join(root, "bin", "codex-web-gpt");
@@ -131,7 +163,7 @@ test("verified update is handed to one detached worker", async () => {
     const controller = createUpdateController({
       currentVersion: "1.1.4",
       platform: "linux",
-      arch: "x64",
+      arch,
       packaged: true,
       executablePath: "/tmp/launcher",
       runtimeExecutable: "/durable/bun",
@@ -141,8 +173,8 @@ test("verified update is handed to one detached worker", async () => {
           tag_name: "v1.2.0",
           assets: [
             {
-              name: "codex-web-gpt-multidevice-1.2.0-linux-x64.AppImage",
-              browser_download_url: "https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/download/v1.2.0/codex-web-gpt-multidevice-1.2.0-linux-x64.AppImage",
+              name: `codex-web-gpt-multidevice-1.2.0-linux-${arch}.AppImage`,
+              browser_download_url: `https://github.com/0-mkdad/codex-chatgpt-web-multidevice/releases/download/v1.2.0/codex-web-gpt-multidevice-1.2.0-linux-${arch}.AppImage`,
             },
             {
               name: "checksums.txt",
@@ -150,7 +182,7 @@ test("verified update is handed to one detached worker", async () => {
             },
           ],
         }),
-        downloadText: async () => `${hash}  codex-web-gpt-multidevice-1.2.0-linux-x64.AppImage\n`,
+        downloadText: async () => `${hash}  codex-web-gpt-multidevice-1.2.0-linux-${arch}.AppImage\n`,
         downloadFile: async (_url, destination) => fs.writeFileSync(destination, assetBody),
         sha256: (filePath) => require("node:crypto").createHash("sha256").update(fs.readFileSync(filePath)).digest("hex"),
         spawnWorker: (runtime, worker, job) => {
@@ -177,6 +209,7 @@ test("verified update is handed to one detached worker", async () => {
     if (previousWrapper === undefined) delete process.env.CODEX_WEB_GPT_LAUNCHER_EXECUTABLE;
     else process.env.CODEX_WEB_GPT_LAUNCHER_EXECUTABLE = previousWrapper;
     fs.rmSync(root, { recursive: true, force: true });
+  }
   }
 });
 

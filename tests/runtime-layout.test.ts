@@ -57,6 +57,63 @@ test("configuration reload preserves a custom automatic connector across setup",
   });
 });
 
+test("two device homes persist independent connector, Tunnel, key, and launcher preferences", () => {
+  const devices = [
+    { id: "laptop", connector: "Laptop Codex Connector", tunnelHex: "a" },
+    { id: "desktop", connector: "Desktop Codex Connector", tunnelHex: "b" },
+  ].map(device => ({ ...device, root: mkdtempSync(join(tmpdir(), `codex-chatgpt-web-${device.id}-`)) }));
+  roots.push(...devices.map(device => device.root));
+
+  for (const device of devices) {
+    const config = defaultConfig("full");
+    const tunnel = {
+      binaryPath: join(device.root, "bin", "tunnel-client.exe"),
+      tunnelId: `tunnel_${device.tunnelHex.repeat(32)}`,
+      runtimeKeyFile: join(device.root, "secrets", "tunnel-runtime.key"),
+      profileDir: join(device.root, "tunnel", "profiles"),
+      profileName: device.id,
+      alias: device.id,
+    };
+    config.appName = device.connector;
+    config.automaticAppName = device.connector;
+    config.tunnel = tunnel;
+    config.automaticTunnel = tunnel;
+    config.experimentalFreshConversationPerTurn = true;
+    config.useSavedChats = true;
+    writeFileSync(join(device.root, "config.json"), `${JSON.stringify(config)}\n`);
+  }
+
+  const loadDevice = (device: typeof devices[number]) => {
+    process.env.CODEX_CHATGPT_WEB_HOME = device.root;
+    return loadConfigForSetup();
+  };
+  const laptop = loadDevice(devices[0]!);
+  const desktop = loadDevice(devices[1]!);
+  const laptopAfterRestart = loadDevice(devices[0]!);
+
+  expect(laptop).toMatchObject({
+    automaticAppName: devices[0]!.connector,
+    appName: devices[0]!.connector,
+    tunnel: { tunnelId: `tunnel_${"a".repeat(32)}`, runtimeKeyFile: join(devices[0]!.root, "secrets", "tunnel-runtime.key"), profileName: "laptop" },
+    experimentalFreshConversationPerTurn: true,
+    useSavedChats: true,
+  });
+  expect(desktop).toMatchObject({
+    automaticAppName: devices[1]!.connector,
+    appName: devices[1]!.connector,
+    tunnel: { tunnelId: `tunnel_${"b".repeat(32)}`, runtimeKeyFile: join(devices[1]!.root, "secrets", "tunnel-runtime.key"), profileName: "desktop" },
+  });
+  expect(laptopAfterRestart.automaticAppName).toBe(devices[0]!.connector);
+  expect(laptopAfterRestart.tunnel?.tunnelId).toBe(`tunnel_${"a".repeat(32)}`);
+  expect(laptopAfterRestart.tunnel?.runtimeKeyFile).not.toBe(desktop.tunnel?.runtimeKeyFile);
+  expect(resolveInteractionConnectorIdentities("automatic", "production", laptopAfterRestart.automaticAppName).appName)
+    .toBe(devices[0]!.connector);
+  expect(resolveInteractionConnectorIdentities("automatic", "production", desktop.automaticAppName).appName)
+    .toBe(devices[1]!.connector);
+  expect(resolveInteractionConnectorIdentities("manual", "production", laptopAfterRestart.automaticAppName).appName)
+    .toBe(ZERO_RISK_CHATGPT_CONNECTOR_NAME);
+});
+
 test("managed runtime commands reject every ephemeral path component", () => {
   expect(() => assertDurableRuntimeCommand(["/private/tmp/codex-chatgpt-web"])).toThrow("ephemeral path");
   expect(() => assertDurableRuntimeCommand([process.execPath, "/tmp/build/app/cli.js"])).toThrow("ephemeral path");
@@ -304,6 +361,39 @@ test("manual provider configuration preserves a distinct backend without guessin
     [CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL]: ["low"],
     [CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL]: ["low"],
   });
+});
+
+test("conversation preferences survive reload; saved chats also apply to Zero Risk", () => {
+  const root = join(tmpdir(), `codex-web-fresh-config-${process.pid}-${Date.now()}`);
+  roots.push(root);
+  process.env.CODEX_CHATGPT_WEB_HOME = root;
+  mkdirSync(root, { recursive: true });
+  const config: Record<string, unknown> = { ...defaultConfig("browser-only") };
+  const persist = () => writeFileSync(join(root, "config.json"), JSON.stringify(config));
+  expect(config.experimentalFreshConversationPerTurn).toBe(false);
+  expect(config.useSavedChats).toBe(false);
+  delete config.useSavedChats;
+  delete config.experimentalFreshConversationPerTurn;
+  persist();
+  expect(loadConfig()!.experimentalFreshConversationPerTurn).toBe(false);
+  expect(loadConfig()!.useSavedChats).toBe(false);
+  config.useSavedChats = true;
+  config.experimentalFreshConversationPerTurn = true;
+  persist();
+  const loaded = loadConfig()!;
+  expect(providerConfig(loaded).chatgptWeb!.useSavedChats).toBe(true);
+  expect(providerConfig({ ...loaded, browserInteractionMode: "manual" }).chatgptWeb!.useSavedChats).toBe(true);
+  expect(providerConfig(loaded).chatgptWeb!.experimentalFreshConversationPerTurn).toBe(true);
+  expect(providerConfig({ ...loaded, browserInteractionMode: "manual" })
+    .chatgptWeb!.experimentalFreshConversationPerTurn).toBe(false);
+  expect(loaded.experimentalFreshConversationPerTurn).toBe(true);
+  config.experimentalFreshConversationPerTurn = "true";
+  persist();
+  expect(() => loadConfig()).toThrow("experimentalFreshConversationPerTurn");
+  config.experimentalFreshConversationPerTurn = false;
+  config.useSavedChats = "true";
+  persist();
+  expect(() => loadConfig()).toThrow("useSavedChats");
 });
 
 test("skill attachments config defaults off, reaches the adapter, and rejects invalid/manual settings", () => {

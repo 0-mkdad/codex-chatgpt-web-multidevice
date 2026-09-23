@@ -7,6 +7,13 @@ const { writePrivateFileAtomic } = require("./atomic-file.cjs");
 const {
   connectorNameForDevSetup,
   connectorNameForSetup,
+  automaticConnectorName,
+  automaticConnectorNameForSetup,
+  automaticConnectorNameRequiresRepair,
+  automaticConnectorNameForEditor,
+  activeConnectorName,
+  activeConnectorNameForSetup,
+  isAutomaticConnectorIdentityError,
   CURRENT_CONNECTOR_NAME,
   DEV_CONNECTOR_NAME,
   isLegacyConnectorName,
@@ -432,7 +439,14 @@ class RuntimeHost {
       };
     }
     const launcherOwned = setupConfig.browserHost === "launcher";
-    const config = launcherOwned ? this.supervisor.readConfig() : setupConfig;
+    let config = setupConfig;
+    if (launcherOwned) {
+      try {
+        config = this.supervisor.readConfig();
+      } catch (error) {
+        if (!isAutomaticConnectorIdentityError(error)) throw error;
+      }
+    }
     return {
       configured: true,
       owner: launcherOwned ? "launcher" : "external",
@@ -910,7 +924,7 @@ class RuntimeHost {
     }
     return this.launcherProfile === "development"
       ? connectorNameForDevSetup(current.config?.appName)
-      : requireCurrentRuntimeConnectorName(current.config?.automaticAppName ?? current.config?.appName);
+      : requireCurrentRuntimeConnectorName(automaticConnectorName(current.config));
   }
 
   browserConnectorName() {
@@ -919,7 +933,19 @@ class RuntimeHost {
       return connectorNameForDevSetup(current.config?.appName);
     }
     if (!current.configured || current.mode !== "full") return CURRENT_CONNECTOR_NAME;
-    return connectorNameForSetup(current.config?.appName);
+    return activeConnectorName(current.config);
+  }
+
+  snapshotConnectorName() {
+    const current = this.runtimeConfigSnapshot();
+    if (this.launcherProfile === "development") return this.browserConnectorName();
+    if (!current.configured || current.mode !== "full") return CURRENT_CONNECTOR_NAME;
+    try {
+      return activeConnectorName(current.config);
+    } catch (error) {
+      if (!isAutomaticConnectorIdentityError(error)) throw error;
+      return automaticConnectorNameForEditor(current.config);
+    }
   }
 
   setupConnectorName() {
@@ -928,7 +954,7 @@ class RuntimeHost {
       return connectorNameForDevSetup(current.config?.appName);
     }
     if (current.configured) {
-      return connectorNameForSetup(current.config?.automaticAppName ?? current.config?.appName);
+      return automaticConnectorNameForEditor(current.config);
     }
     return CURRENT_CONNECTOR_NAME;
   }
@@ -1131,6 +1157,61 @@ class RuntimeHost {
     return { ...result, enabled: enabled === true };
   }
 
+  async setFreshConversationPerTurn(enabled) {
+    if (typeof enabled !== "boolean") throw new Error("Fresh conversation preference must be a boolean");
+    const current = this.runtimeConfigSnapshot();
+    if (!current.configured) throw new Error("Initialize the runtime before changing browser conversation retention");
+    if ((current.config?.browserInteractionMode ?? "automatic") !== "automatic") {
+      throw new Error("New browser chats per turn are unavailable in Zero Risk mode");
+    }
+    const development = this.launcherProfile === "development";
+    const args = [
+      ...(development ? ["dev", "setup"] : ["setup"]),
+      current.mode === "full" ? "--full" : "--browser-only",
+      "--browser-host-descriptor", this.browserDescriptorPath,
+      ...this.browserInteractionArgs(),
+      "--acknowledge-unofficial",
+      ...(development ? [] : ["--replace-codex-route", "--restart-service"]),
+      enabled ? "--fresh-conversation" : "--retained-conversation",
+    ];
+    if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
+    const options = {
+      message: enabled ? "Enabling a new browser chat for each turn" : "Restoring browser chat retention",
+      successMessage: enabled ? "New browser chats per turn enabled" : "Browser chat retention restored",
+      timeoutMs: CORE_SETUP_TIMEOUT_MS,
+    };
+    const result = development
+      ? await this.runDevSetup("fresh-conversation-per-turn", args, options)
+      : await this.runSetup("fresh-conversation-per-turn", args, options);
+    return { ...result, enabled };
+  }
+
+  async setUseSavedChats(enabled) {
+    if (typeof enabled !== "boolean") throw new Error("Saved chat preference must be a boolean");
+    const current = this.runtimeConfigSnapshot();
+    if (!current.configured) throw new Error("Initialize the runtime before changing saved chats");
+    const development = this.launcherProfile === "development";
+    const args = [
+      ...(development ? ["dev", "setup"] : ["setup"]),
+      current.mode === "full" ? "--full" : "--browser-only",
+      "--browser-host-descriptor", this.browserDescriptorPath,
+      ...this.browserInteractionArgs(),
+      "--acknowledge-unofficial",
+      ...(development ? [] : ["--replace-codex-route", "--restart-service"]),
+      enabled ? "--saved-chats" : "--temporary-chats",
+    ];
+    if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
+    const options = {
+      message: enabled ? "Enabling saved ChatGPT conversations" : "Restoring Temporary Chat",
+      successMessage: enabled ? "Saved ChatGPT conversations enabled" : "Temporary Chat restored",
+      timeoutMs: CORE_SETUP_TIMEOUT_MS,
+    };
+    const result = development
+      ? await this.runDevSetup("use-saved-chats", args, options)
+      : await this.runSetup("use-saved-chats", args, options);
+    return { ...result, enabled };
+  }
+
   async setZeroRiskPro(enabled) {
     const current = this.runtimeConfigSnapshot();
     if (!current.configured) {
@@ -1169,9 +1250,21 @@ class RuntimeHost {
     this.assertProductionProfile("Managed Codex runtime upgrade");
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const existing = this.runtimeConfigSnapshot();
+    const persistedConfig = this.supervisor.readSetupConfig
+      ? this.supervisor.readSetupConfig()
+      : existing.config;
     const currentVersion = this.app.getVersion();
-    const connectorMigrationRequired = existing.mode === "full"
-      && isLegacyConnectorName(validateConnectorName(existing.config?.appName));
+    const configuredConnectorName = persistedConfig?.mode === "full"
+      ? automaticConnectorNameForSetup(persistedConfig)
+      : CURRENT_CONNECTOR_NAME;
+    const expectedActiveConnectorName = persistedConfig?.mode === "full"
+      ? activeConnectorNameForSetup(persistedConfig)
+      : null;
+    const connectorMigrationRequired = existing.mode === "full" && Boolean(
+      automaticConnectorNameRequiresRepair(persistedConfig)
+      || isLegacyConnectorName(persistedConfig?.automaticAppName ?? persistedConfig?.appName)
+      || persistedConfig?.appName !== expectedActiveConnectorName,
+    );
     const interactionMode = existing.config?.browserInteractionMode ?? "automatic";
     const expectedTunnelProfile = interactionMode === "manual"
       ? "codex-chatgpt-web-zero-risk"
@@ -1207,11 +1300,8 @@ class RuntimeHost {
       "--acknowledge-unofficial",
       "--restart-service",
     ];
-    const configuredConnectorName = existing.config?.automaticAppName ?? existing.config?.appName;
     if (existing.mode === "full"
-      && typeof configuredConnectorName === "string"
-      && configuredConnectorName !== CURRENT_CONNECTOR_NAME
-      && !isLegacyConnectorName(configuredConnectorName)) {
+      && (connectorMigrationRequired || configuredConnectorName !== CURRENT_CONNECTOR_NAME)) {
       args.push("--connector-name", configuredConnectorName);
     }
     const result = await this.runSetup("runtime-upgrade", args, {
@@ -1237,6 +1327,17 @@ class RuntimeHost {
     this.assertProductionProfile("Native Codex MCP setup");
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const targetMode = interactionMode ?? this.browserInteractionMode();
+    const previousConnectorName = this.setupConnectorName();
+    const requestedConnectorName = connectorName === undefined
+      ? previousConnectorName
+      : requireCurrentRuntimeConnectorName(validateConnectorName(connectorName));
+    automaticConnectorName({ automaticAppName: requestedConnectorName });
+    const transition = {
+      previousConnectorName,
+      requestedConnectorName,
+      interactionMode: targetMode,
+    };
+    this.logger.info("connector.setup_started", transition);
     const reuseSavedCredentials = replace !== true && this.mcpCredentialsConfigured(targetMode);
     if (!reuseSavedCredentials && !/^tunnel_[a-f0-9]{32}$/.test(tunnelId)) {
       throw new Error("Tunnel ID must be tunnel_ followed by 32 lowercase hexadecimal characters");
@@ -1252,15 +1353,31 @@ class RuntimeHost {
       ...this.browserInteractionArgs({ mode: targetMode }),
       "--replace-codex-route",
     ];
-    if (connectorName !== undefined) args.push("--connector-name", connectorName);
+    if (connectorName !== undefined || requestedConnectorName !== CURRENT_CONNECTOR_NAME) {
+      args.push("--connector-name", requestedConnectorName);
+    }
+    const completeSetup = async (setup) => {
+      const result = await setup;
+      const persistedConnectorName = this.setupConnectorName();
+      this.logger.info("connector.setup_persisted", {
+        ...transition,
+        persistedConnectorName,
+      });
+      if (persistedConnectorName !== requestedConnectorName) {
+        throw new Error(
+          `Connector setup requested ${JSON.stringify(requestedConnectorName)} but persisted ${JSON.stringify(persistedConnectorName)}`,
+        );
+      }
+      return result;
+    };
     if (reuseSavedCredentials) {
       args.push("--acknowledge-unofficial", "--restart-service");
-      return this.runSetup("mcp-setup", args, {
+      return completeSetup(this.runSetup("mcp-setup", args, {
         message: "Reconnecting the native Codex harness with saved tunnel credentials",
         successMessage: "Local MCP tools are ready",
         timeoutMs: MCP_SETUP_TIMEOUT_MS,
         afterRuntimeReady,
-      });
+      }));
     }
     const secretsDir = path.join(this.app.getPath("userData"), "secrets");
     fs.mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
@@ -1275,12 +1392,12 @@ class RuntimeHost {
       "--acknowledge-unofficial",
       "--restart-service",
     );
-    return this.runSetup("mcp-setup", args, {
+    return completeSetup(this.runSetup("mcp-setup", args, {
       message: "Connecting the native Codex harness",
       successMessage: "Local MCP tools are ready",
       timeoutMs: MCP_SETUP_TIMEOUT_MS,
       afterRuntimeReady,
-    }).finally(() => fs.rmSync(keyPath, { force: true }));
+    }).finally(() => fs.rmSync(keyPath, { force: true })));
   }
 
   setupDevMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode } = {}, afterRuntimeReady) {
@@ -1391,7 +1508,7 @@ class RuntimeHost {
           ...options,
           message: "Validating Codex configuration before changing the runtime",
           successMessage: "Codex configuration is ready for setup",
-          timeoutMs: Math.min(options.timeoutMs || 15_000, 15_000),
+          timeoutMs: options.timeoutMs || CORE_SETUP_TIMEOUT_MS,
         });
       }
       runtimeTransitionStarted = true;
@@ -1455,7 +1572,7 @@ class RuntimeHost {
         ...failures,
       ].join("; ");
       this.publishOperation?.({ name, status: "failed", message });
-      throw new Error(message);
+      throw new Error(message, { cause: error });
     } finally {
       this.lifecycleOperation = null;
     }

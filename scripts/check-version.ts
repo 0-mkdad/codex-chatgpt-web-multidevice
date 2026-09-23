@@ -43,6 +43,11 @@ if (readme.includes("/releases/download/")) {
   throw new Error("README.md must not claim platform download assets that may not be published");
 }
 const releaseWorkflow = readFileSync(resolve(root, ".github/workflows/release.yml"), "utf8");
+for (const arch of ["amd64", "arm64"]) {
+  if (!releaseWorkflow.includes(`runtime_asset: codex-chatgpt-web-linux-${arch}.tar.gz`)) {
+    throw new Error(`release.yml must build the native Linux ${arch} runtime`);
+  }
+}
 if (releaseWorkflow.split(`bun-version: ${bunVersion}`).length - 1 !== 2) {
   throw new Error(`release.yml must pin Bun ${bunVersion} in both jobs`);
 }

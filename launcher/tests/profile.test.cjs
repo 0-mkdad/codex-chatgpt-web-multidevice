@@ -42,6 +42,32 @@ test("DEV launcher refuses an explicit home collision with production", () => {
   }), /must differ from the production/);
 });
 
+test("separate workstation homes resolve isolated production launcher and runtime state", () => {
+  const profileFor = (name) => {
+    const homeDir = path.resolve(`/Users/${name}`);
+    return resolveLauncherProfile({
+      argv: ["electron", "."],
+      env: {
+        CODEX_CHATGPT_WEB_HOME: path.join(homeDir, ".codex-chatgpt-web"),
+        CODEX_HOME: path.join(homeDir, ".codex"),
+        CODEX_WEB_GPT_LAUNCHER_DATA_DIR: path.join(homeDir, "Library", "Codex Web GPT MultiDevice"),
+      },
+      homeDir,
+      appData: path.join(homeDir, "Library", "Application Support"),
+    });
+  };
+  const laptop = profileFor("laptop");
+  const desktop = profileFor("desktop");
+
+  assert.notEqual(laptop.coreHome, desktop.coreHome);
+  assert.notEqual(laptop.codexHome, desktop.codexHome);
+  assert.notEqual(laptop.userData, desktop.userData);
+  assert.equal(laptop.browserPartition, "persist:codex-web-gpt-chatgpt");
+  assert.equal(desktop.browserPartition, "persist:codex-web-gpt-chatgpt");
+  assert.equal(laptop.kind, "production");
+  assert.equal(desktop.kind, "production");
+});
+
 test("DEV launcher ignores generic production path overrides", () => {
   const homeDir = path.resolve("/Users/tester");
   const development = resolveLauncherProfile({

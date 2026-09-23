@@ -1,9 +1,10 @@
 # Contributing
 
 Codex Web GPT was created and is primarily developed and maintained by
-This fork is maintained by [@0-mkdad](https://github.com/0-mkdad). Product direction, core architecture, and release decisions for this repository are managed here.
-remain with the creator. Other contributors listed by GitHub have provided focused external fixes
-rather than shared product or architectural ownership.
+[@miuuyy](https://github.com/miuuyy). This fork is maintained by
+[@0-mkdad](https://github.com/0-mkdad). Product direction, core architecture, and release decisions
+for this repository are managed here. Other contributors listed by GitHub have provided focused
+external fixes rather than shared product or architectural ownership.
 
 External contributions are welcome, but this is an intentionally maintainer-led project. Pull
 requests are expected to be small, focused, and easy to review and verify. Good contributions
@@ -16,8 +17,10 @@ structured issue form. Reproduce once on the latest release and attach the priva
 
 Large feature branches, broad refactors, rewrites, new providers, and changes to core behavior or
 architecture are generally not accepted. In rare cases they may be considered, but discuss the
-proposal in an issue before implementation. Prior discussion does not guarantee acceptance, and a
-large unsolicited pull request may be closed even when substantial work went into it.
+proposal in [project Discussions](https://github.com/0-mkdad/codex-chatgpt-web-multidevice/discussions)
+before implementation. Feature requests belong there; issues track bugs. Prior discussion does not
+guarantee acceptance, and a large unsolicited pull request may be closed even when substantial
+work went into it.
 
 ## Scope and invariants
 

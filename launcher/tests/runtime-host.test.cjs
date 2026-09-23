@@ -6,18 +6,28 @@ const path = require("node:path");
 const { CURRENT_CONNECTOR_NAME, DEV_CONNECTOR_NAME } = require("../electron/connector-identity.cjs");
 const { RuntimeHost } = require("../electron/runtime.cjs");
 
-function hostFor(existingConfig, interactionMode = "automatic") {
+function hostFor(
+  existingConfig,
+  interactionMode = "automatic",
+  userDataPath = path.join(os.tmpdir(), "codex-web-gpt-runtime-host-test"),
+) {
+  let config = existingConfig;
+  const logs = [];
   const host = new RuntimeHost({
     app: {
-      getPath: () => path.join(os.tmpdir(), "codex-web-gpt-runtime-host-test"),
+      getPath: () => userDataPath,
       getVersion: () => "1.1.3",
     },
-    logger: { info() {}, warn() {}, error() {} },
+    logger: {
+      info: (event, fields) => logs.push({ event, fields }),
+      warn() {},
+      error() {},
+    },
     sourceRoot: "/source",
     browserDescriptorPath: "/runtime/launcher-browser.json",
     supervisor: {
-      readConfig: () => existingConfig,
-      readSetupConfig: () => existingConfig,
+      readConfig: () => config,
+      readSetupConfig: () => config,
       stopForSetup: async () => ({ status: "stopped" }),
       startIfConfigured: async () => ({ status: "ready" }),
     },
@@ -26,10 +36,25 @@ function hostFor(existingConfig, interactionMode = "automatic") {
   let invocation;
   host.runSetup = async (name, args, options = {}) => {
     invocation = { name, args };
+    if (name === "mcp-setup" || name === "runtime-upgrade") {
+      const connectorIndex = args.indexOf("--connector-name");
+      const automaticAppName = connectorIndex >= 0
+        ? args[connectorIndex + 1]
+        : config?.automaticAppName ?? config?.appName ?? CURRENT_CONNECTOR_NAME;
+      config = {
+        ...config,
+        mode: "full",
+        appName: automaticAppName,
+        automaticAppName,
+        manualAppName: "Codex Zero Risk",
+        browserInteractionMode: "automatic",
+        ...(name === "runtime-upgrade" ? { releaseVersion: "1.1.3" } : {}),
+      };
+    }
     await options.afterRuntimeReady?.();
     return { code: 0, stdout: "", stderr: "" };
   };
-  return { host, invocation: () => invocation };
+  return { host, invocation: () => invocation, config: () => config, logs };
 }
 
 function devHostFor(existingConfig, interactionMode = "automatic") {
@@ -432,6 +457,8 @@ test("launcher migrates the legacy connector identity even when the release vers
     "--refresh-account-capabilities",
     "--acknowledge-unofficial",
     "--restart-service",
+    "--connector-name",
+    CURRENT_CONNECTOR_NAME,
   ]);
   assert.equal(result.updated, true);
   assert.equal(result.connectorMigrated, true);
@@ -535,6 +562,82 @@ test("new MCP setup uses the fixed connector without a CLI name override", async
   ]);
   assert.equal(fixture.invocation().args.includes("--app-name"), false);
   assert.equal(fixture.host.setupConnectorName(), CURRENT_CONNECTOR_NAME);
+});
+
+test("MCP setup and reconnect preserve the selected per-computer connector name", async () => {
+  const connectorName = "Codex Native2 Dell";
+  const tunnelId = "tunnel_0123456789abcdef0123456789abcdef";
+  const newInstall = hostFor(null);
+  await newInstall.host.setupMcp({
+    replace: true,
+    tunnelId,
+    runtimeKey: "new-private-runtime-key",
+    connectorName,
+  });
+  const newInstallArgs = newInstall.invocation().args;
+  assert.equal(newInstallArgs[newInstallArgs.indexOf("--connector-name") + 1], connectorName);
+  assert.equal(newInstall.config().automaticAppName, connectorName);
+  assert.equal(newInstall.host.setupConnectorName(), connectorName);
+  assert.equal(newInstall.host.mcpConnectorName(), connectorName);
+  assert.equal(newInstall.host.browserConnectorName(), connectorName);
+  assert.deepEqual(
+    newInstall.logs.filter(record => record.event.startsWith("connector.setup_")).map(record => record.fields),
+    [
+      {
+        previousConnectorName: CURRENT_CONNECTOR_NAME,
+        requestedConnectorName: connectorName,
+        interactionMode: "automatic",
+      },
+      {
+        previousConnectorName: CURRENT_CONNECTOR_NAME,
+        requestedConnectorName: connectorName,
+        interactionMode: "automatic",
+        persistedConnectorName: connectorName,
+      },
+    ],
+  );
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-custom-connector-"));
+  const keyPath = path.join(root, "tunnel-runtime.key");
+  fs.writeFileSync(keyPath, "saved-private-runtime-key\n", { mode: 0o600 });
+  try {
+    const savedInstall = hostFor({
+      mode: "full",
+      browserHost: "launcher",
+      appName: CURRENT_CONNECTOR_NAME,
+      automaticAppName: CURRENT_CONNECTOR_NAME,
+      tunnel: { tunnelId, runtimeKeyFile: keyPath },
+    });
+    assert.equal(savedInstall.host.setupConnectorName(), CURRENT_CONNECTOR_NAME);
+    await savedInstall.host.setupMcp({ replace: false, connectorName });
+    const reconnectArgs = savedInstall.invocation().args;
+    assert.equal(reconnectArgs[reconnectArgs.indexOf("--connector-name") + 1], connectorName);
+    assert.equal(reconnectArgs.includes("--tunnel-id"), false);
+    assert.equal(reconnectArgs.includes("--runtime-key-file"), false);
+    assert.equal(savedInstall.config().tunnel.tunnelId, tunnelId);
+    assert.equal(fs.readFileSync(keyPath, "utf8"), "saved-private-runtime-key\n");
+    assert.equal(savedInstall.config().automaticAppName, connectorName);
+    assert.equal(savedInstall.host.setupConnectorName(), connectorName);
+    assert.equal(savedInstall.host.mcpConnectorName(), connectorName);
+    assert.equal(savedInstall.host.browserConnectorName(), connectorName);
+    assert.equal(JSON.stringify(savedInstall.logs).includes("saved-private-runtime-key"), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("automatic runtime and browser identity prefer automaticAppName when appName is stale", () => {
+  const fixture = hostFor({
+    mode: "full",
+    browserHost: "launcher",
+    browserInteractionMode: "automatic",
+    appName: CURRENT_CONNECTOR_NAME,
+    automaticAppName: "Codex Native2 Dell",
+    manualAppName: "Codex Zero Risk",
+  });
+  assert.equal(fixture.host.setupConnectorName(), "Codex Native2 Dell");
+  assert.equal(fixture.host.mcpConnectorName(), "Codex Native2 Dell");
+  assert.equal(fixture.host.browserConnectorName(), "Codex Native2 Dell");
 });
 
 test("MCP credential replacement remains explicit and requires a complete new pair", async () => {
@@ -770,6 +873,133 @@ test("connector verification uses the current identity and rejects a legacy loca
   assert.equal(dev.host.mcpConnectorName(), DEV_CONNECTOR_NAME);
 });
 
+test("fresh setup with no custom name persists and uses the default connector", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-default-connector-"));
+  try {
+    const fixture = hostFor(null, "automatic", root);
+    await fixture.host.setupMcp({
+      replace: true,
+      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+      runtimeKey: "fresh-private-runtime-key",
+    });
+    const args = fixture.invocation().args;
+    assert.equal(args.includes("--connector-name"), false);
+    assert.equal(fixture.config().automaticAppName, CURRENT_CONNECTOR_NAME);
+    assert.equal(fixture.host.setupConnectorName(), CURRENT_CONNECTOR_NAME);
+    assert.equal(fixture.host.browserConnectorName(), CURRENT_CONNECTOR_NAME);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("release upgrade repairs a stale active appName from the persisted automatic connector name", async () => {
+  const config = {
+    mode: "full",
+    browserHost: "launcher",
+    releaseVersion: "1.0.0",
+    appName: CURRENT_CONNECTOR_NAME,
+    automaticAppName: "Codex Native2 Dell",
+    manualAppName: "Codex Zero Risk",
+    browserInteractionMode: "automatic",
+  };
+  const fixture = hostFor(config);
+  const upgrade = await fixture.host.upgradeManagedRuntime();
+  assert.equal(upgrade.updated, true);
+  const args = fixture.invocation().args;
+  assert.equal(args[args.indexOf("--connector-name") + 1], "Codex Native2 Dell");
+  assert.equal(fixture.config().appName, "Codex Native2 Dell");
+  assert.equal(fixture.config().automaticAppName, "Codex Native2 Dell");
+  const restarted = hostFor(fixture.config());
+  assert.equal(restarted.host.setupConnectorName(), "Codex Native2 Dell");
+  assert.equal(restarted.host.browserConnectorName(), "Codex Native2 Dell");
+});
+
+test("invalid persisted automatic name remains editable and is repaired by release setup", async () => {
+  const config = {
+    mode: "full",
+    browserHost: "launcher",
+    releaseVersion: "1.1.3",
+    appName: "Codex Native2 Dell",
+    automaticAppName: "",
+    manualAppName: "Codex Zero Risk",
+    browserInteractionMode: "automatic",
+  };
+  const fixture = hostFor(config);
+  fixture.host.supervisor.readConfig = () => {
+    throw new Error("Automatic connector name is invalid: Connector name is invalid");
+  };
+
+  assert.equal(fixture.host.setupConnectorName(), "");
+  assert.equal(fixture.host.snapshotConnectorName(), "");
+  assert.throws(() => fixture.host.browserConnectorName(), /Automatic connector name is invalid/);
+  assert.throws(() => fixture.host.mcpConnectorName(), /Automatic connector name is invalid/);
+
+  const result = await fixture.host.upgradeManagedRuntime();
+  assert.equal(result.connectorMigrated, true);
+  const args = fixture.invocation().args;
+  assert.equal(args[args.indexOf("--connector-name") + 1], CURRENT_CONNECTOR_NAME);
+  assert.equal(fixture.config().automaticAppName, CURRENT_CONNECTOR_NAME);
+  assert.equal(fixture.host.browserConnectorName(), CURRENT_CONNECTOR_NAME);
+});
+
+test("two devices retain independent connector names through upgrade, reconnect, and launcher restart", async () => {
+  const devices = [
+    ["Codex Native2 Dell", "tunnel_11111111111111111111111111111111"],
+    ["Codex Native2 Laptop", "tunnel_22222222222222222222222222222222"],
+  ];
+  const roots = [];
+  try {
+    for (const [connectorName, tunnelId] of devices) {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-device-identity-"));
+      roots.push(root);
+      const keyPath = path.join(root, "tunnel-runtime-automatic.key");
+      fs.writeFileSync(keyPath, "device-private-runtime-key\n", { mode: 0o600 });
+      const tunnel = {
+        alias: "codex-chatgpt-web",
+        tunnelId,
+        runtimeKeyFile: keyPath,
+        profileDir: path.join(root, "profiles"),
+        profileName: "codex-chatgpt-web",
+        binaryPath: path.join(root, "tunnel-client"),
+      };
+      const original = {
+        mode: "full",
+        browserHost: "launcher",
+        releaseVersion: "1.0.0",
+        appName: CURRENT_CONNECTOR_NAME,
+        automaticAppName: connectorName,
+        manualAppName: "Codex Zero Risk",
+        browserInteractionMode: "automatic",
+        tunnel,
+        automaticTunnel: tunnel,
+      };
+      const beforeUpgrade = hostFor(original);
+      await beforeUpgrade.host.upgradeManagedRuntime();
+      assert.equal(
+        beforeUpgrade.invocation().args[beforeUpgrade.invocation().args.indexOf("--connector-name") + 1],
+        connectorName,
+      );
+
+      const restarted = hostFor(beforeUpgrade.config());
+      assert.equal(restarted.host.setupConnectorName(), connectorName);
+      await restarted.host.setupMcp({ replace: false, connectorName });
+      const reconnectArgs = restarted.invocation().args;
+      assert.equal(reconnectArgs[reconnectArgs.indexOf("--connector-name") + 1], connectorName);
+      assert.equal(reconnectArgs.includes("--tunnel-id"), false);
+      assert.equal(reconnectArgs.includes("--runtime-key-file"), false);
+      assert.equal(restarted.config().tunnel.tunnelId, tunnelId);
+      assert.equal(fs.readFileSync(keyPath, "utf8"), "device-private-runtime-key\n");
+
+      const afterRestart = hostFor(restarted.config());
+      assert.equal(afterRestart.host.setupConnectorName(), connectorName);
+      assert.equal(afterRestart.host.mcpConnectorName(), connectorName);
+      assert.equal(afterRestart.host.browserConnectorName(), connectorName);
+    }
+  } finally {
+    for (const root of roots) fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("launcher-controlled CLI operations use the live descriptor token", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-runtime-control-"));
   const descriptorPath = path.join(root, "launcher-browser.json");
@@ -799,6 +1029,7 @@ test("failed first-time setup removes its route before restoring the unconfigure
   const codexHome = path.join(root, "codex");
   const journalPath = path.join(coreHome, "codex", "integration-journal.json");
   const recoveryJournalPath = path.join(coreHome, "codex", "integration-journal.recovery.json");
+  const setupError = new Error("synthetic setup failure");
   const configPath = path.join(root, "config.json");
   const codexConfigPath = path.join(codexHome, "config.toml");
   const codexModelsCachePath = path.join(codexHome, "models_cache.json");
@@ -837,12 +1068,16 @@ test("failed first-time setup removes its route before restoring the unconfigure
     fs.writeFileSync(recoveryJournalPath, "partial recovery journal\n");
     fs.writeFileSync(codexConfigPath, "partially changed codex config\n");
     fs.rmSync(codexModelsCachePath);
-    throw new Error("synthetic setup failure");
+    throw setupError;
   };
   try {
     await assert.rejects(
       host.runSetup("core-setup", ["setup", "--browser-only"], {}),
-      /synthetic setup failure; incomplete first-time setup was rolled back/,
+      error => {
+        assert.match(error.message, /synthetic setup failure; incomplete first-time setup was rolled back/);
+        assert.equal(error.cause, setupError);
+        return true;
+      },
     );
     assert.deepEqual(calls.map((args) => args.join(" ")), [
       "setup --browser-only --preflight-only",
@@ -896,6 +1131,30 @@ test("a failed setup preflight leaves the previous runtime running and untouched
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("setup preflight keeps the requested setup budget before stopping the current runtime", async () => {
+  const events = [];
+  const host = new RuntimeHost({
+    app: { getPath: () => os.tmpdir() },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: "/source",
+    browserDescriptorPath: "/runtime/launcher-browser.json",
+    supervisor: {
+      readSetupConfig: () => null,
+      readConfig: () => null,
+      stopForSetup: async () => { events.push("stop"); },
+      startIfConfigured: async () => { events.push("start"); return { status: "ready" }; },
+    },
+  });
+  host.captureSetupCheckpoint = () => [];
+  host.run = async (_name, args, options) => {
+    events.push(args.includes("--preflight-only") ? "preflight" : "setup");
+    assert.equal(options.timeoutMs, 300_000);
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  await host.runSetup("core-setup", ["setup", "--full"], { timeoutMs: 300_000 });
+  assert.deepEqual(events, ["preflight", "stop", "setup", "start"]);
 });
 
 test("a browser-mode commit failure restores the previous runtime inside setup", async () => {
@@ -1016,7 +1275,7 @@ test("failed terminal migration verifies the unchanged previous runtime instead 
   ]);
 });
 
-test("failed launcher update restores every mutable setup file before restarting the previous runtime", async () => {
+test("failed fresh-conversation setting restores every mutable setup file before restarting the previous runtime", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-setup-checkpoint-"));
   const coreHome = path.join(root, "core");
   const codexHome = path.join(root, "codex");
@@ -1033,6 +1292,8 @@ test("failed launcher update restores every mutable setup file before restarting
   const oldConfig = {
     mode: "full",
     browserHost: "launcher",
+    browserInteractionMode: "automatic",
+    experimentalFreshConversationPerTurn: false,
     releaseVersion: "0.1.16",
     tunnel: {
       runtimeKeyFile: keyPath,
@@ -1083,7 +1344,7 @@ test("failed launcher update restores every mutable setup file before restarting
   });
   host.run = async (_name, args) => {
     if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
-    fs.writeFileSync(configPath, `${JSON.stringify({ ...oldConfig, releaseVersion: "0.2.0" })}\n`);
+    fs.writeFileSync(configPath, `${JSON.stringify({ ...oldConfig, releaseVersion: "0.2.0", experimentalFreshConversationPerTurn: true })}\n`);
     fs.writeFileSync(journalPath, "new journal\n");
     fs.writeFileSync(recoveryJournalPath, "new recovery journal\n");
     fs.writeFileSync(keyPath, "new key\n");
@@ -1095,7 +1356,7 @@ test("failed launcher update restores every mutable setup file before restarting
 
   try {
     await assert.rejects(
-      host.runSetup("core-setup", ["setup", "--full"], {}),
+      host.setFreshConversationPerTurn(true),
       /synthetic updated runtime startup failure$/,
     );
     assert.equal(startAttempts, 2);
@@ -1283,4 +1544,48 @@ test("skill file experiment uses the setup transaction in production and DEV, an
   const manual = hostFor({ mode: "full", browserInteractionMode: "manual" }, "manual");
   await assert.rejects(() => manual.host.setSkillAttachments(true), /Zero Risk/);
   assert.equal(manual.invocation(), undefined);
+});
+
+
+test("fresh-conversation preference uses production and DEV setup without forcing mode or other preferences", async () => {
+  for (const makeHost of [hostFor, devHostFor]) {
+    for (const mode of ["browser-only", "full"]) {
+      const existing = { mode, browserInteractionMode: "automatic", autoApproveToolCalls: true,
+        experimentalFreshConversationPerTurn: false, experimentalSkillAttachments: true };
+      const fixture = makeHost(existing);
+      for (const enabled of [true, false]) {
+        assert.equal((await fixture.host.setFreshConversationPerTurn(enabled)).enabled, enabled);
+        const { name, args } = fixture.invocation();
+        assert.equal(name, "fresh-conversation-per-turn");
+        assert.deepEqual(args.slice(0, makeHost === devHostFor ? 2 : 1), makeHost === devHostFor ? ["dev", "setup"] : ["setup"]);
+        assert.equal(args.includes(`--${mode}`), true);
+        assert.equal(args.includes(enabled ? "--fresh-conversation" : "--retained-conversation"), true);
+        assert.equal(args.includes(enabled ? "--retained-conversation" : "--fresh-conversation"), false);
+        assert.equal(args.includes("--auto-approve-tool-calls"), true);
+        assert.equal(args.includes("--restart-service"), makeHost === hostFor);
+        assert.equal(args.includes("--replace-codex-route"), makeHost === hostFor);
+        assert.equal(existing.experimentalFreshConversationPerTurn, false, "setter must delegate persistence to setup");
+        assert.equal(existing.experimentalSkillAttachments, true);
+      }
+    }
+    for (const config of [null, { mode: "full", browserInteractionMode: "manual" }]) {
+      const fixture = makeHost(config);
+      await assert.rejects(() => fixture.host.setFreshConversationPerTurn(true), /Initialize|Zero Risk/);
+      await assert.rejects(() => fixture.host.setFreshConversationPerTurn(false), /Initialize|Zero Risk/);
+      assert.equal(fixture.invocation(), undefined);
+    }
+    for (const interaction of ["automatic", "manual"]) {
+      const saved = makeHost({ mode: "full", browserInteractionMode: interaction }, interaction);
+      for (const enabled of [true, false]) {
+        await saved.host.setUseSavedChats(enabled);
+        assert.equal(saved.invocation().args.includes(enabled ? "--saved-chats" : "--temporary-chats"), true);
+        assert.equal(saved.invocation().args.includes("--full"), true);
+        assert.equal(saved.invocation().args.includes("--fresh-conversation"), false);
+      }
+      await assert.rejects(() => saved.host.setUseSavedChats("true"), /boolean/);
+    }
+    const fixture = makeHost({ mode: "browser-only", browserInteractionMode: "automatic" });
+    await assert.rejects(() => fixture.host.setFreshConversationPerTurn("true"), /boolean/);
+    assert.equal(fixture.invocation(), undefined);
+  }
 });
