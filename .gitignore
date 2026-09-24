@@ -16,4 +16,5 @@ launcher/release/
 launcher/artifacts/
 .playwright-cli/
 output/
+.tmp/
 notes.md

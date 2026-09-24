@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { LauncherBrowserHelperClient } from "../src/adapters/chatgpt-web/launcher-helper-client";
+import { ChatGptExternalTurnProgress } from "../src/adapters/chatgpt-web/turn-progress";
 import type { BrowserTurn, ResolvedBrowserConfig } from "../src/adapters/chatgpt-web/browser-worker";
 import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL } from "../src/launcher-browser-host";
 
@@ -354,6 +355,68 @@ test("an abort dispatched during run submission cannot overtake the run frame", 
 
   expect(messages).toEqual(["run", "abort"]);
   expect(released).toBe(false);
+});
+
+test("MCP progress mirror transport failure aborts the same helper turn", async () => {
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native",
+    browserHost: "launcher",
+    browserHostDescriptorPath: "/durable/launcher.json",
+    storageStatePath: "/durable/unused-state.json",
+    chromeExecutablePath: "/durable/unused-chrome",
+    turnTimeoutMs: 60_000,
+    headed: true,
+    autoApproveToolCalls: false,
+    useSavedChats: false,
+  });
+  const progress = new ChatGptExternalTurnProgress();
+  const turn = {
+    traceId: "progress-mirror-failure",
+    modelId: "gpt-5.6-sol",
+    reasoning: "high",
+    capabilities: { localToolsEnabled: true, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    externalProgress: progress,
+    prepare: async () => ({ text: "inspect", images: [], release() {} }),
+    onTextDelta() {},
+  } satisfies BrowserTurn;
+  const child = {};
+  const internal = client as unknown as {
+    child?: unknown;
+    helperFeatures: Set<string>;
+    pending: Map<string, {
+      turn: BrowserTurn;
+      resolve: (value: string) => void;
+      reject: (error: Error) => void;
+    }>;
+    send(message: { type: string; id?: string }): Promise<void>;
+    handleLine(child: unknown, line: string): void;
+    forwardProgress(turn: BrowserTurn, stop: AbortSignal): void;
+  };
+  internal.child = child;
+  internal.helperFeatures.add("progress");
+  const sent: string[] = [];
+  internal.send = async message => {
+    sent.push(message.type);
+    if (message.type === "progress") throw new Error("progress pipe failed");
+    if (message.type === "abort" && message.id) {
+      queueMicrotask(() => internal.handleLine(child, JSON.stringify({
+        type: "error",
+        id: message.id,
+        name: "AbortError",
+        message: "helper aborted after local progress failure",
+      })));
+    }
+  };
+  const result = new Promise<string>((resolve, reject) => {
+    internal.pending.set(turn.traceId, { turn, resolve, reject });
+  });
+  const stop = new AbortController();
+  internal.forwardProgress(turn, stop.signal);
+  progress.recordToolBatch(1);
+
+  await expect(result).rejects.toThrow("lost its MCP progress mirror");
+  expect(sent).toEqual(["progress", "abort"]);
+  stop.abort();
 });
 
 test("structured helper errors preserve the ChatGPT adapter failure contract", async () => {

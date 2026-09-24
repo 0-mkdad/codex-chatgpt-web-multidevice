@@ -409,6 +409,28 @@ test("launcher page selection uses native ownership without evaluating unrelated
   });
 });
 
+test("launcher page selection bounds an unrelated stalled CDP target probe", async () => {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorFile());
+  const stalledPage = {} as Page;
+  const ownedPage = {} as Page;
+  const context = {
+    pages: () => [stalledPage, ownedPage],
+    newCDPSession: async (page: Page) => ({
+      send: async (method: string) => {
+        expect(method).toBe("Target.getTargetInfo");
+        if (page === stalledPage) return await new Promise<never>(() => {});
+        return { targetInfo: { targetId: "native-owned-target" } };
+      },
+      detach: async () => {},
+    }),
+  } as unknown as BrowserContext;
+  const browser = { contexts: () => [context] } as unknown as Browser;
+
+  const startedAt = Date.now();
+  expect(await selectLauncherPage(browser, descriptor, 50)).toEqual({ context, page: ownedPage });
+  expect(Date.now() - startedAt).toBeLessThan(500);
+});
+
 test("launcher page selection rejects duplicated native target ownership", async () => {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorFile());
   const page = () => ({

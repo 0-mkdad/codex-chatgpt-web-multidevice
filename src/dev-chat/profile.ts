@@ -22,6 +22,7 @@ export interface DevProfilePaths {
 }
 
 const WINDOWS_LAUNCHER_GUID = "7f4d5fd5-8b96-4d1d-ae3a-8c3f3c88a2b1";
+const WINDOWS_LAUNCHER_PRODUCT_NAME = "Codex Web GPT MultiDevice";
 
 function registeredWindowsLauncherInstallLocation(): string | undefined {
   try {
@@ -136,11 +137,16 @@ export function installedLauncherCandidates({
       || (process.platform === "win32" && environment === process.env
         ? registeredWindowsLauncherInstallLocation() : undefined);
     if (registeredLocation && win32.isAbsolute(registeredLocation)) {
-      candidates.push(win32.join(registeredLocation, "Codex Web GPT.exe"));
+      candidates.push(win32.join(registeredLocation, `${WINDOWS_LAUNCHER_PRODUCT_NAME}.exe`));
     } else {
       const localAppData = environment.LOCALAPPDATA?.trim();
       if (localAppData) {
-        candidates.push(win32.join(localAppData, "Programs", "Codex Web GPT", "Codex Web GPT.exe"));
+        candidates.push(win32.join(
+          localAppData,
+          "Programs",
+          WINDOWS_LAUNCHER_PRODUCT_NAME,
+          `${WINDOWS_LAUNCHER_PRODUCT_NAME}.exe`,
+        ));
       }
     }
   } else if (platform === "linux") {

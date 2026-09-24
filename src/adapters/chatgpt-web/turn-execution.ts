@@ -8,7 +8,7 @@ import {
   extractChatGptTurnIdentity,
   extractChatGptTurnUserRevision,
 } from "./environment";
-import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
+import { MAX_CHATGPT_TURN_SESSIONS } from "./concurrency";
 import type { ChatGptExternalTurnProgress } from "./turn-progress";
 
 function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -139,6 +139,49 @@ export class ChatGptTextFeed {
   }
 }
 
+export type ChatGptTurnProgressSource = "browser" | "mcp" | "tool" | "response" | "recovery";
+
+export interface ChatGptTurnLifecycleProgressSnapshot {
+  lastBrowserProgressAt?: number;
+  lastMcpProgressAt?: number;
+  lastToolProgressAt?: number;
+  lastResponseProgressAt?: number;
+  lastRecoveryAt?: number;
+  lastProgressSource?: ChatGptTurnProgressSource;
+}
+
+/** Per-physical-turn progress evidence. Global process/host liveness never mutates this object. */
+export class ChatGptTurnLifecycleProgress {
+  private readonly timestamps = new Map<ChatGptTurnProgressSource, number>();
+  private lastSource?: ChatGptTurnProgressSource;
+
+  record(source: ChatGptTurnProgressSource, now = Date.now()): void {
+    if (!Number.isFinite(now)) throw new Error("ChatGPT turn progress timestamp must be finite");
+    const previous = this.timestamps.get(source);
+    if (previous !== undefined && now < previous) {
+      throw new Error(`ChatGPT ${source} progress timestamp regressed`);
+    }
+    this.timestamps.set(source, now);
+    this.lastSource = source;
+  }
+
+  snapshot(): ChatGptTurnLifecycleProgressSnapshot {
+    const lastBrowserProgressAt = this.timestamps.get("browser");
+    const lastMcpProgressAt = this.timestamps.get("mcp");
+    const lastToolProgressAt = this.timestamps.get("tool");
+    const lastResponseProgressAt = this.timestamps.get("response");
+    const lastRecoveryAt = this.timestamps.get("recovery");
+    return {
+      ...(lastBrowserProgressAt !== undefined ? { lastBrowserProgressAt } : {}),
+      ...(lastMcpProgressAt !== undefined ? { lastMcpProgressAt } : {}),
+      ...(lastToolProgressAt !== undefined ? { lastToolProgressAt } : {}),
+      ...(lastResponseProgressAt !== undefined ? { lastResponseProgressAt } : {}),
+      ...(lastRecoveryAt !== undefined ? { lastRecoveryAt } : {}),
+      ...(this.lastSource ? { lastProgressSource: this.lastSource } : {}),
+    };
+  }
+}
+
 interface ChatGptTurnRuntimeBase {
   browser: Promise<string>;
   /** Physical helper/Playwright settlement, including the launcher end/release acknowledgement. */
@@ -153,6 +196,7 @@ interface ChatGptTurnRuntimeBase {
   submission?: { phase: "prepared" | "send_activated" | "accepted" };
   /** Present only when the visible ChatGPT tab is driven manually through the Codex Zero Risk MCP contract. */
   manualControl?: { surfaceNonce: string };
+  lifecycleProgress?: ChatGptTurnLifecycleProgress;
   cancel: (reason?: Error) => void;
 }
 
@@ -284,6 +328,7 @@ export class ChatGptTurnSession {
   private attachedConversationKey: string | undefined;
   private tail: Promise<void> = Promise.resolve();
   private capabilityRetirementScheduled = false;
+  private readonly lifecycleProgress: ChatGptTurnLifecycleProgress;
   private readonly rounds = new Map<string, {
     events: AdapterEvent[];
     reasoning: string[];
@@ -299,6 +344,7 @@ export class ChatGptTurnSession {
     readonly nativeThreadId?: string,
     readonly instruction?: string,
   ) {
+    this.lifecycleProgress = runtime.lifecycleProgress ?? new ChatGptTurnLifecycleProgress();
     this.attachedConversationKey = runtime.conversationKey;
     this.physicalSettlement = runtime.physicalSettlement.then(
       () => { this.settledPhysical = true; },
@@ -319,6 +365,7 @@ export class ChatGptTurnSession {
         outcome: outcome.type,
         compaction: runtime.usageInput?._compactionRequest === true,
         ...(!runtime.usageInput?._compactionRequest ? { submission: runtime.submission?.phase ?? "unknown" } : {}),
+        ...this.lifecycleProgress.snapshot(),
         ...(error ? { code: error.code, retryable: error.retryable } : {}),
       })}`);
       return outcome;
@@ -339,6 +386,14 @@ export class ChatGptTurnSession {
 
   lastUsedAt(): number {
     return this.lastTouchedAt;
+  }
+
+  recordProgress(source: ChatGptTurnProgressSource, now = Date.now()): void {
+    this.lifecycleProgress.record(source, now);
+  }
+
+  progressSnapshot(): ChatGptTurnLifecycleProgressSnapshot {
+    return this.lifecycleProgress.snapshot();
   }
 
   outstanding(): BrokerToolRequest[] {
@@ -511,7 +566,7 @@ export class ChatGptTurnSessions {
 
   constructor(
     private readonly ttlMs = 30 * 60_000,
-    private readonly maxEntries = 256,
+    private readonly maxEntries = MAX_CHATGPT_TURN_SESSIONS,
   ) {}
 
   getOrCreate(
@@ -529,12 +584,6 @@ export class ChatGptTurnSessions {
       if (existing.supersededError) throw existing.supersededError;
       existing.touch();
       return existing;
-    }
-    const active = [...this.entries.values()].filter(session => session.isActive()).length;
-    if (active >= MAX_CHATGPT_BROWSER_TABS) {
-      throw new Error(
-        `ChatGPT Web supports at most ${MAX_CHATGPT_BROWSER_TABS} simultaneous browser turns; close or finish a browser tab before starting another`,
-      );
     }
     if (this.entries.size >= this.maxEntries) throw new Error(`ChatGPT web session registry is full (${this.maxEntries} entries)`);
     const session = new ChatGptTurnSession(start(), traceId, ownerKey, nativeTurnId, nativeThreadId, instruction);

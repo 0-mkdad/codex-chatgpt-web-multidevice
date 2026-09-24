@@ -3,6 +3,8 @@ export interface ChatGptWebAdapterErrorOptions {
   errorType: string;
   code: string;
   retryable: boolean;
+  retryAfterMs?: number;
+  submissionRejected?: boolean;
   cause?: unknown;
 }
 
@@ -11,6 +13,8 @@ export class ChatGptWebAdapterError extends Error {
   readonly errorType: string;
   readonly code: string;
   readonly retryable: boolean;
+  readonly retryAfterMs?: number;
+  readonly submissionRejected: boolean;
 
   constructor(message: string, options: ChatGptWebAdapterErrorOptions) {
     super(message, options.cause === undefined ? undefined : { cause: options.cause });
@@ -19,6 +23,27 @@ export class ChatGptWebAdapterError extends Error {
     this.errorType = options.errorType;
     this.code = options.code;
     this.retryable = options.retryable;
+    this.submissionRejected = options.submissionRejected === true;
+    if (options.retryAfterMs !== undefined) {
+      if (!Number.isFinite(options.retryAfterMs) || options.retryAfterMs < 0) {
+        throw new Error("ChatGPT retryAfterMs must be a non-negative finite number");
+      }
+      this.retryAfterMs = options.retryAfterMs;
+    }
+  }
+}
+
+export type ChatGptRecoveryExhaustedClass = "CDP_SESSION_LOST" | "DOM_TEMPORARILY_UNRESPONSIVE";
+
+/** Same-owner recovery was attempted and exhausted. The accepted prompt must not be resubmitted. */
+export class ChatGptRecoveryExhaustedError extends Error {
+  constructor(
+    readonly recoveryClass: ChatGptRecoveryExhaustedClass,
+    message: string,
+    cause?: unknown,
+  ) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "ChatGptRecoveryExhaustedError";
   }
 }
 

@@ -260,6 +260,7 @@ export class TurnBroker implements TurnBrokerOwner {
   private acceptingExternalOwners = true;
   private server?: Server;
   private startPromise?: Promise<void>;
+  private readonly sockets = new Set<Socket>();
 
   private constructor(readonly socketPath: string) {}
 
@@ -740,6 +741,8 @@ export class TurnBroker implements TurnBrokerOwner {
     this.server = undefined;
     this.startPromise = undefined;
     brokers.delete(this.socketPath);
+    for (const socket of [...this.sockets]) socket.destroy();
+    this.sockets.clear();
     if (server?.listening) {
       await new Promise<void>((resolveClose, rejectClose) => server.close(error => {
         if (!error || (error as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") resolveClose();
@@ -848,9 +851,16 @@ export class TurnBroker implements TurnBrokerOwner {
     let buffered = "";
     let handled = false;
     const disconnected = new AbortController();
+    this.sockets.add(socket);
     socket.setEncoding("utf8");
     socket.on("error", () => {});
-    socket.once("close", () => disconnected.abort());
+    socket.once("close", () => {
+      this.sockets.delete(socket);
+      disconnected.abort();
+    });
+    socket.once("end", () => {
+      if (!handled) socket.destroy();
+    });
     socket.on("data", chunk => {
       if (handled) return;
       buffered += chunk;
@@ -1278,6 +1288,9 @@ export async function callTurnBroker<T>(
     // The server owns response termination. Waiting for the pipe/socket to close before resolving
     // prevents callers from retiring the broker while Bun still has a named-pipe write in flight.
     socket.once("close", finishResponse);
+    socket.once("end", () => {
+      if (!response) finishError(new Error("ChatGPT web turn broker closed the connection"));
+    });
     socket.once("connect", () => socket.write(`${JSON.stringify({ id, ...wireRequest })}\n`));
     socket.on("data", chunk => {
       if (settled || response) return;
@@ -1305,6 +1318,12 @@ export async function callTurnBroker<T>(
         // frame is therefore the terminal boundary; ordinary calls still wait for physical close.
         finishResponse();
         socket.destroy();
+      } else if (isWindowsPipeEndpoint(socketPath)) {
+        // A Windows named pipe is full duplex. After the server has ended its side and the client
+        // has received the complete response frame, leaving the client's writable side open can
+        // keep both peers waiting for a physical close indefinitely. Half-close the client side as
+        // well, then keep the normal close listener as the actual settlement boundary.
+        socket.end();
       }
     });
   });

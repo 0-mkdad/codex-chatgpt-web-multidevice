@@ -20,15 +20,16 @@ import {
 import { namespacedToolName, type AdapterEvent, type CodexContentPart, type CodexParsedRequest, type CodexProviderConfig, type CodexToolResultMessage, type CodexUsage } from "../../types";
 import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
-import { ChatGptWebAdapterError } from "./adapter-error";
+import { ChatGptRecoveryExhaustedError, ChatGptWebAdapterError } from "./adapter-error";
 import { ChatGptBrowserWorker } from "./browser-worker";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity, priorChatGptAbortedTurnIds } from "./environment";
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
 import { createChatGptStructuredOutputValidator } from "./output-validation";
+import { classifyChatGptRecovery } from "./recovery-classification";
 import { chatGptWebTurnRetryPolicy } from "./retry-policy";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult, type TurnBrokerOwner } from "./turn-broker";
-import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnRoundKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
+import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnLifecycleProgress, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnRoundKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
 import { estimateChatGptWebUsage, resolveBiggerContextMultipartParts } from "./usage";
 import { ChatGptThreadEnvironmentStore } from "./thread-environment";
 import {
@@ -36,6 +37,7 @@ import {
   type CapturedChatGptLunaCheckpoint,
 } from "./rolling-checkpoint";
 import { ChatGptExternalTurnProgress } from "./turn-progress";
+import { ChatGptTurnJournal } from "./turn-journal";
 import {
   canonicalizeCompactionHandoff,
   existingStructuredCompactionRun,
@@ -296,9 +298,28 @@ function replayEvents(events: AdapterEvent[], emit: (event: AdapterEvent) => voi
 
 function submittedTurnFailure(session: ChatGptTurnSession, error: unknown): Error {
   const normalized = error instanceof Error ? error : new Error(String(error));
-  if (normalized instanceof ChatGptWebAdapterError) return normalized;
   const phase = session.runtime.submission?.phase;
+  // Submission phase is authoritative for resend safety. A retryable provider error observed
+  // after Send activation cannot prove that ChatGPT rejected the prompt, so retrying it could
+  // duplicate side effects. Preserve only explicitly terminal provider classifications.
   if (!phase || phase === "prepared") return normalized;
+  // The browser worker emits this only after bounded same-owner recovery has already been
+  // exhausted. Keep the structured classification intact so the outer lifecycle retires the
+  // unrecoverable owner/tools explicitly instead of misreporting them as preservable.
+  if (normalized instanceof ChatGptRecoveryExhaustedError) return normalized;
+  if (normalized instanceof ChatGptWebAdapterError) {
+    if (normalized.submissionRejected || !normalized.retryable) return normalized;
+    if (normalized.status === 429 || normalized.code === "rate_limit_exceeded") {
+      return new ChatGptWebAdapterError(normalized.message, {
+        status: normalized.status,
+        errorType: normalized.errorType,
+        code: normalized.code,
+        retryable: false,
+        ...(normalized.retryAfterMs !== undefined ? { retryAfterMs: normalized.retryAfterMs } : {}),
+        cause: normalized,
+      });
+    }
+  }
   const ambiguous = phase === "send_activated";
   return new ChatGptWebAdapterError(
     ambiguous
@@ -397,6 +418,10 @@ export function createChatGptWebAdapter(
       ? resolve(expandUserPath(provider.chatgptWeb.lunaCheckpointStatePath))
       : undefined,
   );
+  const turnJournalStatePath = provider.chatgptWeb?.turnJournalStatePath
+    ? resolve(expandUserPath(provider.chatgptWeb.turnJournalStatePath))
+    : undefined;
+  const turnJournal = new ChatGptTurnJournal(turnJournalStatePath);
   const currentUsageInput = (parsed: CodexParsedRequest): CodexParsedRequest => (
     parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID && !parsed._compactionRequest
       ? lunaCheckpointStore.apply(parsed).parsed
@@ -408,7 +433,14 @@ export function createChatGptWebAdapter(
     environment: ReturnType<typeof extractChatGptTurnEnvironment> | undefined,
     traceId: string,
     turnCapabilities: ChatGptWebCapabilities,
-    hooks: { onCompactionProgress?: () => void } = {},
+    hooks: {
+      onCompactionProgress?: () => void;
+      onSubmissionActivated?: (conversationKey?: string) => void;
+      onSendDispatchAttempted?: () => void;
+      onSubmissionAccepted?: (conversationKey?: string) => void;
+      beforePhysicalSubmission?: () => void | Promise<void>;
+      onRateLimitPressure?: (error: ChatGptWebAdapterError) => void | Promise<void>;
+    } = {},
   ): ChatGptTurnRuntime => {
     const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
     if (manualRequest !== manualInteraction) {
@@ -484,6 +516,21 @@ export function createChatGptWebAdapter(
     });
     const trace = new ChatGptTraceFeed();
     const text = new ChatGptTextFeed();
+    const lifecycleProgress = new ChatGptTurnLifecycleProgress();
+    const recordBrowserProgress = () => lifecycleProgress.record("browser");
+    const recordRecovery = () => lifecycleProgress.record("recovery");
+    const pushReasoning = (value: string, continuation?: boolean) => {
+      lifecycleProgress.record("response");
+      trace.push({ kind: "reasoning", text: value, ...(continuation ? { continuation: true } : {}) });
+    };
+    const pushCommentary = (value: string, continuation?: boolean) => {
+      lifecycleProgress.record("response");
+      trace.push({ kind: "commentary", text: value, ...(continuation ? { continuation: true } : {}) });
+    };
+    const pushText = (delta: string) => {
+      lifecycleProgress.record("response");
+      text.push(delta);
+    };
     const observedCapabilityTokens = new Set<string>();
     const observeCapabilityRetirement = (
       turnToken: string,
@@ -511,10 +558,15 @@ export function createChatGptWebAdapter(
     // ambiguous browser send. Normal task prompts must never be replayed after Send activation.
     const submissionLifecycle = {
       ...(!parsed._compactionRequest ? {
-        onSendActivated: () => { submission.phase = "send_activated" as const; },
+        onSendActivated: () => {
+          hooks.onSubmissionActivated?.(conversationKey);
+          submission.phase = "send_activated" as const;
+        },
+        onSendDispatchAttempted: () => hooks.onSendDispatchAttempted?.(),
       } : {}),
       onSubmitted: () => {
         if (!parsed._compactionRequest) submission.phase = "accepted";
+        hooks.onSubmissionAccepted?.(conversationKey);
         hooks.onCompactionProgress?.();
       },
     };
@@ -591,6 +643,7 @@ export function createChatGptWebAdapter(
           });
           await broker.confirmSafeTurnSent(activeToken, surfaceNonce);
           submission.phase = "accepted";
+          hooks.onSubmissionAccepted?.();
           if (!parsed._compactionRequest) trace.push({
             kind: "commentary",
             text: "> **Waiting for ChatGPT**\n>\n> The prompt is marked `Sent`. Waiting for `Codex Zero Risk` to bind this turn through the selected ChatGPT connector.",
@@ -703,12 +756,16 @@ export function createChatGptWebAdapter(
           release: () => {},
         }),
         abortSignal: browserAbort.signal,
+        ...hooks.beforePhysicalSubmission ? { beforePhysicalSubmission: hooks.beforePhysicalSubmission } : {},
+        ...hooks.onRateLimitPressure ? { onRateLimitPressure: hooks.onRateLimitPressure } : {},
         ...(parsed._compactionRequest ? { compaction: true } : {}),
         ...submissionLifecycle,
         ...multipartProgressLifecycle,
-        onReasoningSummary: (text, continuation) => trace.push({ kind: "reasoning", text, ...(continuation ? { continuation: true } : {}) }),
-        onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
-        onTextDelta: delta => text.push(delta),
+        onHeartbeat: recordBrowserProgress,
+        onRecovery: recordRecovery,
+        onReasoningSummary: pushReasoning,
+        onCommentary: pushCommentary,
+        onTextDelta: pushText,
         ...(captureLunaCheckpoint ? {
           captureLunaCheckpoint: true,
           onLunaCheckpoint: captureCheckpoint,
@@ -720,6 +777,7 @@ export function createChatGptWebAdapter(
         physicalSettlement: browserTurn.physicalSettlement,
         trace,
         text,
+        lifecycleProgress,
         usageInput: checkpointInput.parsed,
         submission,
         cancel: browserTurn.cancel,
@@ -768,12 +826,16 @@ export function createChatGptWebAdapter(
       ...(resumeInput ? { prepareResume: () => prepareWith(resumeInput) } : {}),
       ...(retainConversation ? { retainConversation: true, conversationKey } : {}),
       abortSignal: browserAbort.signal,
+      ...hooks.beforePhysicalSubmission ? { beforePhysicalSubmission: hooks.beforePhysicalSubmission } : {},
+      ...hooks.onRateLimitPressure ? { onRateLimitPressure: hooks.onRateLimitPressure } : {},
       ...(parsed._compactionRequest ? { compaction: true } : {}),
       ...submissionLifecycle,
       ...multipartProgressLifecycle,
-      onReasoningSummary: (text, continuation) => trace.push({ kind: "reasoning", text, ...(continuation ? { continuation: true } : {}) }),
-      onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
-      onTextDelta: delta => text.push(delta),
+      onHeartbeat: recordBrowserProgress,
+      onRecovery: recordRecovery,
+      onReasoningSummary: pushReasoning,
+      onCommentary: pushCommentary,
+      onTextDelta: pushText,
       externalProgress,
       completionFence: {
         begin: async () => broker.beginCompletionFence(await token.promise),
@@ -798,6 +860,7 @@ export function createChatGptWebAdapter(
       physicalSettlement: browserTurn.physicalSettlement,
       trace,
       text,
+      lifecycleProgress,
       usageInput: checkpointInput.parsed,
       ...(conversationKey ? { conversationKey } : {}),
       ...(releaseRetainedConversation ? { releaseRetainedConversation } : {}),
@@ -1154,22 +1217,94 @@ export function createChatGptWebAdapter(
           chatGptTurnSessions.retireAbortedOwnerTurns(ownerKey, abortedTurnIds, executionKey);
         }
         const traceId = chatGptWebTraceId(provider, parsed);
-        const session = await chatGptTurnSessions.getOrCreateAfterOwnerRetirement(
-          executionKey,
-          ownerKey,
-          () => startRuntime(parsed, environment, traceId, turnCapabilities),
-          traceId,
-          incoming.abortSignal,
-          nativeTurnId,
-          nativeIdentity.threadId,
-          chatGptInstructionLineage(parsed),
-        );
+        const existingSession = chatGptTurnSessions.find(executionKey);
+        const reconnecting = existingSession !== undefined;
+        if (!reconnecting && !parsed._compactionRequest) {
+          const restartCheckpoint = turnJournal.checkpoint(executionKey);
+          if (restartCheckpoint) {
+            emit({
+              type: "error",
+              message: restartCheckpoint.completion === "running"
+                ? "ChatGPT may already be processing this turn from before the local runtime restarted. Reconnect to the existing ChatGPT turn or start a new Codex turn explicitly."
+                : "This exact ChatGPT turn already reached a terminal state before the local runtime restarted, but its response body is not available for crash replay. Start a new Codex turn explicitly if you want to run it again.",
+              status: 409,
+              errorType: "invalid_request_error",
+              code: "chatgpt_restart_recovery_required",
+              retryable: false,
+            });
+            return;
+          }
+        }
+        const retryGate = reconnecting
+          ? undefined
+          : await chatGptWebTurnRetryPolicy.waitForAttempt(retryKey, incoming.abortSignal);
+        if (retryGate && (retryGate.retryNumber > 0 || retryGate.circuitState !== "CLOSED")) {
+          console.info(
+            `[chatgpt-web] turn ${traceId} retry=${retryGate.retryNumber}`
+            + ` backoffMs=${retryGate.backoffMs} circuit=${retryGate.circuitState}`,
+          );
+        }
+        let session: ChatGptTurnSession;
+        let schedulerRateLimitPressureRecorded = false;
+        try {
+          session = await chatGptTurnSessions.getOrCreateAfterOwnerRetirement(
+            executionKey,
+            ownerKey,
+            () => startRuntime(parsed, environment, traceId, turnCapabilities, {
+              beforePhysicalSubmission: () => chatGptWebTurnRetryPolicy.waitForAttempt(retryKey, incoming.abortSignal).then(() => undefined),
+              onRateLimitPressure: error => {
+                chatGptWebTurnRetryPolicy.recordRateLimitPressure(retryKey, error.retryAfterMs);
+                schedulerRateLimitPressureRecorded = true;
+              },
+              onSubmissionActivated: conversationKey => {
+                turnJournal.recordSubmission(executionKey, "send_activated", {
+                  traceId,
+                  nativeThreadId: nativeIdentity.threadId,
+                  nativeTurnId,
+                  conversationKey,
+                  retryCount: retryGate?.retryNumber ?? 0,
+                });
+                console.info(`[chatgpt-web] send_safety_checkpoint ${JSON.stringify({
+                  traceId,
+                  durable: turnJournalStatePath !== undefined,
+                })}`);
+              },
+              onSendDispatchAttempted: () => {
+                console.info(`[chatgpt-web] send_dispatch_attempted ${JSON.stringify({ traceId })}`);
+              },
+              onSubmissionAccepted: conversationKey => {
+                turnJournal.recordSubmission(executionKey, "accepted", {
+                  traceId,
+                  nativeThreadId: nativeIdentity.threadId,
+                  nativeTurnId,
+                  conversationKey,
+                  retryCount: retryGate?.retryNumber ?? 0,
+                });
+                console.info(`[chatgpt-web] submission_accepted ${JSON.stringify({ traceId })}`);
+                chatGptWebTurnRetryPolicy.recordSubmissionAccepted(retryKey);
+              },
+            }),
+            traceId,
+            incoming.abortSignal,
+            nativeTurnId,
+            nativeIdentity.threadId,
+            chatGptInstructionLineage(parsed),
+          );
+        } catch (error) {
+          if (retryGate?.halfOpenProbe) chatGptWebTurnRetryPolicy.releaseProbe(retryKey);
+          throw error;
+        }
         const roundKey = chatGptTurnRoundKey(parsed);
         const emitRoundEvents = (events: readonly AdapterEvent[]): void => {
           // Journal the complete synchronous event batch before touching the HTTP observer. If the
           // observer disconnects midway through emission, an exact reconnect can replay the entire
           // canonical batch instead of losing the already-drained tail.
           session.appendRoundEvents(roundKey, events);
+          try {
+            turnJournal.recordEvents(executionKey, events);
+          } catch (error) {
+            console.error(`[chatgpt-web] failed to advance turn journal event checkpoint: ${error instanceof Error ? error.message : String(error)}`);
+          }
           for (const event of events) emit(event);
         };
         const emitRoundBatch = (
@@ -1232,6 +1367,9 @@ export function createChatGptWebAdapter(
                 buffer,
               ));
               session.completeRound(roundKey);
+              try { turnJournal.recordTerminal(executionKey, "final", { response: settled.answer }); } catch (error) {
+                console.error(`[chatgpt-web] failed to persist terminal turn journal checkpoint: ${error instanceof Error ? error.message : String(error)}`);
+              }
               chatGptWebTurnRetryPolicy.clear(retryKey);
               return;
             }
@@ -1261,8 +1399,12 @@ export function createChatGptWebAdapter(
                 }
                 for (const message of results) {
                   await broker.completeTool(turnToken, message.toolCallId, brokerResult(message));
+                  session.recordProgress("tool");
                   session.runtime.externalProgress.recordToolResult();
                   session.markResultDelivered(message.toolCallId);
+                  try { turnJournal.recordToolResult(executionKey, message.toolCallId); } catch (error) {
+                    console.error(`[chatgpt-web] failed to persist tool-result turn journal checkpoint: ${error instanceof Error ? error.message : String(error)}`);
+                  }
                 }
               }
             } else if (session.outstanding().length > 0) {
@@ -1294,6 +1436,7 @@ export function createChatGptWebAdapter(
                     throw new Error("ChatGPT broker returned tools for a read-only browser turn");
                   }
                   if (requests.length > 0) {
+                    session.recordProgress("mcp");
                     const revision = externalProgress.recordToolBatch(requests.length);
                     if (!session.runtime.manualControl) {
                       // The browser outcome is in the same race below and owns the semantic DOM and
@@ -1338,6 +1481,9 @@ export function createChatGptWebAdapter(
                   buffer,
                 ));
                 session.completeRound(roundKey);
+                try { turnJournal.recordTerminal(executionKey, "final", { response: completedOutcome.answer }); } catch (error) {
+                  console.error(`[chatgpt-web] failed to persist terminal turn journal checkpoint: ${error instanceof Error ? error.message : String(error)}`);
+                }
                 chatGptWebTurnRetryPolicy.clear(retryKey);
               };
               const waitForTrace = () => session.runtime.trace.wait(toolWaitAbort.signal)
@@ -1390,6 +1536,9 @@ export function createChatGptWebAdapter(
                 }
                 validateBatchTools(parsed, next.requests);
                 session.setOutstanding(next.requests, roundReasoning, session.roundEvents(roundKey));
+                try { turnJournal.recordOutstandingToolCalls(executionKey, next.requests.map(request => request.callId)); } catch (error) {
+                  console.error(`[chatgpt-web] failed to persist tool-batch turn journal checkpoint: ${error instanceof Error ? error.message : String(error)}`);
+                }
                 emitRoundBatch(buffer => emitToolBatch(
                   next.requests,
                   estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning: roundReasoning, toolRequests: next.requests }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments),
@@ -1404,24 +1553,66 @@ export function createChatGptWebAdapter(
           });
         } catch (error) {
           if (incoming.abortSignal?.aborted && error instanceof DOMException && error.name === "AbortError") {
-            if (session.runtime.manualControl) {
+            if (session.runtime.manualControl || session.runtime.submission?.phase === "prepared") {
               // Zero Risk is user-driven and has no DOM observer that can distinguish continued
-              // work from a stopped native turn. A closed Responses stream is therefore terminal:
-              // revoke the MCP capability and release the Launcher tab instead of leaving a task
-              // that Codex already shows as stopped waiting forever.
+              // work from a stopped native turn. A pre-submission automatic turn is also safe to
+              // retire because no prompt can have reached ChatGPT yet.
               chatGptTurnSessions.retire(executionKey, session);
+              chatGptWebTurnRetryPolicy.releaseProbe(retryKey);
             }
-            // Automatic browser turns keep their exact execution and journal for reconnect. Their
-            // owned DOM observer can continue proving the same accepted ChatGPT submission.
+            // Post-Send automatic browser turns keep their exact execution and journal for
+            // reconnect. Their owned DOM observer can continue proving the same physical ChatGPT
+            // submission without ever replaying the prompt.
             throw error;
           }
           const turnError = submittedTurnFailure(session, error);
-          const handledError = turnError instanceof ChatGptWebAdapterError && turnError.retryable
-            ? chatGptWebTurnRetryPolicy.recordRetryableFailure(retryKey, turnError)
-            : turnError;
-          if (!(turnError instanceof ChatGptWebAdapterError && turnError.retryable)) {
+          const recovery = classifyChatGptRecovery(turnError, {
+            submissionPhase: session.runtime.submission?.phase,
+          });
+          const safeRetry = turnError instanceof ChatGptWebAdapterError
+            && turnError.retryable
+            && recovery.mayResubmit;
+          let handledError: Error = turnError;
+          if (turnError instanceof ChatGptWebAdapterError && recovery.class === "CHATGPT_RATE_LIMITED") {
+            if (safeRetry) {
+              handledError = chatGptWebTurnRetryPolicy.recordRetryableFailure(
+                retryKey,
+                turnError,
+                undefined,
+                { rateLimitPressureAlreadyRecorded: schedulerRateLimitPressureRecorded },
+              );
+            } else if (!schedulerRateLimitPressureRecorded) {
+              chatGptWebTurnRetryPolicy.recordRateLimitPressure(retryKey, turnError.retryAfterMs);
+            }
+          } else if (safeRetry && turnError instanceof ChatGptWebAdapterError) {
+            handledError = chatGptWebTurnRetryPolicy.recordRetryableFailure(retryKey, turnError);
+          } else {
             chatGptWebTurnRetryPolicy.clear(retryKey);
           }
+          let willRetry = safeRetry
+            && handledError instanceof ChatGptWebAdapterError
+            && handledError.retryable;
+          if (willRetry) {
+            // Explicit provider evidence can prove that a post-Send activation was rejected before
+            // ChatGPT accepted it. Remove that safety tombstone only after classification has made
+            // the next fresh submission safe; every ambiguous outcome keeps its durable checkpoint.
+            try { turnJournal.clear(executionKey); } catch (journalError) {
+              console.error(`[chatgpt-web] failed to clear rejected-submission turn journal checkpoint: ${journalError instanceof Error ? journalError.message : String(journalError)}`);
+              handledError = new ChatGptWebAdapterError("ChatGPT proved the submission was rejected, but the local restart journal could not be cleared safely.", {
+                status: 500,
+                errorType: "server_error",
+                code: "turn_journal_clear_failed",
+                retryable: false,
+                cause: journalError,
+              });
+              willRetry = false;
+            }
+          }
+          console.info(
+            `[chatgpt-web] turn ${traceId} recovery=${recovery.class}`
+            + ` phase=${session.runtime.submission?.phase ?? "unknown"}`
+            + ` retryable=${safeRetry} resubmit=${recovery.mayResubmit}`,
+          );
           if (handledError instanceof ChatGptWebAdapterError && !handledError.retryable) {
             // A deterministic request failure remains replayable so a native reconnect cannot burn
             // another browser attempt. Every other failure retires the browser session: client
@@ -1435,6 +1626,17 @@ export function createChatGptWebAdapter(
             void session.runtime.token.then(turnToken => broker.revoke(turnToken)).catch(() => {});
           }
           if (handledError instanceof ChatGptWebAdapterError) {
+            if (session.runtime.submission?.phase !== "prepared" && !willRetry) {
+              try {
+                turnJournal.recordTerminal(
+                  executionKey,
+                  handledError.code === "client_cancelled" ? "cancelled" : "error",
+                  { errorCode: handledError.code },
+                );
+              } catch (journalError) {
+                console.error(`[chatgpt-web] failed to persist failed turn journal checkpoint: ${journalError instanceof Error ? journalError.message : String(journalError)}`);
+              }
+            }
             emitRoundEvent({
               type: "error",
               message: handledError.message,

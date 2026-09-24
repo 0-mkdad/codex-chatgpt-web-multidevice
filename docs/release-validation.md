@@ -17,7 +17,7 @@ a newer stable release. Launchers discover it on their next startup update check
 version is newer and its platform asset and checksums are present. Already running launchers
 do not poll for publication changes.
 
-The tag workflow marks new suffixed versions such as `v6.0.0-rc.1` as pre-releases automatically
+The tag workflow marks new suffixed versions such as `vX.Y.Z-rc.1` as pre-releases automatically
 and preserves an existing release's pre-release flag when rerun.
 Use a new version for changed binaries; toggling publication flags promotes the existing build.
 Do not publish a stable tag and only mark it as a pre-release afterwards: an older launcher could
@@ -65,14 +65,6 @@ Run this list on a maintained Windows 11 x64 machine with a real ChatGPT account
 
 Any failed or unexecuted item blocks a stable release. An alpha may ship with a named failed item
 only when the release notes describe the limitation and recovery path explicitly.
-
-### v3.0.0 result
-
-Maintainer validation passed on Windows 11 x64 on 2026-08-22 using the published v3.0.0-alpha
-upgrade package and a real ChatGPT Pro account. The authenticated launcher, Codex model catalog,
-Full-mode MCP tools, Pro turns, compaction, cancellation, session reuse, and preserved connector
-configuration were exercised successfully. The direct installer completed successfully but gave no
-clear completion action; v3.0.0 changes it to an assisted installer with a final launch option.
 
 ## macOS gate
 

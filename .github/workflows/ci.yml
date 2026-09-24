@@ -53,6 +53,10 @@ jobs:
         run: bun run launcher/scripts/prepare-linux-appimage-tools.cjs
       - run: bun run verify
       - run: bun run app:package
+      - name: Verify Windows v6.0.0 installer upgrade and uninstall
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./launcher/scripts/smoke-upgrade-windows.ps1 -CandidateInstaller ./launcher/artifacts/codex-web-gpt-multidevice-6.1.0-win-x64.exe
       - name: Verify Linux AppImage ABI on current Arch
         if: runner.os == 'Linux'
         run: |

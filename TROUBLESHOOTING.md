@@ -157,10 +157,11 @@ If local tools work on the first message but disappear on a follow-up, check the
 in **Launcher → Browser**. ChatGPT may not retain the connector for the next message in a reused
 conversation. The model saying it has no tools alone does not establish this.
 
-In 6.0, enable **Settings → New browser chat for each turn** in automatic browser mode for this
-case: the same Codex task continues, but each turn attaches the connector in a
-fresh ChatGPT conversation. It resends more context and can be slower. In stock v5.0.8, close the
-task's **completed** browser tab before sending the next message; closing a running tab cancels it.
+Enable **Settings → New browser chat for each turn** in automatic browser mode for this case. The
+same Codex task continues, but each turn attaches the connector in a fresh ChatGPT conversation. It
+resends more context and can be slower. If conversation reuse remains enabled and a fresh chat is
+needed, close only the task's **completed** browser tab before sending the next message; closing a
+running tab cancels it.
 
 Also try recreating the connector under the launcher's selected name with the same Tunnel and **Allow
 all actions**, then run **Verify runtime**. If tools are already missing in a fresh chat, report that
@@ -174,8 +175,8 @@ response, Windows trusts that connection. Fully quit the launcher, then start it
 
 ```powershell
 $env:NODE_USE_SYSTEM_CA = "1"
-$install = (Get-ItemProperty "HKCU:\Software\d1a6026a-6210-588e-9a2b-da3936f94e02").InstallLocation
-Start-Process (Join-Path $install "Codex Web GPT.exe")
+$install = (Get-ItemProperty "HKCU:\Software\7f4d5fd5-8b96-4d1d-ae3a-8c3f3c88a2b1").InstallLocation
+Start-Process (Join-Path $install "Codex Web GPT MultiDevice.exe")
 ```
 
 For a portable copy, use its executable path instead. Retry **Connect harness** once. This enables
@@ -237,9 +238,9 @@ even when the local bridge is healthy.
 - Include the exact model, Browser-only or Full harness mode, whether tools ran, and whether the
   ChatGPT page showed a final answer.
 
-Do not assume that a generic 502 means the Tunnel is broken. Since v4.0.7, a native tool that
-outlives its turn binding is reported explicitly as `codex_tool_timeout` and retired rather than
-being presented as an ambiguous proxy success.
+Do not assume that a generic 502 means the Tunnel is broken. A native tool that outlives its turn
+binding is reported explicitly as `codex_tool_timeout` and retired rather than being presented as
+an ambiguous proxy success.
 
 ## Native compaction returns `404 Not Found`
 
@@ -294,7 +295,8 @@ complete or retrieve through its current contract.
 Codex's native Image Gen tool uses a different path: it sends `/v1/images/generations` or
 `/v1/images/edits` through the configured Codex base URL. The bridge forwards those requests to the
 native Codex backend using the incoming Codex authorization. A local `404 Not found` on these paths
-in 5.0.4 or earlier is a missing bridge route, not proof of an OpenAI plugin or backend failure.
+means the installed bridge/runtime does not expose the native Image Gen route; repair or update the
+launcher before treating it as proof of an OpenAI plugin or backend failure.
 Upstream authentication and image-allowance errors remain unchanged; the ChatGPT browser connector
 does not provide credentials or additional allowance for native Image Gen.
 
