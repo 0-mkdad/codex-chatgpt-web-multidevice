@@ -1,9 +1,18 @@
 import { expect, test } from "bun:test";
+import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
+
 // PRE-FIX module: the exact source that produced the failing installed 6.1.10 candidate
 // (final-6.1.10-source/src is byte-identical to the repo tree at the installed build, whose
 // dist/runtime/app/cli.js hash 25197a95… matches the live install). Read-only import.
-import { ChatGptBrowserWorker as PreFixChatGptBrowserWorker } from "../../final-6.1.10-source/src/adapters/chatgpt-web/browser-worker";
-import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
+// The fixture lives only on the incident workstation, outside the repository, so CI and any
+// other checkout skip these differential tests instead of failing on the missing module.
+let preFixPrototype: object | null = null;
+try {
+  // @ts-ignore — deliberate import of an incident fixture that exists outside the repository
+  preFixPrototype = (await import("../../final-6.1.10-source/src/adapters/chatgpt-web/browser-worker"))
+    .ChatGptBrowserWorker.prototype;
+} catch {}
+const testIfFixture = test.skipIf(preFixPrototype === null);
 
 /**
  * Differential pre-fix reproduction of the 2026-09-29 compaction starvation incident:
@@ -13,10 +22,12 @@ import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
  * shipped bug rather than merely confirming the new code's happy path.
  */
 
+type PreFixWorkerStub = { run: (turn: BrowserTurn) => Promise<unknown> };
+
 function preFixStubWorker(operationalLimit: number) {
   const starts: string[] = [];
   const releases = new Map<string, () => void>();
-  const worker = Object.assign(Object.create(PreFixChatGptBrowserWorker.prototype), {
+  const worker = Object.assign(Object.create(preFixPrototype!), {
     config: { browserHost: "managed-chrome" },
     activeRuns: new Map<string, Promise<string>>(),
     pendingRuns: [],
@@ -30,7 +41,7 @@ function preFixStubWorker(operationalLimit: number) {
       starts.push(turn.traceId);
       releases.set(turn.traceId, () => resolve(turn.traceId));
     }),
-  }) as PreFixChatGptBrowserWorker;
+  }) as PreFixWorkerStub;
   return { worker, starts, releases };
 }
 
@@ -50,7 +61,7 @@ function preFixTurn(options: {
   } as BrowserTurn;
 }
 
-test("PRE-FIX 6.1.10 scheduler reproduces the incident: compaction loses the slot to the gated turn", async () => {
+testIfFixture("PRE-FIX 6.1.10 scheduler reproduces the incident: compaction loses the slot to the gated turn", async () => {
   const { worker, starts, releases } = preFixStubWorker(2);
   let releaseGate!: () => void;
   void worker.run(preFixTurn({ traceId: "runner_A" }));
@@ -75,7 +86,7 @@ test("PRE-FIX 6.1.10 scheduler reproduces the incident: compaction loses the slo
   await gated;
 });
 
-test("PRE-FIX 6.1.10 scheduler reproduces the steer starvation: a steered child's resume waits behind older FIFO work", async () => {
+testIfFixture("PRE-FIX 6.1.10 scheduler reproduces the steer starvation: a steered child's resume waits behind older FIFO work", async () => {
   // Live: steered child 8fac's follow-up c30634339f67 queued at the FIFO tail (18:50:17) and was
   // admitted only at 19:24:17 (queueWaitMs 2,039,861). The pre-fix scheduler has no continuation
   // class, so the resume turn is plain FIFO head-of-line blocked behind the older turn.
