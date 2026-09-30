@@ -1,6 +1,6 @@
 {
   "name": "codex-web-gpt-multidevice-launcher",
-  "version": "6.2.0",
+  "version": "6.2.1",
   "private": true,
   "description": "Desktop control center for the Codex ChatGPT Web MultiDevice fork",
   "author": "0-mkdad",
@@ -38,7 +38,7 @@
   },
   "overrides": {
     "@xmldom/xmldom": "0.8.15",
-    "fast-uri": "3.1.6"
+    "fast-uri": "3.1.8"
   },
   "build": {
     "appId": "dev.0mkdad.codexwebgpt.multidevice",
