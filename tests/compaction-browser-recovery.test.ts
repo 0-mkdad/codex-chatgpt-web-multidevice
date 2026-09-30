@@ -95,11 +95,13 @@ test.each([[true, false, true], [false, false, true], [true, true, true], [true,
     expect(recoveryCallbacks.map(callback => typeof callback)).toEqual(
       Array(multipart ? 12 : 2).fill(owned ? "function" : "undefined"),
     );
+    // Staging policy (2026-09-26): six-part Sol transactions stage at Medium or wider — never
+    // Instant/Low — while the final part still re-proves the requested execution effort.
     expect(actions).toEqual([
       ...(multipart ? [
-        "effort:low",
+        "effort:medium",
         ...Array.from({ length: 5 }, (_, index) => [
-          ...(index > 0 ? ["effort:low"] : []), "attach:plain", "send", "observe", "ack",
+          ...(index > 0 ? ["effort:medium"] : []), "attach:plain", "send", "observe", "ack",
         ]).flat(),
       ] : []),
       `effort:${effort}`,

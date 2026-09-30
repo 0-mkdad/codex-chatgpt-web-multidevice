@@ -10,6 +10,11 @@ import {
 } from "./adapters/chatgpt-web/compaction-handoff";
 import { ChatGptWebAdapterError, chatGptBrowserTabClosedError } from "./adapters/chatgpt-web/adapter-error";
 import {
+  CHATGPT_CONTINUATION_CREDIT_REASONS,
+  grantChatGptContinuationCredit,
+} from "./adapters/chatgpt-web/continuation-credits";
+import { chatGptWebTraceHash, emitChatGptWebStructuredTrace } from "./adapters/chatgpt-web/structured-trace";
+import {
   CHATGPT_TURN_REVISION_CONFLICT_MESSAGE,
   extractChatGptTurnIdentity,
   extractCodexTurnIdentityFromBody,
@@ -381,8 +386,23 @@ interface ModelCatalogFailure {
 }
 
 function modelCatalogFailure(stage: ModelCatalogFailure["stage"], error: unknown): ModelCatalogFailure {
-  const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
-  return { stage, ...(typeof code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(code) ? { code } : {}) };
+  const safeCode = (source: unknown): string | undefined => {
+    if (!source || typeof source !== "object" || !("code" in source)) return undefined;
+    const code = (source as { code?: unknown }).code;
+    return typeof code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(code) ? code : undefined;
+  };
+  // Prefer the error's own safe code, then its cause chain, then the abort/timeout classes
+  // whose DOMException/TimeoutError instances carry no usable code property.
+  const direct = safeCode(error);
+  if (direct) return { stage, code: direct };
+  if (error instanceof Error) {
+    const cause = safeCode(error.cause);
+    if (cause) return { stage, code: cause };
+  }
+  const name = error instanceof Error ? error.name : undefined;
+  if (name === "AbortError") return { stage, code: "ABORT_ERR" };
+  if (name === "TimeoutError") return { stage, code: "ETIMEDOUT" };
+  return { stage };
 }
 
 export async function modelsRequest(
@@ -927,6 +947,15 @@ export function startServer(
           );
         }
         const reason = new DOMException("Codex turn interrupted", "AbortError");
+        // A Codex Interrupt (multi-agent send_input steer) intentionally aborts the target's live
+        // browser generation. Grant the thread a short one-shot continuation credit so its
+        // follow-up turn reclaims admission instead of starving at the FIFO tail behind turns
+        // enqueued after it (live: 34-minute steered-child starvation, 2026-09-29 incident).
+        grantChatGptContinuationCredit(identity.threadId, CHATGPT_CONTINUATION_CREDIT_REASONS.interruptSteer);
+        emitChatGptWebStructuredTrace("continuation_credit_granted", {
+          nativeThreadHash: chatGptWebTraceHash(identity.threadId),
+          reason: CHATGPT_CONTINUATION_CREDIT_REASONS.interruptSteer,
+        });
         const browserCancellation = chatGptTurnSessions.cancelNativeTurn(
           identity.threadId,
           identity.turnId,

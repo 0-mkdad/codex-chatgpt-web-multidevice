@@ -126,6 +126,7 @@ test("startup failure stays visible on another launch and Retry exits the failed
   const sandbox = {
     mainWindow: window, mainWindowReadyToShow: false, mainWindowShowRequested: false,
     startupFailed: false, quitting: false,
+    finishRuntimeStartup() {},
     browserHost: { destroy: () => events.push("destroy") },
     browserControl: { close: async () => events.push("control closed") },
     start: async () => { throw new Error("Browser idle document did not commit within 10000ms"); },
@@ -336,6 +337,51 @@ test("saved ChatGPT authentication is refreshed before setup is presented", () =
   assert.ok(runtimeStart > upgrade, "configured runtime must start after any upgrade");
   assert.ok(routeConnect > runtimeStart, "Codex route must connect only after the runtime is healthy");
   assert.match(appSource, /browser\?\.status === "loading" \? copy\.checkingSignIn/);
+});
+
+test("runtime renderer actions wait for the startup boundary and the boundary always settles", async () => {
+  // Upstream v6.1.3 runtimeStartup barrier, adapted: renderer actions can arrive as soon
+  // as loadRenderer starts, so runtime-mutating channels await the startup promise while
+  // plain reads answer immediately, and every startup path settles the promise once.
+  const vm = require("node:vm");
+  const handlers = new Map();
+  const captured = {};
+  const source = electronMain.slice(electronMain.indexOf("let finishRuntimeStartup;"), electronMain.indexOf("function findFreePort()"))
+    + electronMain.slice(electronMain.indexOf("function registerIpc("), electronMain.indexOf("async function requestQuit()"))
+    + "\nregisterIpc({ logger });\n__capture({ runtimeStartup, finishRuntimeStartup });";
+  vm.runInNewContext(source, {
+    __capture: value => Object.assign(captured, value),
+    registerLoggedIpc: (_ipcMain, _logger, channel, handler) => handlers.set(channel, handler),
+    ipcMain: { on() {} },
+    logger: { recent: () => [] },
+    IS_DEV_PROFILE: false,
+    runtimeHost: { cancelActiveTurns: () => "cancelled" },
+  });
+  const runtimeAction = handlers.get("launcher:cancel-turns")();
+  const plainAction = handlers.get("launcher:logs")(null, 5);
+  let runtimeSettled = false;
+  void runtimeAction.then(() => { runtimeSettled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(await plainAction, [], "non-runtime channels must not wait for the startup boundary");
+  assert.equal(runtimeSettled, false, "runtime channels must wait for the startup boundary");
+  let startupSettled = false;
+  void captured.runtimeStartup.then(() => { startupSettled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(startupSettled, false, "the startup boundary must stay pending until startup settles it");
+  captured.finishRuntimeStartup();
+  assert.equal(await runtimeAction, "cancelled");
+  assert.equal(startupSettled, true, "the startup boundary must settle once startup finishes");
+  const devFullChain = electronMain.indexOf(".finally(finishRuntimeStartup)", electronMain.indexOf('if (config?.mode === "full") {'));
+  const devSkipSettle = electronMain.indexOf(".finally(finishRuntimeStartup)", electronMain.indexOf("} else {", devFullChain));
+  const productionChain = electronMain.indexOf(".finally(finishRuntimeStartup)", electronMain.indexOf("} else void (async () => {"));
+  assert.ok(devFullChain > 0 && devFullChain < electronMain.indexOf("} else {", devFullChain), "the DEV managed-runtime start must settle the boundary");
+  assert.ok(devSkipSettle > 0 && devSkipSettle < productionChain, "the DEV no-runtime branch must settle the boundary");
+  assert.ok(productionChain > 0, "the managed-runtime startup chain must settle the boundary");
+  assert.equal(electronMain.split(".finally(finishRuntimeStartup)").length - 1, 3, "each startup daemon path must settle the boundary exactly once");
+  const smokeSettle = electronMain.indexOf("finishRuntimeStartup();", electronMain.indexOf("if (launcherSmokeTest) {"));
+  const fatalSettle = electronMain.indexOf("finishRuntimeStartup();", electronMain.indexOf("void start().catch("));
+  assert.ok(smokeSettle > 0 && smokeSettle < electronMain.indexOf("const smokeRuntimeRoot"), "the smoke-test skip branch must settle the boundary before it can abort");
+  assert.ok(fatalSettle > 0, "a failed startup must still settle the boundary");
 });
 
 test("completed model setup remains a repeatable capability probe", () => {

@@ -3,11 +3,21 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from "node:fs
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { isWindowsPipeEndpoint } from "../../config";
+import { estimateTokens } from "../../lib/token-estimate";
 import {
   CompactionTransactionStore,
   type CompactionTransactionHandle,
 } from "./compaction-transaction";
 import type { ChatGptTurnEnvironment } from "./environment";
+import { chatGptWebTraceHash, emitChatGptWebStructuredTrace } from "./structured-trace";
+import {
+  assertChatGptWebMcpContextTransport,
+  ChatGptWebMcpContextIncompleteError,
+  chatGptWebMcpContextChunk,
+  chatGptWebMcpContextChunks,
+  chatGptWebMcpContextManifest,
+  type ChatGptWebMcpContextTransport,
+} from "./context-transport";
 
 interface PendingTurn extends ChatGptTurnEnvironment {
   expiresAt?: number;
@@ -81,9 +91,43 @@ interface TurnChannel {
   /** Monotonic across activity start/end so a completed request cannot disappear across a fence. */
   activityRevision: number;
   completionCommitted: boolean;
+  recoveryRequested?: TurnReferenceFailureCode;
   completionRevision?: number;
   retirementWaiters: Set<SafeWaiter<void>>;
   batchTimer?: ReturnType<typeof setTimeout>;
+  /** Immutable MCP context transport for this turn (set before binding, never after). */
+  contextTransport?: ChatGptWebMcpContextTransport;
+  /** Model/effort metadata reported with context telemetry; never contains task content. */
+  contextModelId?: string;
+  contextReasoning?: string;
+  /** Wall-clock origin for context-transport elapsedMs telemetry. */
+  contextTransportStartedAt?: number;
+  contextEstimatedTokens?: number;
+  contextTotalChunks?: number;
+  /** Server-side completeness proof: every chunk index served at least once. */
+  contextReadChunks: Set<number>;
+  /** True only when every context chunk was served; execution tools stay locked until then. */
+  contextReadComplete: boolean;
+  /** Set once when the first ordinary execution request is admitted after completeness. */
+  contextExecutionUnlocked: boolean;
+  /** Emit-once guard: a completion commit was rejected because the context was incomplete. */
+  contextCompletionRejectedLogged?: boolean;
+  /**
+   * Task turns unlock ordinary execution after completeness; compaction turns never do — a
+   * compaction is summarization-only and its summary acceptance is fenced on completeness.
+   */
+  contextPurpose: "task" | "compaction";
+  /**
+   * Authoritative forward-progress notification for the adapter's compaction execution stall
+   * deadline. Fired only on a NEW contiguous frontier advance and on the completion transition;
+   * duplicate and out-of-order reads deliver nothing, so a stalled reconstruction can never
+   * extend the caller's stall window. The broker never owns the deadline itself.
+   */
+  contextProgress?: (info: {
+    kind: "chunk" | "complete";
+    contiguousThrough?: number;
+    totalChunks?: number;
+  }) => void;
 }
 
 interface BrokerRequest {
@@ -93,6 +137,8 @@ interface BrokerRequest {
     | "resolve"
     | "release"
     | "invoke"
+    | "context_read"
+    | "owner_set_context"
     | "owner_status"
     | "owner_register"
     | "owner_register_safe"
@@ -111,6 +157,7 @@ interface BrokerRequest {
     | "safe_start"
     | "safe_complete"
     | "activity_complete"
+    | "request_recovery"
     | "submit_compaction_handoff";
   token?: string;
   bindingId?: string;
@@ -122,7 +169,11 @@ interface BrokerRequest {
   ttlMs?: number;
   traceId?: string;
   callId?: string;
+  contextTransport?: ChatGptWebMcpContextTransport | null;
+  contextId?: string;
+  chunk?: number;
   activityId?: string;
+  rejectionTicket?: string;
   revision?: number;
   toolResult?: BrokerToolResult;
   handoffId?: string;
@@ -136,6 +187,63 @@ interface BrokerResponse {
   id: string;
   result?: unknown;
   error?: string;
+  errorCode?: TurnReferenceFailureCode;
+  rejectionTicket?: string;
+}
+
+export type TurnReferenceFailureCode =
+  | "unknown_turn_reference"
+  | "retired_turn_reference"
+  | "turn_reference_invalid_shape";
+
+export class TurnReferenceFailure extends Error {
+  rejectionTicket?: string;
+  constructor(readonly code: TurnReferenceFailureCode, message: string) {
+    super(`${code}: ${message}`);
+    this.name = "TurnReferenceFailure";
+  }
+}
+
+function isTurnReferenceFailureCode(value: unknown): value is TurnReferenceFailureCode {
+  return value === "unknown_turn_reference"
+    || value === "retired_turn_reference"
+    || value === "turn_reference_invalid_shape";
+}
+
+export function classifyTurnReferenceFailureCode(
+  token: string,
+  contract: "native" | "safe",
+  retiredTurn?: string,
+): TurnReferenceFailureCode {
+  if (retiredTurn !== undefined) return "retired_turn_reference";
+  const exactShape = contract === "safe" ? /^request_[A-Za-z0-9_-]{32}$/ : /^turn_[A-Za-z0-9_-]{32}$/;
+  if (exactShape.test(token)) return "unknown_turn_reference";
+  // The production regression that motivated fenced recovery truncated a native turn handle by
+  // exactly one character. It is still an unissued turn reference, not evidence of a malformed
+  // transport envelope. Preserve invalid_shape for genuinely malformed namespace/alphabet input.
+  if (contract === "native" && /^turn_[A-Za-z0-9_-]{31}$/.test(token)) return "unknown_turn_reference";
+  return "turn_reference_invalid_shape";
+}
+
+function turnReferenceFailure(token: string, contract: "native" | "safe", retiredTurn?: string): TurnReferenceFailure {
+  const label = contract === "safe" ? "request_id" : "turn_token";
+  if (retiredTurn !== undefined) {
+    return new TurnReferenceFailure(
+      "retired_turn_reference",
+      `This ${label} was issued for ${retiredTurnLabel(retiredTurn)}, which has already finished. This Codex Native action can no longer run. No native action was executed for this request.`,
+    );
+  }
+  const code = classifyTurnReferenceFailureCode(token, contract);
+  if (code === "turn_reference_invalid_shape") {
+    return new TurnReferenceFailure(
+      "turn_reference_invalid_shape",
+      `The supplied ${label} has an invalid shape. No native action was executed for this request.`,
+    );
+  }
+  return new TurnReferenceFailure(
+    "unknown_turn_reference",
+    `The supplied ${label} was not issued for an active or remembered turn. No native action was executed for this request.`,
+  );
 }
 
 const brokers = new Map<string, TurnBroker>();
@@ -220,6 +328,11 @@ export interface TurnBrokerOwner {
     surfaceNonce: string,
   ): { confirmed: true; duplicate: boolean } | Promise<{ confirmed: true; duplicate: boolean }>;
   nextToolBatch(token: string, signal?: AbortSignal): Promise<BrokerToolRequest[]>;
+  setContextTransport?(
+    token: string,
+    context?: ChatGptWebMcpContextTransport,
+    metadata?: { modelId?: string; reasoning?: string; purpose?: "task" | "compaction" },
+  ): void | Promise<void>;
   completeTool(token: string, callId: string, result: BrokerToolResult): void | Promise<void>;
   waitForSafeStart(token: string, signal?: AbortSignal): Promise<void>;
   waitForSafeCompletion(token: string, signal?: AbortSignal): Promise<string>;
@@ -227,6 +340,11 @@ export interface TurnBrokerOwner {
   compactionDeliveryCount(token: string): number | Promise<number>;
   beginCompletionFence(token: string): number | undefined | Promise<number | undefined>;
   commitCompletionFence(token: string, revision: number): boolean | Promise<boolean>;
+  contextReadSnapshot?(token: string): {
+    chunksRead: number;
+    totalChunks: number;
+    complete: boolean;
+  } | undefined;
   waitForRetirement(token: string, signal?: AbortSignal): Promise<void>;
   revoke(token: string, reason?: Error): void | Promise<void>;
 }
@@ -257,8 +375,12 @@ export class TurnBroker implements TurnBrokerOwner {
   // previous turn's handle" from "this handle never existed".
   private readonly retiredBindings = new Map<string, string>();
   private readonly retiredTokens = new Map<string, string>();
+  /** One-use proof that an unissued reference was rejected. This is not turn ownership. */
+  private readonly referenceRejections = new Map<string, { expiresAt: number; code: TurnReferenceFailureCode }>();
   private acceptingExternalOwners = true;
   private server?: Server;
+  /** On-disk identity of the socket THIS listener created; guards close() unlink. */
+  private socketIdentity?: { dev: number; ino: number };
   private startPromise?: Promise<void>;
   private readonly sockets = new Set<Socket>();
 
@@ -301,6 +423,10 @@ export class TurnBroker implements TurnBrokerOwner {
       deliveredCallIds: new Set(),
       invocations: new Map(),
       waiters: new Set(),
+      contextReadChunks: new Set(),
+      contextReadComplete: false,
+      contextExecutionUnlocked: false,
+      contextPurpose: "task",
       compactionRequested: false,
       compactionDeliveryCount: 0,
       activities: new Set(),
@@ -313,6 +439,15 @@ export class TurnBroker implements TurnBrokerOwner {
     this.pending.set(token, channel);
     console.info(`[chatgpt-web] broker trace=${traceId} registered tokenHash=${handleFingerprint(token)}`);
     return token;
+  }
+
+  /** Owner-only readback. A recovery request is never authorization for a native tool call. */
+  consumeRecoveryRequest(token: string): TurnReferenceFailureCode | undefined {
+    const channel = this.channels.get(token);
+    if (!channel?.completionCommitted || !channel.recoveryRequested) return undefined;
+    const reason = channel.recoveryRequested;
+    channel.recoveryRequested = undefined;
+    return reason;
   }
 
   async registerSafe(
@@ -375,6 +510,69 @@ export class TurnBroker implements TurnBrokerOwner {
         ? { expiresAt: channel.environment.expiresAt }
         : {}),
     };
+  }
+
+  async setContextTransport(
+    token: string,
+    context?: ChatGptWebMcpContextTransport,
+    metadata?: {
+      modelId?: string;
+      reasoning?: string;
+      purpose?: "task" | "compaction";
+      onContextProgress?: (info: {
+        kind: "chunk" | "complete";
+        contiguousThrough?: number;
+        totalChunks?: number;
+      }) => void;
+    },
+  ): Promise<void> {
+    this.prune();
+    const channel = this.channels.get(token);
+    if (!channel) throw new Error("turn token is invalid or expired");
+    if (channel.bindingId) {
+      emitChatGptWebStructuredTrace("mcp_context_rebind_rejected", {
+        traceId: channel.traceId,
+        boundContextIdHash: channel.contextTransport
+          ? chatGptWebTraceHash(channel.contextTransport.contextId)
+          : undefined,
+        attemptedContextIdHash: context ? chatGptWebTraceHash(context.contextId) : undefined,
+      }, "warning");
+      throw new Error("Codex MCP context transport cannot change after the turn is already bound");
+    }
+    if (context === undefined) {
+      delete channel.contextTransport;
+      delete channel.contextProgress;
+      return;
+    }
+    channel.contextTransport = assertChatGptWebMcpContextTransport(context);
+    channel.contextModelId = metadata?.modelId;
+    channel.contextReasoning = metadata?.reasoning;
+    channel.contextPurpose = metadata?.purpose === "compaction" ? "compaction" : "task";
+    channel.contextProgress = metadata?.onContextProgress;
+    channel.contextTransportStartedAt = Date.now();
+    channel.contextEstimatedTokens = estimateTokens(channel.contextTransport.text);
+    channel.contextTotalChunks = chatGptWebMcpContextChunks(channel.contextTransport).length;
+    channel.contextReadChunks = new Set();
+    channel.contextReadComplete = false;
+    channel.contextExecutionUnlocked = false;
+    emitChatGptWebStructuredTrace("mcp_context_transport_installed", {
+      traceId: channel.traceId,
+      contextIdHash: chatGptWebTraceHash(channel.contextTransport.contextId),
+      transport: "MCP_CONTEXT",
+      purpose: channel.contextPurpose,
+      chars: channel.contextTransport.chars,
+      bytes: channel.contextTransport.bytes,
+      estimatedTokens: channel.contextEstimatedTokens,
+      chunkChars: channel.contextTransport.chunkChars,
+      totalChunks: channel.contextTotalChunks,
+      ...(channel.contextModelId ? { modelId: channel.contextModelId } : {}),
+      ...(channel.contextReasoning ? { reasoning: channel.contextReasoning } : {}),
+    });
+    console.info(
+      `[chatgpt-web] broker trace=${channel.traceId} mcp_context_transport_installed`
+      + ` transport=MCP_CONTEXT contextIdHash=${chatGptWebTraceHash(channel.contextTransport.contextId)}`
+      + ` chunks=${channel.contextTotalChunks} chars=${channel.contextTransport.chars}`,
+    );
   }
 
   async nextToolBatch(token: string, signal?: AbortSignal): Promise<BrokerToolRequest[]> {
@@ -449,6 +647,18 @@ export class TurnBroker implements TurnBrokerOwner {
     return channel.activityRevision;
   }
 
+  /** Privacy-safe context-transport progress for state-descriptive failure classification. */
+  contextReadSnapshot(token: string): { chunksRead: number; totalChunks: number; complete: boolean } | undefined {
+    this.prune();
+    const channel = this.channels.get(token);
+    if (!channel?.contextTransport) return undefined;
+    return {
+      chunksRead: channel.contextReadChunks.size,
+      totalChunks: chatGptWebMcpContextChunks(channel.contextTransport).length,
+      complete: channel.contextReadComplete,
+    };
+  }
+
   commitCompletionFence(token: string, revision: number): boolean {
     this.prune();
     if (!Number.isSafeInteger(revision) || revision < 0) {
@@ -456,6 +666,21 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
+    // Authoritative context-completeness barrier. A final answer must never commit while the
+    // turn's immutable MCP context is incomplete, regardless of caller: the wire dispatch, the
+    // in-process adapter hook, and every future caller all reach this method.
+    if (channel.contextTransport && !channel.contextReadComplete) {
+      if (!channel.contextCompletionRejectedLogged) {
+        channel.contextCompletionRejectedLogged = true;
+        emitChatGptWebStructuredTrace("mcp_context_completion_rejected", {
+          traceId: channel.traceId,
+          contextIdHash: chatGptWebTraceHash(channel.contextTransport.contextId),
+          totalChunks: chatGptWebMcpContextChunks(channel.contextTransport).length,
+          chunksRead: channel.contextReadChunks.size,
+        }, "warning");
+      }
+      throw new ChatGptWebMcpContextIncompleteError();
+    }
     if (channel.completionCommitted) return channel.completionRevision === revision;
     if (channel.activityRevision !== revision
       || channel.activities.size > 0
@@ -620,6 +845,13 @@ export class TurnBroker implements TurnBrokerOwner {
       deliveredTools: channel.deliveredCallIds.size,
       activeMcpRequests: channel.activities.size,
       completionCommitted: channel.completionCommitted,
+      ...(channel.contextTransport ? {
+        contextTransport: "MCP_CONTEXT",
+        contextTotalChunks: channel.contextTotalChunks,
+        contextChunksRead: channel.contextReadChunks.size,
+        contextReadComplete: channel.contextReadComplete,
+        contextExecutionUnlocked: channel.contextExecutionUnlocked,
+      } : {}),
     })}`);
     this.channels.delete(token);
     this.pending.delete(token);
@@ -740,7 +972,9 @@ export class TurnBroker implements TurnBrokerOwner {
     const server = this.server;
     this.server = undefined;
     this.startPromise = undefined;
-    brokers.delete(this.socketPath);
+    // Failed or late cleanup must not evict a replacement broker's registration: only remove
+    // the registry entry that still points at THIS instance.
+    if (brokers.get(this.socketPath) === this) brokers.delete(this.socketPath);
     for (const socket of [...this.sockets]) socket.destroy();
     this.sockets.clear();
     if (server?.listening) {
@@ -749,9 +983,20 @@ export class TurnBroker implements TurnBrokerOwner {
         else rejectClose(error);
       }));
     }
+    // Only unlink the socket file when the on-disk node is still the one THIS listener created;
+    // a stale or replacement broker must not delete another running connection's socket.
     if (!isWindowsPipeEndpoint(this.socketPath)
-      && existsSync(this.socketPath)
-      && lstatSync(this.socketPath).isSocket()) unlinkSync(this.socketPath);
+      && this.socketIdentity
+      && existsSync(this.socketPath)) {
+      try {
+        const stat = lstatSync(this.socketPath);
+        if (stat.isSocket() && stat.dev === this.socketIdentity.dev && stat.ino === this.socketIdentity.ino) {
+          unlinkSync(this.socketPath);
+        }
+      } catch {
+        // The socket vanished concurrently: nothing to unlink.
+      }
+    }
   }
 
   private start(): Promise<void> {
@@ -783,7 +1028,15 @@ export class TurnBroker implements TurnBrokerOwner {
         });
         server.listen(this.socketPath, () => {
           server.off("error", rejectStart);
-          if (!windowsPipe) chmodSync(this.socketPath, 0o600);
+          if (!windowsPipe) {
+            chmodSync(this.socketPath, 0o600);
+            try {
+              const identity = lstatSync(this.socketPath);
+              this.socketIdentity = { dev: identity.dev, ino: identity.ino };
+            } catch {
+              // Identity capture is best-effort; close() then skips the unlink path.
+            }
+          }
           resolveStart();
         });
       };
@@ -884,7 +1137,13 @@ export class TurnBroker implements TurnBrokerOwner {
       }
       void Promise.resolve().then(() => this.dispatch(request!, disconnected.signal)).then(
         result => this.writeSocketResponse(socket, { id: request!.id, result }),
-        error => this.writeSocketResponse(socket, { id: request!.id, error: errorOf(error).message }),
+        error => this.writeSocketResponse(socket, {
+          id: request!.id,
+          error: errorOf(error).message,
+          ...(error instanceof TurnReferenceFailure ? { errorCode: error.code } : {}),
+          ...(error instanceof TurnReferenceFailure && error.rejectionTicket
+            ? { rejectionTicket: error.rejectionTicket } : {}),
+        }),
       );
     });
   }
@@ -902,13 +1161,30 @@ export class TurnBroker implements TurnBrokerOwner {
     if (!request || typeof request !== "object" || typeof request.id !== "string" || request.id.length === 0 || request.id.length > 256) {
       throw new Error("turn broker request id is invalid");
     }
-    if (!["claim", "resolve", "release", "invoke", "owner_status", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "submit_compaction_handoff"].includes(request.method)) {
+    if (!["claim", "resolve", "release", "invoke", "context_read", "owner_set_context", "owner_status", "owner_register", "owner_register_safe", "owner_update", "owner_safe_sent", "owner_next", "owner_complete", "owner_completion_fence_begin", "owner_completion_fence_commit", "owner_wait_retirement", "owner_revoke", "owner_safe_wait_start", "owner_safe_wait_completion", "owner_request_compaction", "owner_compaction_delivery_count", "safe_start", "safe_complete", "activity_complete", "request_recovery", "submit_compaction_handoff"].includes(request.method)) {
       throw new Error("turn broker method is invalid");
     }
   }
 
   private async dispatch(request: BrokerRequest, socketSignal?: AbortSignal): Promise<unknown> {
     this.prune();
+    if (request.method === "request_recovery") {
+      const token = request.token;
+      if (typeof token !== "string" || token.length === 0) throw new Error("turn_token is required");
+      const channel = this.channels.get(token);
+      if (!channel || channel.completionCommitted) {
+        throw turnReferenceFailure(token, "native", this.retiredTokens.get(token) ?? (channel?.completionCommitted ? channel.traceId : undefined));
+      }
+      const ticket = request.rejectionTicket;
+      if (typeof ticket !== "string" || !/^rejection_[A-Za-z0-9_-]{32}$/.test(ticket)
+        || (this.referenceRejections.get(ticket)?.expiresAt ?? 0) < Date.now()) {
+        throw new Error("turn_reference_recovery_evidence_unavailable: a broker rejection ticket is required");
+      }
+      const rejection = this.referenceRejections.get(ticket)!;
+      this.referenceRejections.delete(ticket);
+      channel.recoveryRequested = rejection.code;
+      return { accepted: true };
+    }
     if (request.method === "safe_start") {
       if (!request.token) throw new Error("Zero Risk request_id is required");
       return this.startSafeTurn(request.token);
@@ -938,7 +1214,7 @@ export class TurnBroker implements TurnBrokerOwner {
       return { submitted: true };
     }
     if (request.method === "owner_status") {
-      return { protocolVersion: 5, acceptingExternalOwners: this.acceptingExternalOwners };
+      return { protocolVersion: 6, acceptingExternalOwners: this.acceptingExternalOwners };
     }
     if (request.method === "owner_register") {
       const environment = ownerEnvironment(request.environment);
@@ -964,6 +1240,15 @@ export class TurnBroker implements TurnBrokerOwner {
     if (request.method === "owner_update") {
       if (!request.token) throw new Error("turn owner token is required");
       this.updateEnvironment(request.token, ownerEnvironment(request.environment));
+      return { updated: true };
+    }
+    if (request.method === "owner_set_context") {
+      if (!request.token) throw new Error("turn owner token is required");
+      const context = request.contextTransport;
+      if (context !== null && context !== undefined && (typeof context !== "object" || Array.isArray(context))) {
+        throw new Error("turn owner context transport is invalid");
+      }
+      await this.setContextTransport(request.token, context ?? undefined);
       return { updated: true };
     }
     if (request.method === "owner_safe_sent") {
@@ -993,6 +1278,8 @@ export class TurnBroker implements TurnBrokerOwner {
       if (!Number.isSafeInteger(request.revision) || request.revision! < 0) {
         throw new Error("turn completion fence revision is invalid");
       }
+      // Context-completeness enforcement lives inside commitCompletionFence so wire and in-process
+      // callers cannot diverge.
       return { committed: this.commitCompletionFence(request.token, request.revision!) };
     }
     if (request.method === "owner_wait_retirement") {
@@ -1037,10 +1324,14 @@ export class TurnBroker implements TurnBrokerOwner {
         + `${activeChannel ? "" : `, retiredTurn=${retiredTurn ?? "unknown"}`})`,
       );
       if (!activeChannel) {
-        throw new Error(retiredTurn !== undefined
-          ? `${contract === "safe" ? "This request_id" : "This turn_token"} was issued for ${retiredTurnLabel(retiredTurn)}, which has already finished.`
-          + " This Codex Native action can no longer run."
-          : `${contract === "safe" ? "request id" : "turn token"} is invalid, expired, or revoked`);
+        const failure = turnReferenceFailure(token, contract, retiredTurn);
+        if (failure.code !== "retired_turn_reference" && contract === "native") {
+          const ticket = opaqueId("rejection");
+          this.referenceRejections.set(ticket, { expiresAt: Date.now() + 5 * 60_000, code: failure.code });
+          failure.rejectionTicket = ticket;
+          failure.message += ` rejection_ticket=${ticket}`;
+        }
+        throw failure;
       }
       if (activeChannel.safe) {
         if (contract !== "safe") throw new Error("Zero Risk request id requires the Zero Risk MCP contract");
@@ -1075,13 +1366,27 @@ export class TurnBroker implements TurnBrokerOwner {
         if (!existing || existing.token !== token || existing.channel !== activeChannel) {
           throw new Error("turn token binding state is inconsistent");
         }
-        return { bindingId: activeChannel.bindingId, activityId, environment: activeChannel.environment };
+        return {
+          bindingId: activeChannel.bindingId,
+          activityId,
+          environment: activeChannel.environment,
+          ...(activeChannel.contextTransport
+            ? { contextTransport: chatGptWebMcpContextManifest(activeChannel.contextTransport) }
+            : {}),
+        };
       }
       this.pending.delete(token);
       const bindingId = opaqueId("binding");
       activeChannel.bindingId = bindingId;
       this.bindings.set(bindingId, { token, channel: activeChannel });
-      return { bindingId, activityId, environment: activeChannel.environment };
+      return {
+        bindingId,
+        activityId,
+        environment: activeChannel.environment,
+        ...(activeChannel.contextTransport
+          ? { contextTransport: chatGptWebMcpContextManifest(activeChannel.contextTransport) }
+          : {}),
+      };
     }
 
     const bindingId = request.bindingId;
@@ -1127,6 +1432,140 @@ export class TurnBroker implements TurnBrokerOwner {
     }
     if (request.method === "resolve") return { environment: binding.channel.environment };
     this.assertSafeHarnessRunning(binding.channel);
+    // The reserved read-only context retrieval is the ONLY operation allowed while the MCP
+    // context is incomplete; every execution tool call is rejected until the broker proves the
+    // full immutable context was reconstructed.
+    if (request.method === "context_read") {
+      const context = binding.channel.contextTransport;
+      if (!context) {
+        emitChatGptWebStructuredTrace("mcp_context_read_rejected", {
+          traceId: binding.channel.traceId,
+          reason: "context_unavailable",
+        }, "warning");
+        throw new Error("Codex MCP context is unavailable for this turn");
+      }
+      if (typeof request.contextId !== "string" || request.contextId.length === 0) {
+        emitChatGptWebStructuredTrace("mcp_context_read_rejected", {
+          traceId: binding.channel.traceId,
+          contextIdHash: chatGptWebTraceHash(context.contextId),
+          reason: "context_id_required",
+        }, "warning");
+        throw new Error("Codex MCP context id is required");
+      }
+      if (!Number.isSafeInteger(request.chunk) || request.chunk! < 0) {
+        emitChatGptWebStructuredTrace("mcp_context_read_rejected", {
+          traceId: binding.channel.traceId,
+          contextIdHash: chatGptWebTraceHash(context.contextId),
+          reason: "invalid_chunk",
+        }, "warning");
+        throw new Error("Codex MCP context chunk is invalid");
+      }
+      let chunk: ReturnType<typeof chatGptWebMcpContextChunk>;
+      try {
+        chunk = chatGptWebMcpContextChunk(context, request.contextId, request.chunk!);
+      } catch (error) {
+        emitChatGptWebStructuredTrace("mcp_context_read_rejected", {
+          traceId: binding.channel.traceId,
+          contextIdHash: chatGptWebTraceHash(request.contextId),
+          chunk: request.chunk,
+          totalChunks: chatGptWebMcpContextChunks(context).length,
+          reason: /does not match/.test(error instanceof Error ? error.message : String(error))
+            ? "context_id_mismatch"
+            : "chunk_out_of_range",
+        }, "warning");
+        throw error;
+      }
+      const duplicateRead = binding.channel.contextReadChunks.has(request.chunk!);
+      let contiguousBefore = 0;
+      while (binding.channel.contextReadChunks.has(contiguousBefore)) contiguousBefore += 1;
+      binding.channel.contextReadChunks.add(request.chunk!);
+      let contiguousThrough = contiguousBefore;
+      while (binding.channel.contextReadChunks.has(contiguousThrough)) contiguousThrough += 1;
+      const frontierAdvanced = contiguousThrough > contiguousBefore;
+      // Only NEW contiguous context progress refreshes the channel lease: legitimate sequential
+      // reconstruction keeps the outer turn alive, while duplicate rereads and stalled frontiers
+      // cannot extend it indefinitely. Bounded by the finite chunk count.
+      if (frontierAdvanced && binding.channel.environment.expiresAt !== undefined) {
+        binding.channel.environment.expiresAt = Math.max(
+          binding.channel.environment.expiresAt,
+          Date.now() + 600_000,
+        );
+      }
+      const wasComplete = binding.channel.contextReadComplete;
+      const totalChunks = chatGptWebMcpContextChunks(context).length;
+      binding.channel.contextReadComplete = binding.channel.contextReadChunks.size >= totalChunks;
+      // Authoritative forward-progress notification for the adapter's compaction execution stall
+      // deadline — the same discrimination as the lease refresh above: a new contiguous frontier
+      // is meaningful progress, the completion transition starts the next phase budget, and
+      // duplicate or out-of-order reads deliver nothing. A notification failure must never fail
+      // the read itself.
+      if (binding.channel.contextProgress
+        && (frontierAdvanced || (binding.channel.contextReadComplete && !wasComplete))) {
+        try {
+          if (frontierAdvanced) {
+            binding.channel.contextProgress({ kind: "chunk", contiguousThrough, totalChunks });
+          }
+          if (binding.channel.contextReadComplete && !wasComplete) {
+            binding.channel.contextProgress({ kind: "complete", totalChunks });
+          }
+        } catch {
+          // Deadline re-arming is best-effort; the served chunk result is unaffected.
+        }
+      }
+      const elapsedMs = binding.channel.contextTransportStartedAt === undefined
+        ? undefined
+        : Math.max(0, Date.now() - binding.channel.contextTransportStartedAt);
+      emitChatGptWebStructuredTrace("mcp_context_chunk_read", {
+        traceId: binding.channel.traceId,
+        contextIdHash: chatGptWebTraceHash(context.contextId),
+        chunkIndex: request.chunk,
+        chunk: request.chunk,
+        totalChunks,
+        chunkChars: chunk.text.length,
+        chars: chunk.text.length,
+        contiguousThrough,
+        contextReadComplete: binding.channel.contextReadComplete,
+        complete: binding.channel.contextReadComplete,
+        ...(duplicateRead ? { duplicateRead: true } : {}),
+        ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+      });
+      if (binding.channel.contextReadComplete && !wasComplete) {
+        emitChatGptWebStructuredTrace("mcp_context_complete", {
+          traceId: binding.channel.traceId,
+          contextIdHash: chatGptWebTraceHash(context.contextId),
+          transport: "MCP_CONTEXT",
+          totalChunks,
+          chars: context.chars,
+          bytes: context.bytes,
+          estimatedTokens: binding.channel.contextEstimatedTokens,
+          ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+        });
+        console.info(
+          `[chatgpt-web] broker trace=${binding.channel.traceId} mcp_context_complete`
+          + ` totalChunks=${totalChunks} chars=${context.chars} elapsedMs=${elapsedMs ?? "unknown"}`,
+        );
+      }
+      console.info(
+        `[chatgpt-web] broker trace=${binding.channel.traceId} mcp_context_chunk_read`
+        + ` chunk=${request.chunk} total=${totalChunks}`
+        + ` complete=${binding.channel.contextReadComplete}`
+        + (duplicateRead ? " duplicateRead=true" : ""),
+      );
+      return structuredClone(chunk);
+    }
+    if (binding.channel.contextTransport && !binding.channel.contextReadComplete) {
+      emitChatGptWebStructuredTrace("mcp_context_execution_rejected", {
+        traceId: binding.channel.traceId,
+        contextIdHash: chatGptWebTraceHash(binding.channel.contextTransport.contextId),
+        totalChunks: chatGptWebMcpContextChunks(binding.channel.contextTransport).length,
+        chunksRead: binding.channel.contextReadChunks.size,
+        wireName: request.wireName,
+      }, "warning");
+      throw new Error(
+        "Codex execution is locked until every MCP context chunk has been read"
+        + ` (contextId=${binding.channel.contextTransport.contextId})`,
+      );
+    }
     if (binding.channel.compactionRequested) {
       const result = binding.channel.compactionResult;
       if (!result) throw new Error("Codex context compaction control result is unavailable");
@@ -1139,6 +1578,34 @@ export class TurnBroker implements TurnBrokerOwner {
 
     const wireName = request.wireName?.trim();
     if (!wireName) throw new Error("wire tool name is required");
+    // Compaction turns are summarization-only: no ordinary execution unlocks, even after the
+    // context completed. Only the reserved read-only retrieval and the summary generation exist.
+    if (binding.channel.contextPurpose === "compaction") {
+      emitChatGptWebStructuredTrace("mcp_context_execution_rejected", {
+        traceId: binding.channel.traceId,
+        contextIdHash: chatGptWebTraceHash(binding.channel.contextTransport!.contextId),
+        totalChunks: chatGptWebMcpContextChunks(binding.channel.contextTransport!).length,
+        chunksRead: binding.channel.contextReadChunks.size,
+        reason: "compaction_execution_locked",
+        wireName,
+      }, "warning");
+      throw new Error("Codex MCP context execution is locked for compaction turns");
+    }
+    // The auditable boundary: an ordinary Full-harness tool call is admitted only here, after the
+    // broker proved every context chunk was read. Emitted exactly once per MCP context turn.
+    if (binding.channel.contextTransport && !binding.channel.contextExecutionUnlocked) {
+      binding.channel.contextExecutionUnlocked = true;
+      emitChatGptWebStructuredTrace("mcp_context_execution_unlocked", {
+        traceId: binding.channel.traceId,
+        contextIdHash: chatGptWebTraceHash(binding.channel.contextTransport.contextId),
+        totalChunks: chatGptWebMcpContextChunks(binding.channel.contextTransport).length,
+        contextReadComplete: true,
+      });
+      console.info(
+        `[chatgpt-web] broker trace=${binding.channel.traceId} mcp_context_execution_unlocked`
+        + ` totalChunks=${chatGptWebMcpContextChunks(binding.channel.contextTransport).length}`,
+      );
+    }
     const callId = opaqueId("call");
     const toolRequest: BrokerToolRequest = {
       callId,
@@ -1214,6 +1681,14 @@ export class TurnBroker implements TurnBrokerOwner {
 
   private prune(): void {
     const now = Date.now();
+    for (const [ticket, rejection] of this.referenceRejections) {
+      if (rejection.expiresAt <= now) this.referenceRejections.delete(ticket);
+    }
+    while (this.referenceRejections.size > 64) {
+      const first = this.referenceRejections.keys().next().value;
+      if (!first) break;
+      this.referenceRejections.delete(first);
+    }
     for (const [token, channel] of this.channels) {
       if (channel.environment.expiresAt === undefined || channel.environment.expiresAt > now) continue;
       this.revoke(token);
@@ -1233,6 +1708,8 @@ export class TurnBrokerTimeoutError extends Error {
     this.name = "TurnBrokerTimeoutError";
   }
 }
+
+export { ChatGptWebMcpContextIncompleteError } from "./context-transport";
 
 export async function callTurnBroker<T>(
   socketPath: string,
@@ -1272,7 +1749,15 @@ export async function callTurnBroker<T>(
       settled = true;
       clearTimeout(timer);
       cleanup();
-      if (response.error) rejectCall(new Error(response.error));
+      if (response.error) {
+        if (isTurnReferenceFailureCode(response.errorCode)) {
+          const failure = new TurnReferenceFailure(response.errorCode, response.error.replace(/^\w+: /, ""));
+          if (response.rejectionTicket && /^rejection_[A-Za-z0-9_-]{32}$/.test(response.rejectionTicket)) {
+            failure.rejectionTicket = response.rejectionTicket;
+          }
+          rejectCall(failure);
+        } else rejectCall(new Error(response.error));
+      }
       else resolveCall(response.result as T);
     };
     const timer = timeoutMs === null
@@ -1306,6 +1791,12 @@ export async function callTurnBroker<T>(
         parsed = JSON.parse(buffered.slice(0, newline)) as BrokerResponse;
       } catch (error) {
         finishError(new Error(`ChatGPT web turn broker returned invalid JSON: ${errorOf(error).message}`));
+        return;
+      }
+      // Strict frame contract: exactly one of result/error must be present. A malformed frame
+      // must fail the call explicitly instead of silently resolving or rejecting on shape.
+      if ((parsed.result === undefined) === (parsed.error === undefined)) {
+        finishError(new Error("ChatGPT web turn broker returned an invalid response frame"));
         return;
       }
       if (parsed.id !== id) {
@@ -1347,12 +1838,20 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
         + ` (${error instanceof Error ? error.message : String(error)})`,
       );
     }
-    if (status.protocolVersion !== 5) {
+    if (status.protocolVersion !== 6) {
       throw new Error(`Unsupported DEV turn-owner protocol version: ${String(status.protocolVersion)}`);
     }
     if (status.acceptingExternalOwners !== true) {
       throw new Error("The running launcher runtime is draining and is not accepting DEV chat turns");
     }
+  }
+
+  async setContextTransport(token: string, context?: ChatGptWebMcpContextTransport): Promise<void> {
+    await callTurnBroker(this.socketPath, {
+      method: "owner_set_context",
+      token,
+      contextTransport: context ?? null,
+    }, null);
   }
 
   async register(environment: ChatGptTurnEnvironment, ttlMs?: number, traceId = "unknown"): Promise<string> {

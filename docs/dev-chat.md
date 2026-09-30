@@ -103,14 +103,16 @@ that ChatGPT will follow them more reliably.
 Both launcher profiles expose **Bigger Context (experimental)** in Settings. It is disabled by
 default. The switch updates the profile's canonical runtime configuration through the normal setup
 transaction; it is not a launcher-only preference. Production setup also rewrites the managed
-Codex model catalog with 3x context and auto-compaction thresholds and asks you to restart Codex.
+Codex model catalog while preserving the selected mode's measured context and auto-compaction
+thresholds, then asks you to restart Codex.
 The DEV CLI reads the same setting from its isolated runtime configuration on each command.
 
-When enabled, a normal turn stays on the original single-message path while its estimated input
-is below the selected mode's existing auto-compaction threshold. At the first threshold it uses two
-messages; at twice that threshold it uses six messages. The final context part also commits the
-transaction and starts the task, so there is no extra request. The existing DEV compaction threshold
-remains three times the selected mode's base limit.
+When enabled, a normal turn stays on the original single-message path while that message fits the
+selected mode's safe browser boundaries. A larger browser payload can use two or six messages when
+needed to keep each physical submission within the measured message and composer limits. The final
+context part also commits the transaction and starts the task, so there is no extra request. Every
+part remains in one ChatGPT conversation, and the cumulative transcript must stay inside the
+selected mode's existing model context and auto-compaction limits.
 
 Each stage contains complete semantic records, never a raw JSON string cut in the middle. The model
 must return an exact transaction-bound SHA-256 acknowledgement before the next part is sent.
@@ -132,15 +134,17 @@ starts one read-only fallback chat from the canonical Codex history instead. Bro
 has no retained MCP boundary and uses the six-message compaction path so its summarizer receives
 the complete expanded history.
 
-Any missing or malformed acknowledgement fails the whole transaction. No later part or final
-commit is sent, and a retry starts again from part one in a fresh Temporary Chat. The model context
-and auto-compaction ceilings are reported as 3× while the switch is active, but every individual
-stage must still fit the selected ChatGPT mode's measured one-message boundary.
+Any missing or malformed acknowledgement fails the transaction and no later part or final commit
+is sent. Each inert stage is durably marked as sent before its physical Send and acknowledged only
+after the exact acknowledgement is observed. An ambiguous failure after a stage Send therefore
+fails closed instead of replaying that stage; only a proven pre-Send failure or explicit provider
+rejection can take a safe retry path. Every individual stage must fit its measured one-message
+boundary, and every cumulative stage prefix plus the final commit must fit the actual model window.
 
 Small turns use one request. Two-part turns use one inert staging request and one final request;
 six-part turns use five staging requests and one final request. Browser-only compaction also uses
-six parts. Inert stages use the fastest available mode that fits their complete messages; the final
-part uses the selected execution effort. Large turns may increase the probability of
+six parts. Inert stages use the fastest available mode that fits both their complete messages and
+every cumulative prefix; the final part uses the selected execution effort. Large turns may increase the probability of
 rate limits or a temporary account cooldown. The experiment is intentionally unavailable for Luna:
 Luna's later requests still include the accumulated transcript inside the same measured
 28,000-token browser transport budget.

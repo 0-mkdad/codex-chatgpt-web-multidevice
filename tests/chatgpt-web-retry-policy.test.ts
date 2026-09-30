@@ -84,6 +84,32 @@ test("rate-limit circuit honors Retry-After, permits one half-open probe, and ne
   await expect(second).resolves.toMatchObject({ circuitState: "CLOSED", halfOpenProbe: false });
 });
 
+test("default configured=5 still collapses to 1 under an OPEN circuit and restores fully after close", async () => {
+  let now = 20_000;
+  const sleeps: number[] = [];
+  const policy = new ChatGptWebTurnRetryPolicy(30 * 60_000, {
+    now: () => now,
+    random: () => 0.5,
+    sleep: async ms => { sleeps.push(ms); now += ms; },
+  });
+
+  // No pressure: the new default headroom (the hard ceiling itself) passes through untouched.
+  expect(policy.operationalConcurrencyLimit(5, "account")).toBe(5);
+
+  policy.recordRetryableFailure("account:turn", rateLimitError(30_000, true));
+  expect(policy.circuitSnapshot("account")).toMatchObject({ state: "OPEN" });
+  // The 429 guard must cap the new default exactly as it capped the previous ones.
+  expect(policy.operationalConcurrencyLimit(5, "account")).toBe(1);
+
+  const probe = await policy.waitForAttempt("account:turn");
+  expect(probe).toMatchObject({ circuitState: "HALF_OPEN", halfOpenProbe: true });
+  expect(policy.operationalConcurrencyLimit(5, "account")).toBe(5);
+
+  policy.recordSubmissionAccepted("account:turn");
+  expect(policy.circuitSnapshot("account")).toMatchObject({ state: "CLOSED" });
+  expect(policy.operationalConcurrencyLimit(5, "account")).toBe(5);
+});
+
 test("repeated account pressure backs off with 15s/30s/60s cooldowns", async () => {
   let now = 0;
   const sleeps: number[] = [];

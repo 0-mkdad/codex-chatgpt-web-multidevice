@@ -177,7 +177,7 @@ test("a compaction control token cannot claim the ordinary Codex tool environmen
     await expect(callTurnBroker(broker.socketPath, {
       method: "claim",
       token: transaction.token,
-    })).rejects.toThrow("turn token is invalid");
+    })).rejects.toThrow("turn_reference_invalid_shape");
     await callTurnBroker(broker.socketPath, {
       method: "submit_compaction_handoff",
       token: transaction.token,
@@ -320,6 +320,7 @@ test("a completed retained agent returns an exact checkpoint and its browser is 
   const worker = {
     run: async (turn: BrowserTurn): Promise<string> => {
       captured = turn;
+      await turn.onSlotGranted?.();
       const prepared = await turn.prepareResume!();
       expect(prepared.text).toContain("wire_name codex.control.compaction_handoff");
       prepared.release();
@@ -354,6 +355,56 @@ test("a completed retained agent returns an exact checkpoint and its browser is 
   expect(transactionTtl).toBe(MAX_COMPACTION_HANDOFF_TIMEOUT_MS);
 });
 
+test("a deferred slot grant still registers the handoff waiter before the admission check", async () => {
+  const sourceRequest = request(false);
+  const source = new ChatGptTurnSession({
+    mode: "read-only",
+    browser: Promise.resolve("source complete"),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    usageInput: sourceRequest,
+    conversationKey: chatGptConversationKey(sourceRequest, "provider")!,
+    cancel() {},
+  });
+  const broker = {
+    beginCompactionTransaction: async () => ({
+      token: "control_11111111111111111111111111111111",
+      handoffId: "handoff_22222222222222222222222222222222",
+    }),
+    waitForCompactionHandoff: async () => "Deferred admission checkpoint",
+    abortCompactionTransaction() {},
+  } as unknown as TurnBroker;
+  const worker = {
+    run: (turn: BrowserTurn): Promise<string> => {
+      // Mirror the real worker scheduler: onSlotGranted is deferred through the microtask queue,
+      // never invoked synchronously inside run(). The waiter registration chained onto the
+      // admission settlement must still win the ordering over the outer handoff check.
+      return Promise.resolve().then(async () => {
+        await turn.onSlotGranted?.();
+        const prepared = await turn.prepareResume!();
+        prepared.release();
+        return new Promise<string>((_resolve, reject) => {
+          const onAbort = () => reject(new DOMException("retained handoff browser closed", "AbortError"));
+          if (turn.abortSignal?.aborted) onAbort();
+          else turn.abortSignal?.addEventListener("abort", onAbort, { once: true });
+        });
+      });
+    },
+  };
+
+  await expect(requestRetainedCompactionHandoff(
+    worker as never,
+    request(true),
+    source,
+    broker,
+    { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+    "trace_deferred_admission",
+    undefined,
+    60 * 60_000,
+  )).resolves.toBe("Deferred admission checkpoint");
+});
+
 test("completed retained compaction never treats ordinary assistant text as a handoff", async () => {
   const sourceRequest = request(false);
   const source = new ChatGptTurnSession({
@@ -375,7 +426,14 @@ test("completed retained compaction never treats ordinary assistant text as a ha
     abortCompactionTransaction() {},
   } as unknown as TurnBroker;
   const worker = {
-    run: async () => '{"checkpoint":"must never be parsed"}',
+    run: async (turn: BrowserTurn) => {
+      // Realistic admission ordering: prepare runs after the slot grant, so the handoff waiter is
+      // registered before the browser response can settle.
+      await turn.onSlotGranted?.();
+      const prepared = await turn.prepareResume!();
+      prepared.release();
+      return '{"checkpoint":"must never be parsed"}';
+    },
   };
 
   await expect(requestRetainedCompactionHandoff(
@@ -386,6 +444,64 @@ test("completed retained compaction never treats ordinary assistant text as a ha
     { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     "trace_no_text_fallback",
   )).rejects.toThrow("structured handoff missing");
+});
+
+test("a settled browser response without a checkpoint reports the missing handoff immediately", async () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-missing-handoff-"));
+  const broker = TurnBroker.forSocket(defaultBrokerEndpoint(root));
+  const sourceRequest = request(false);
+  const source = new ChatGptTurnSession({
+    mode: "read-only", browser: Promise.resolve("source complete"),
+    physicalSettlement: Promise.resolve(), trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(),
+    usageInput: sourceRequest, conversationKey: chatGptConversationKey(sourceRequest, "provider")!, cancel() {},
+  });
+  const abort = new AbortController();
+  const guard = setTimeout(() => abort.abort(new Error("test observation guard")), 1000);
+  try {
+    await expect(requestRetainedCompactionHandoff(
+      { run: async (turn: BrowserTurn) => {
+        await turn.onSlotGranted?.();
+        return "The requested tool call did not run.";
+      } } as never,
+      request(true), source, broker,
+      { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      "trace_missing_handoff", abort.signal,
+    )).rejects.toMatchObject({ code: "compaction_handoff_missing", retryable: false });
+  } finally {
+    clearTimeout(guard);
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a checkpoint submitted before browser completion wins the terminal response race", async () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-handoff-race-"));
+  const broker = TurnBroker.forSocket(defaultBrokerEndpoint(root));
+  const sourceRequest = request(false);
+  const source = new ChatGptTurnSession({
+    mode: "read-only", browser: Promise.resolve("source complete"),
+    physicalSettlement: Promise.resolve(), trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(),
+    usageInput: sourceRequest, conversationKey: chatGptConversationKey(sourceRequest, "provider")!, cancel() {},
+  });
+  try {
+    await expect(requestRetainedCompactionHandoff(
+      { run: async (turn: BrowserTurn) => {
+        await turn.onSlotGranted?.();
+        const prepared = await turn.prepare();
+        const token = prepared.text.match(/turn_token (control_\w+)/)![1]!;
+        const handoffId = prepared.text.match(/handoff_id (handoff_\w+)/)![1]!;
+        await callTurnBroker(broker.socketPath, { method: "submit_compaction_handoff", token, handoffId, summary: "Exact summary" });
+        prepared.release();
+        return "Checkpoint submitted.";
+      } } as never,
+      request(true), source, broker,
+      { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      "trace_handoff_race",
+    )).resolves.toBe("Exact summary");
+  } finally {
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("retained compaction deadline bounds browser settlement after the control handoff succeeds", async () => {
@@ -410,7 +526,10 @@ test("retained compaction deadline bounds browser settlement after the control h
     abortCompactionTransaction: () => { transactionAborted = true; },
   } as unknown as TurnBroker;
   const worker = {
-    run: async () => new Promise<string>(() => {}),
+    run: async (turn: BrowserTurn) => {
+      await turn.onSlotGranted?.();
+      return new Promise<string>(() => {});
+    },
   };
 
   await expect(requestRetainedCompactionHandoff(
@@ -422,7 +541,10 @@ test("retained compaction deadline bounds browser settlement after the control h
     "trace_deadline",
     undefined,
     25,
-  )).rejects.toThrow("timed out after 25ms");
+  )).rejects.toMatchObject({
+    code: "compaction_handoff_timeout",
+    message: "ChatGPT compaction handoff did not complete within 25ms after browser admission",
+  });
   expect(transactionAborted).toBeTrue();
 });
 
@@ -1051,6 +1173,7 @@ test("adapter compact returns one same-agent handoff and preserves a pre-existin
   await chatGptTurnSessions.find(sourceKey)!.browserOutcome;
 
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    await turn.onSlotGranted?.();
     const prepared = await turn.prepareResume!();
     const binding = controlBinding(prepared.text);
     expect(turn.nativeConnector).toBeTrue();
@@ -1152,6 +1275,7 @@ test("a compact HTTP observer can reconnect without sending a second retained-ch
   const finish = new Promise<void>(resolve => { finishMessage = resolve; });
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
     browserMessages += 1;
+    await turn.onSlotGranted?.();
     const prepared = await turn.prepareResume!();
     const binding = controlBinding(prepared.text);
     prepared.release();
@@ -1226,6 +1350,7 @@ test.each([false, true])("structured compact rebuilds canonical context when its
   let browserStarts = 0;
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
     browserStarts += 1;
+    await turn.onSlotGranted?.();
     expect(turn.requireRetainedConversation).toBeUndefined();
     expect(turn.conversationKey).toBeUndefined();
     expect(turn.compaction).toBeTrue();
@@ -1447,6 +1572,7 @@ test("a timed-out fresh compaction retains its owner until helper cleanup comple
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
     browserStarts += 1;
     fallbackTrace = turn.traceId;
+    await turn.onSlotGranted?.();
     started();
     turn.abortSignal!.addEventListener("abort", () => { cancelled = true; }, { once: true });
     await physicalSettlement;
@@ -1527,6 +1653,7 @@ test.each([false, true])("structured compact rebuild after retained browser loss
   let browserStarts = 0;
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
     browserStarts += 1;
+    await turn.onSlotGranted?.();
     if (turn.requireRetainedConversation) throw chatGptRetainedConversationUnavailableError();
     const prepared = await turn.prepare();
     expect(prepared.text).toContain("Original task");
@@ -1602,6 +1729,7 @@ test("a disappeared retained source cannot leave its fresh compaction rebuild pa
     browserStarts += 1;
     if (turn.requireRetainedConversation) throw chatGptRetainedConversationUnavailableError();
     fallbackTrace = turn.traceId;
+    await turn.onSlotGranted?.();
     return new Promise<string>(resolve => { releaseBrowser = () => resolve("browser cleanup completed"); });
   };
   const events: AdapterEvent[] = [];
@@ -1616,9 +1744,9 @@ test("a disappeared retained source cannot leave its fresh compaction rebuild pa
     expect(browserStarts).toBe(2);
     expect(events.at(-1)).toMatchObject({
       type: "error",
-      code: "compaction_handoff_timeout",
+      code: "compaction_execution_timeout",
       retryable: false,
-      message: "ChatGPT compaction did not fully settle within 25ms",
+      message: "ChatGPT compaction made no progress for 25ms after browser admission",
     });
   } finally {
     releaseBrowser?.();

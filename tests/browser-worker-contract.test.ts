@@ -12,14 +12,17 @@ import { ChatGptRecoveryExhaustedError, ChatGptWebAdapterError, chatGptStoppedTh
 import { CHATGPT_STOPPED_THINKING_LABELS } from "../src/adapters/chatgpt-web/ui-labels";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
-import { parseChatGptEffortSliderState } from "../src/chatgpt-session";
+import { CHATGPT_SEND_BUTTON_SELECTOR, parseChatGptEffortSliderState } from "../src/chatgpt-session";
 import { ChatGptExternalTurnProgress, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import { DEFAULT_CHATGPT_OPERATIONAL_CONCURRENCY, resolveChatGptOperationalConcurrency } from "../src/adapters/chatgpt-web/concurrency";
 import type { CodexProviderConfig } from "../src/types";
 import { compileChatGptWebPrompt, formatChatGptWebMultipartCommit, formatChatGptWebMultipartStage } from "../src/adapters/chatgpt-web/prompt";
-import { estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
-import { estimateTokens } from "../src/lib/token-estimate";
+import { estimateChatGptWebMultipartPrefixTokens, estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
+import { estimateTokens, estimateTokensForTransportValidation } from "../src/lib/token-estimate";
 import { chatGptHtmlToMarkdown } from "../src/adapters/chatgpt-web/markdown";
+import { submittedTurnFailure } from "../src/adapters/chatgpt-web/index";
+import type { ChatGptTurnSession } from "../src/adapters/chatgpt-web/turn-execution";
+import { classifyChatGptBrowserDiagnosticError } from "../src/adapters/chatgpt-web/browser-worker";
 
 function personalizedTemporaryChatRole(
   _role: string,
@@ -103,6 +106,7 @@ test("submission DOM tracks logical identities and retains virtualized history i
   ];
   const observers: (() => void)[] = [];
   const element = (turn: Turn, container: boolean) => ({
+    closest: () => null,
     getAttribute: (name: string) => ({
       "data-turn-id": container ? null : turn.id,
       "data-turn-id-container": turn.id,
@@ -170,6 +174,55 @@ test("assistant tracking rebinds only one proven replacement after React detache
     "conversation-turn-2",
     ["conversation-turn-1", "conversation-turn-3", "conversation-turn-4"],
   )).toThrow("2 new conversation turns");
+});
+
+test("power turn identity separates roles and keeps virtualized groups in the submission baseline", async () => {
+  const { createWindow } = require("@mixmark-io/domino");
+  const window = createWindow('<div data-turn-id-container="legacy"><section data-testid="conversation-turn-0" data-turn="assistant" data-turn-id="legacy"></section></div><div data-turn-key="history"></div><div data-turn-key="previous"><div data-user-message-bubble></div><h4 data-conversation-role="assistant"></h4><div data-turn-id-container="search-only"><section data-testid="conversation-turn-search" data-turn="assistant"><div data-message-author-role="assistant"></div></section></div></div>');
+  const observers: (() => void)[] = [];
+  const context = createContext({
+    performance: { timeOrigin: 1 },
+    document: {
+      documentElement: window.document.documentElement,
+      querySelectorAll: (selector: string) => Array.from(window.document.querySelectorAll(selector)),
+    },
+    MutationObserver: class {
+      constructor(callback: () => void) { observers.push(callback); }
+      observe(_element: unknown, options: { attributeFilter: string[] }) {
+        expect(options.attributeFilter).toContain("data-turn-key");
+        expect(options.attributeFilter).toContain("data-conversation-role");
+      }
+    },
+  });
+  const page = {
+    evaluate: async (callback: Function, options: unknown) => runInContext(`(${callback.toString()})`, context)(options),
+    locator: () => ({}),
+  } as unknown as Page;
+  const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+  const baseline = await worker.captureSubmissionBaseline(page);
+  expect(Array.from(baseline.initialTurnIdentities)).toEqual([
+    "legacy", "group:user:history", "group:assistant:history", "group:user:previous", "group:assistant:previous",
+  ]);
+  window.document.querySelector('[data-turn-key="history"]').innerHTML = '<div data-user-message-bubble></div><h4 data-conversation-role="assistant"></h4>';
+  observers.forEach(notify => notify());
+  expect(await worker.currentSubmissionEvidence(page, baseline)).toBeUndefined();
+  const next = window.document.createElement("div");
+  next.setAttribute("data-turn-key", "next");
+  next.innerHTML = '<div data-user-message-bubble></div>';
+  window.document.body.appendChild(next);
+  observers.forEach(notify => notify());
+  expect(await worker.currentSubmissionEvidence(page, baseline)).toBe("user_turn");
+  expect(chatGptNewTurnIdentity(baseline.initialTurnIdentities, (await worker.submissionDomState(page)).responseIdentities)).toBeUndefined();
+  next.innerHTML += '<h4 data-conversation-role="assistant"></h4>';
+  observers.forEach(notify => notify());
+  expect(chatGptNewTurnIdentity(baseline.initialTurnIdentities, (await worker.submissionDomState(page)).responseIdentities)).toBe("group:assistant:next");
+  window.document.body.appendChild(next.cloneNode(true));
+  observers.forEach(notify => notify());
+  await expect(worker.submissionDomState(page)).rejects.toThrow("duplicate conversation turn identities");
+  window.document.body.lastChild.remove();
+  next.setAttribute("data-turn-key", "");
+  observers.forEach(notify => notify());
+  await expect(worker.submissionDomState(page)).rejects.toThrow("no stable data-turn-key");
 });
 
 test("response caching rechecks CSS visibility without requiring a DOM mutation", async () => {
@@ -472,14 +525,21 @@ test("parallel CDP recoveries are bounded without serializing healthy browser tu
 });
 
 test("operational concurrency modes remain below the hard five-tab ceiling", () => {
-  expect(DEFAULT_CHATGPT_OPERATIONAL_CONCURRENCY).toBe(2);
-  expect(resolveChatGptOperationalConcurrency(undefined)).toBe(2);
+  // The default is the hard ceiling itself: parent + 4 subagents in parallel.
+  expect(DEFAULT_CHATGPT_OPERATIONAL_CONCURRENCY).toBe(5);
+  expect(resolveChatGptOperationalConcurrency(undefined)).toBe(5);
   expect(resolveChatGptOperationalConcurrency("safe")).toBe(1);
   expect(resolveChatGptOperationalConcurrency("balanced")).toBe(2);
   expect(resolveChatGptOperationalConcurrency("aggressive")).toBe(3);
   expect(resolveChatGptOperationalConcurrency("maximum")).toBe(5);
+  expect(resolveChatGptOperationalConcurrency("5")).toBe(5);
   expect(resolveChatGptOperationalConcurrency("4")).toBe(4);
+  // Named modes and explicit numerics must keep overriding the new default.
+  expect(resolveChatGptOperationalConcurrency("2")).toBe(2);
+  expect(resolveChatGptOperationalConcurrency(" 3 ")).toBe(3);
   expect(() => resolveChatGptOperationalConcurrency("6")).toThrow("must be safe, balanced, aggressive, maximum, or 1-5");
+  expect(() => resolveChatGptOperationalConcurrency("0")).toThrow("must be safe, balanced, aggressive, maximum, or 1-5");
+  expect(() => resolveChatGptOperationalConcurrency("-1")).toThrow("must be safe, balanced, aggressive, maximum, or 1-5");
 });
 
 test("browser turns have no absolute deadline unless one is explicitly configured", () => {
@@ -751,6 +811,16 @@ test("Luna turns without a retained conversation never send connector identity a
   expect(runExclusive.slice(connectorIdentity - 260, connectorIdentity)).toContain("turn.nativeConnector");
 });
 
+test("chat preparation preserves page-read and composer errors instead of reporting an expired login", async () => {
+  const prepare = (ChatGptBrowserWorker.prototype as unknown as {
+    prepareChatSurface(page: unknown): Promise<unknown>;
+  }).prepareChatSurface;
+  for (const error of [new ChatGptBrowserObservationTimeoutError(5_000), new Error("ChatGPT composer is unavailable")]) {
+    const page = { url: () => "https://chatgpt.com/?temporary-chat=true" };
+    await expect(prepare.call({ activeComposer: async () => { throw error; } }, page)).rejects.toBe(error);
+  }
+});
+
 test("a stalled DOM observation fails within its probe budget", async () => {
   expect(CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS).toBe(5_000);
   expect(MAX_CHATGPT_BROWSER_PAGE_REBINDS).toBe(2);
@@ -832,7 +902,7 @@ test("an accepted Full-mode send survives one stalled DOM probe and a later MCP 
     press: async () => { lifecycle.push("keypress"); sendPresses += 1; },
   };
   const composer = {
-    locator: () => ({ getByTestId: () => sendButton }),
+    locator: () => ({ locator: (selector: string) => { expect(selector).toBe(CHATGPT_SEND_BUTTON_SELECTOR); return sendButton; } }),
   };
   worker.activeComposer = async () => composer;
 
@@ -954,7 +1024,7 @@ test("Bigger Context send activation keeps the outer stage budget instead of res
     },
   };
   worker.activeComposer = async () => ({
-    locator: () => ({ getByTestId: () => sendButton }),
+    locator: () => ({ locator: (selector: string) => { expect(selector).toBe(CHATGPT_SEND_BUTTON_SELECTOR); return sendButton; } }),
   });
   worker.waitForSubmissionAcceptedWithRecovery = async () => "user_turn";
 
@@ -999,7 +1069,7 @@ test("two-part saved chats re-prove unchanged effort after the first message cre
     activeComposer: async () => composer,
     selectModelAndEffort: async () => {
       selections.push(url);
-      return { ...resolveChatGptWebMultipartStagingMode(CHATGPT_WEB_MODEL_ID, capabilities, 100, 100),
+      return { ...resolveChatGptWebMultipartStagingMode(CHATGPT_WEB_MODEL_ID, capabilities, 100, 100, 2),
         selection: { url, label: "Instant" } };
     },
     captureSubmissionBaseline: async () => ({}),
@@ -1239,7 +1309,7 @@ test("missing-assistant expiry checks fresh DOM after a delayed wake while prese
   } as unknown as Page;
   const realDateNow = Date.now;
   try {
-    for (const scenario of ["appeared", "missing", "turn-deadline"] as const) {
+    for (const scenario of ["appeared", "missing", "turn-deadline", "running", "stopped"] as const) {
       let now = 1_000;
       Date.now = () => now;
       const worker = ChatGptBrowserWorker.forProvider({
@@ -1260,11 +1330,14 @@ test("missing-assistant expiry checks fresh DOM after a delayed wake while prese
         return {
           turnIdentities: ["conversation-turn-user", "conversation-turn-assistant"],
           userIdentities: ["conversation-turn-user"],
-          responseIdentities: waits > 0 && scenario !== "missing" ? ["conversation-turn-assistant"] : [],
+          responseIdentities: waits > (scenario === "running" ? 1 : 0)
+            && scenario !== "missing" && scenario !== "stopped" ? ["conversation-turn-assistant"] : [],
+          visibleStopButtonCount: scenario === "running" || scenario === "turn-deadline"
+            || (scenario === "stopped" && waits === 0) ? 1 : 0,
         };
       };
       worker.waitForTurnDomOrExternalProgress = async () => {
-        if (++waits > 1) throw new Error("missing response was allowed to wait past its grace");
+        if (++waits > (scenario === "running" ? 2 : 1)) throw new Error("missing response was allowed to wait past its grace");
         // Renderer or scheduler resumes after the response grace with a newly rendered turn.
         now += CHATGPT_RESPONSE_DOM_GRACE_MS + 1;
       };
@@ -1273,15 +1346,15 @@ test("missing-assistant expiry checks fresh DOM after a delayed wake while prese
         { initialTurnIdentities: [], domCache: {} },
         scenario === "turn-deadline" ? now + CHATGPT_RESPONSE_DOM_GRACE_MS : undefined,
       );
-      if (scenario === "appeared") {
+      if (scenario === "appeared" || scenario === "running") {
         await expect(result).resolves.toMatchObject({ identity: "conversation-turn-assistant", locator: assistantLocator });
       } else {
-        await expect(result).rejects.toThrow(scenario === "missing"
+        await expect(result).rejects.toThrow(scenario === "missing" || scenario === "stopped"
           ? "ChatGPT accepted the message but did not expose its assistant turn in the DOM"
           : "ChatGPT web turn timed out");
       }
-      expect(observations).toBe(scenario === "turn-deadline" ? 1 : 2);
-      expect(waits).toBe(1);
+      expect(observations).toBe(scenario === "turn-deadline" ? 1 : scenario === "running" ? 3 : 2);
+      expect(waits).toBe(scenario === "running" ? 2 : 1);
     }
   } finally {
     Date.now = realDateNow;
@@ -1521,6 +1594,39 @@ test("prompt insertion stops before touching the composer when its stage is alre
   expect(resolvedComposer).toBeFalse();
 });
 
+test("selected connector identity does not depend on its visible pill text", async () => {
+  const { createDocument } = require("@mixmark-io/domino");
+  const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+  worker.config = { appName: "Codex Native2" };
+  const selected = async (html: string) => {
+    const document = createDocument(`<div id="composer">${html}</div>`);
+    const composer = {
+      locator: (selector: string) => ({
+        filter: (options: { hasText?: string; visible?: boolean }) => ({
+          evaluateAll: async (read: (elements: Element[]) => unknown) => read(
+            Array.from(document.querySelectorAll(selector) as NodeListOf<Element>)
+              .filter(element => !options.visible || !element.hasAttribute("hidden"))
+              .filter(element => !options.hasText || element.textContent?.includes(options.hasText)),
+          ),
+        }),
+      }),
+    };
+    return worker.connectorIsSelected(composer);
+  };
+  const pill = '<span data-id="plugin:configured" data-keyword="Codex Native2">表示名</span>';
+  expect(await selected(pill)).toBeTrue();
+  expect(await selected('<span data-id="plugin:other" data-keyword="Other">Codex Native2</span>')).toBeFalse();
+  expect(await selected('<span data-id="unrelated" data-keyword="Codex Native2">Codex Native2</span>')).toBeFalse();
+  expect(await selected(pill.replace('<span ', '<span hidden '))).toBeFalse();
+  await expect(selected(pill + pill)).rejects.toThrow("duplicate");
+  const powerPill = '<span app-mention-path="app://configured" app-mention-display-name="Codex Native2" contenteditable="false">表示名</span>';
+  expect(await selected(powerPill)).toBeTrue();
+  expect(await selected(powerPill.replace('app://configured', 'https://example.com'))).toBeFalse();
+  expect(await selected(powerPill.replace('contenteditable="false"', 'contenteditable="true"'))).toBeFalse();
+  expect(await selected(powerPill.replace('app-mention-display-name="Codex Native2"', 'app-mention-display-name="Other"'))).toBeFalse();
+  await expect(selected(pill + powerPill)).rejects.toThrow("duplicate");
+});
+
 test("connector selection uses persisted automatic identity and re-resolves the active composer after replacement", async () => {
   const appName = resolveBrowserConfig({
     adapter: "chatgpt-web",
@@ -1685,6 +1791,7 @@ test("repeated connector verification reuses its selected pill before clearing t
     config: { appName: "Codex Native2 DEV" },
     activeComposer: async () => selectedComposer,
     connectorIsSelected: async () => true,
+    attachedPromptText: async () => "",
   }, page, async checkpoint => { checkpoints.push(checkpoint); })).resolves.toBe(selectedComposer);
 
   expect(fillCalls).toBe(0);
@@ -1921,9 +2028,10 @@ for (const captureScreenshots of [false, true]) test(`connector failure persists
     ]);
     expect(checkpoints.at(-1)).toMatchObject({
       traceId: "verify_contract_trace",
-      error: "connector proof failed",
+      errorClassification: { kind: "unclassified_error", name: "Error" },
       state: { composer: { visibleCount: 1, textChars: [6] } },
     });
+    expect(JSON.stringify(checkpoints)).not.toContain("connector proof failed");
     expect(JSON.stringify(checkpoints)).not.toContain("private");
   } finally {
     if (previousCapture === undefined) delete process.env.CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS;
@@ -2524,14 +2632,16 @@ test("image attachment readiness uses exact file tiles and not localized remove-
       expect(role).toBe("group");
       expect(options).toEqual({ name: "codex-input-image-1.png", exact: true });
       return {
+        or() { return this; },
         waitFor: async (state: { state: string; timeout: number }) => {
           expect(state).toEqual({ state: "visible", timeout: 60_000 });
           calls.push(["fileTile", options.name]);
         },
       };
     },
-    getByTestId: (testId: string) => {
-      expect(testId).toBe("send-button");
+    locator: (selector: string) => {
+      if (selector.startsWith(".composer-attachment-surface")) return {};
+      expect(selector).toBe(CHATGPT_SEND_BUTTON_SELECTOR);
       return send;
     },
   };
@@ -2552,7 +2662,7 @@ test("image attachment readiness uses exact file tiles and not localized remove-
   };
   const page = {
     locator: (selector: string) => {
-      if (selector === 'input[data-testid="upload-photos-input"]') return input;
+      if (selector === 'input[data-testid="upload-photos-input"], form[data-chatgpt-composer] input[type="file"][multiple]:not([accept])') return input;
       if (selector === '[role="alert"]') {
         return { allInnerTexts: async () => [] };
       }
@@ -3074,6 +3184,7 @@ test.each([
 test("effort selection stops as soon as ChatGPT reports an expired session", async () => {
   const neverVisible = new Promise<void>(() => {});
   const effortControl = {
+    filter() { return this; },
     last() { return this; },
     waitFor: async () => await neverVisible,
   };
@@ -3125,6 +3236,7 @@ test("effort selection stops as soon as ChatGPT reports an expired session", asy
 test("effort menu waiting stops when ChatGPT reports an expired session", async () => {
   const neverVisible = new Promise<void>(() => {});
   const effortControl = {
+    filter() { return this; },
     last() { return this; },
     waitFor: async () => {},
     getAttribute: async () => "true",
@@ -3196,7 +3308,8 @@ test("effort menu waiting stops when ChatGPT reports an expired session", async 
 
 test("terminal model errors are scoped to the new assistant turn instead of global page alerts", () => {
   const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
-  expect(workerSource).toContain("throwIfChatGptTerminalErrorAlert(responseTurn.locator)");
+  expect(workerSource).toContain("throwIfChatGptTerminalErrorAlert(responseTurn.locator, identity)");
+  expect(workerSource).toContain("throwIfChatGptTerminalErrorAlert(responseTurn.locator, { traceId: turn.traceId })");
   expect(workerSource).not.toContain("throwIfChatGptTerminalErrorAlert(page)");
 });
 
@@ -3367,15 +3480,15 @@ test("browser preflight separates model context from one-message transport limit
     expect(String(error)).toContain("/compact");
   }
 
-  expect(() => assertChatGptWebInputWithinLimits(40_999, 32_807, "gpt-5.6-sol", "low", plus)).not.toThrow();
-  expect(() => assertChatGptWebInputWithinLimits(41_000, 32_808, "gpt-5.6-sol", "low", plus)).toThrow(
+  expect(() => assertChatGptWebInputWithinLimits(40_999, 32_295, "gpt-5.6-sol", "low", plus)).not.toThrow();
+  // V-B: Plus Sol has no per-message token cap; the raw Instant composer boundary still applies.
+  expect(() => assertChatGptWebInputWithinLimits(40_999, 32_296, "gpt-5.6-sol", "low", plus)).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(41_000, 1, "gpt-5.6-sol", "low", plus)).toThrow(
     "41,000-token context window",
   );
-  expect(() => assertChatGptWebInputWithinLimits(89_999, 81_807, "gpt-5.6-sol", "medium", plus)).not.toThrow();
-  expect(() => assertChatGptWebInputWithinLimits(89_999, 81_807, "gpt-5.6-sol", "high", plus)).not.toThrow();
-  expect(() => assertChatGptWebInputWithinLimits(90_000, 81_808, "gpt-5.6-sol", "high", plus)).toThrow(
-    "90,000-token context window",
-  );
+  expect(() => assertChatGptWebInputWithinLimits(89_999, 31_488, "gpt-5.6-sol", "medium", plus)).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(89_999, 31_488, "gpt-5.6-sol", "high", plus)).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(89_999, 31_489, "gpt-5.6-sol", "high", plus)).not.toThrow();
   expect(() => assertChatGptWebInputWithinLimits(100_000, 100_000, "gpt-5.6-sol", "xhigh", pro)).not.toThrow();
   expect(() => assertChatGptWebInputWithinLimits(100_000, 100_000, "gpt-5.6-sol", "max", pro)).not.toThrow();
   expect(() => assertChatGptWebInputWithinLimits(28_000, 19_808, "gpt-5.6-luna", "low", luna)).not.toThrow();
@@ -3383,6 +3496,7 @@ test("browser preflight separates model context from one-message transport limit
     "ChatGPT Free browser transport budget",
   );
 
+  // V-B: raw measured composer boundaries (Instant 211,256; Medium/High 1,048,572).
   expect(() => assertChatGptWebInputWithinLimits(
     1,
     1,
@@ -3420,52 +3534,117 @@ test("browser preflight separates model context from one-message transport limit
 
   expect(() => assertChatGptWebInputWithinLimits(
     111_192,
-    103_000,
+    102_488,
     "gpt-5.6-sol",
     "medium",
     pro,
-    500_000,
+    495_904,
   )).not.toThrow();
   expect(() => assertChatGptWebInputWithinLimits(
-    111_193,
+    111_192,
+    102_489,
+    "gpt-5.6-sol",
+    "medium",
+    pro,
+    495_904,
+  )).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(
+    111_192,
     103_001,
     "gpt-5.6-sol",
     "medium",
     pro,
-    500_000,
+    495_904,
   )).toThrow("103,000-token ChatGPT browser message boundary");
   expect(() => assertChatGptWebInputWithinLimits(
+    111_193,
+    1,
+    "gpt-5.6-sol",
+    "medium",
+    pro,
+    495_904,
+  )).toThrow("111,193-token context window");
+  expect(() => assertChatGptWebInputWithinLimits(
     112_192,
-    104_000,
+    103_488,
     "gpt-5.6-sol",
     "max",
     pro,
-    520_000,
+    495_904,
   )).not.toThrow();
   expect(() => assertChatGptWebInputWithinLimits(
-    112_193,
+    112_192,
+    103_489,
+    "gpt-5.6-sol",
+    "max",
+    pro,
+    495_904,
+  )).not.toThrow();
+  expect(() => assertChatGptWebInputWithinLimits(
+    112_192,
     104_001,
     "gpt-5.6-sol",
     "max",
     pro,
-    520_001,
+    495_904,
   )).toThrow("104,000-token ChatGPT browser message boundary");
-  // Live reasoning-mode HTTP 413 failures occur even below the token budget.
+  expect(() => assertChatGptWebInputWithinLimits(
+    112_193,
+    1,
+    "gpt-5.6-sol",
+    "max",
+    pro,
+    495_904,
+  )).toThrow("112,193-token context window");
+  // V-B: the Pro reasoning composer boundary is the raw measured 500,000 characters.
   for (const effort of ["medium", "high", "xhigh"] as const) {
+    expect(() => assertChatGptWebInputWithinLimits(
+      75_000 + 8_192, 75_000, "gpt-5.6-sol", effort, pro, 495_904,
+    )).not.toThrow();
     expect(() => assertChatGptWebInputWithinLimits(
       75_000 + 8_192, 75_000, "gpt-5.6-sol", effort, pro, 500_000,
     )).not.toThrow();
     expect(() => assertChatGptWebInputWithinLimits(
-      75_000 + 8_192, 75_000, "gpt-5.6-sol", effort, pro, 520_000,
+      75_000 + 8_192, 75_000, "gpt-5.6-sol", effort, pro, 500_001,
     )).toThrow("500,000-character ChatGPT composer boundary");
   }
 });
 
-test("Bigger Context fits mixed-density whole records within both token and composer limits", () => {
+test("MCP context turns validate the small physical message against the Bigger-Context logical window", () => {
+  const plus = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+  // Logical: a ~200k canonical estimate sits inside the 270k Bigger Context window for MCP
+  // context turns whose composer message is only the small bootstrap/manifest. The logical check
+  // consumes the summary's canonical estimate, not the small physical message estimate.
+  expect(() => assertChatGptWebInputWithinLimits(
+    9_626, 2_000, "gpt-5.6-sol", "high", plus, 20_000,
+    { estimatedTokens: 200_000, contextWindow: 270_000 },
+  )).not.toThrow();
+  // Above the Bigger Context logical window the existing compaction-required behavior remains.
+  expect(() => assertChatGptWebInputWithinLimits(
+    9_626, 2_000, "gpt-5.6-sol", "high", plus, 20_000,
+    { estimatedTokens: 270_001, contextWindow: 270_000 },
+  )).toThrow("270,000-token context window");
+  // Inline turns without an MCP context keep the base composer window enforcement.
+  expect(() => assertChatGptWebInputWithinLimits(
+    100_000, 1, "gpt-5.6-sol", "high", plus,
+  )).toThrow("90,000-token context window");
+  // The physical message boundary is unaffected by the logical override: Pro Medium carries a
+  // 103,000-token browser message limit, so a 200k visible-message estimate is rejected even
+  // though the logical window is 270k.
+  const pro = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true };
+  expect(() => assertChatGptWebInputWithinLimits(
+    9_626, 200_000, "gpt-5.6-sol", "medium", pro, 495_904,
+    { estimatedTokens: 200_000, contextWindow: 270_000 },
+  )).toThrow("browser message boundary");
+});
+
+test("Bigger Context fits mixed-density whole records within both safe token and composer limits", () => {
   const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false, experimentalBiggerContext: true };
-  const dense = "a!b@c#d$e%f^g&h*".repeat(3_750);
+  // Fixture sized to stay inside the 70k physical conversation envelope; the dense/sparse byte
+  // symmetry that exercises token-aware stage packing is preserved.
+  const dense = "a!b@c#d$e%f^g&h*".repeat(600);
   const sparse = "x".repeat(dense.length);
-  const whitespace = " ".repeat(450_000);
+  const whitespace = " ".repeat(20_000);
   // Equal byte sizes must not pack two dense records into one oversized stage. Conversely,
   // token-only balancing must not leave all the low-token whitespace in one oversized composer.
   for (const contents of [
@@ -3490,27 +3669,39 @@ test("Bigger Context fits mixed-density whole records within both token and comp
     expect(compiled.trimmedCompactionMessages).toBeUndefined();
 
     const transaction = "ctx_0123456789abcdef0123456789abcdef";
-    const stages = multipart.parts.slice(0, -1).map((payload, index) => (
-      formatChatGptWebMultipartStage(payload, transaction, index + 1, 6).text
+    const stageDetails = multipart.parts.slice(0, -1).map((payload, index) => (
+      formatChatGptWebMultipartStage(payload, transaction, index + 1, 6)
     ));
+    const stages = stageDetails.map(stage => stage.text);
     const final = formatChatGptWebMultipartCommit(multipart, transaction);
-    const maxStageMessageTokens = Math.max(...stages.map(text => estimateTokens(text)));
+    const maxStageMessageTokens = Math.max(...stages.map(text => estimateTokensForTransportValidation(text)));
     const maxStageChars = Math.max(...stages.map(text => text.length));
+    const prefix = estimateChatGptWebMultipartPrefixTokens(stageDetails, final, CHATGPT_WEB_MODEL_ID);
     const stagingMode = resolveChatGptWebMultipartStagingMode(
-      CHATGPT_WEB_MODEL_ID, capabilities, maxStageMessageTokens, maxStageChars,
+      CHATGPT_WEB_MODEL_ID, capabilities, maxStageMessageTokens, maxStageChars, 6,
     );
-    const finalMessageTokens = estimateTokens(final);
+    const finalMessageTokens = estimateTokensForTransportValidation(final);
+    // Upstream ceiling (restored 2026-09-26): the packing fixture (~78k) sits far inside the
+    // experimental 270k six-part transaction ceiling.
+    expect(estimateCompiledChatGptWebInputTokens(compiled, CHATGPT_WEB_MODEL_ID))
+      .toBeLessThan(90_000 * 3);
     expect(() => assertChatGptWebMultipartInputWithinLimits(
       estimateCompiledChatGptWebInputTokens(compiled, CHATGPT_WEB_MODEL_ID),
       Math.max(maxStageMessageTokens, finalMessageTokens),
       CHATGPT_WEB_MODEL_ID, "high", capabilities,
       Math.max(maxStageChars, final.length), 6,
-      { stagingEffort: stagingMode.effort, maxStageMessageTokens, maxStageChars, finalMessageTokens, finalMessageChars: final.length },
+      {
+        stagingEffort: stagingMode.effort,
+        maxStageMessageTokens,
+        maxStageChars,
+        finalMessageTokens,
+        finalMessageChars: final.length,
+      },
     )).not.toThrow();
   }
 }, 90_000);
 
-test("Bigger Context preflight expands only the total context ceiling and keeps each message boundary", () => {
+test("Bigger Context preflight keeps the accumulated transcript inside the physical context window", () => {
   const plus = {
     localToolsEnabled: false,
     solAvailable: true,
@@ -3523,45 +3714,43 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     extraHighAvailable: true, proAvailable: true,
     experimentalBiggerContext: true,
   };
+  // Upstream v6.1.1 ceiling (restored 2026-09-26): the Bigger Context transaction ceiling is the
+  // base window scaled by the part count, capped at the multiplier — 270k for six parts on the
+  // 90k Plus profile, 333,579 on the 111,193 Pro profile. Live six-part transactions completed at
+  // ~163k (trace 76c3ba5b9b75) and ~261k (trace 218780a2065d), disproving any smaller cap; the
+  // ~74.4k instability that motivated the brief 6.1.3 envelope was a STAGING-SIZE failure
+  // (Instant razor edge), not a cumulative-transaction one. Message and composer boundaries are
+  // still the raw measured limits and are checked first.
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    333_578,
-    95_000,
+    196_074,
+    33_401,
     "gpt-5.6-sol",
     "high",
-    pro,
-    500_000,
+    plus,
+    900_000,
     6,
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    333_579,
-    95_000,
+    261_776,
+    47_244,
     "gpt-5.6-sol",
     "high",
-    pro,
-    500_000,
+    plus,
+    900_000,
     6,
-  )).toThrow("six-part ceiling");
-  expect(() => assertChatGptWebMultipartInputWithinLimits(
-    222_385,
-    95_000,
-    "gpt-5.6-sol",
-    "high",
-    pro,
-    500_000,
-    2,
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    222_386,
-    95_000,
+    163_769,
+    45_000,
     "gpt-5.6-sol",
     "high",
-    pro,
-    500_000,
-    2,
-  )).toThrow("two-part ceiling");
+    plus,
+    900_000,
+    6,
+  )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     269_999,
-    80_000,
+    31_000,
     "gpt-5.6-sol",
     "high",
     plus,
@@ -3570,29 +3759,56 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     270_000,
-    80_000,
+    31_000,
     "gpt-5.6-sol",
     "high",
     plus,
     900_000,
     6,
-  )).toThrow("270,000-token six-part ceiling");
+  )).toThrow("270,000-token");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    180_000,
-    80_000,
+    333_000,
+    95_000,
     "gpt-5.6-sol",
     "high",
-    plus,
-    900_000,
-    2,
-  )).toThrow("180,000-token two-part ceiling");
+    pro,
+    495_000,
+    6,
+  )).not.toThrow();
+  expect(() => assertChatGptWebMultipartInputWithinLimits(
+    333_579,
+    95_000,
+    "gpt-5.6-sol",
+    "high",
+    pro,
+    495_000,
+    6,
+  )).toThrow("333,579-token");
+  expect(() => assertChatGptWebMultipartInputWithinLimits(
+    88_000,
+    95_000,
+    "gpt-5.6-sol",
+    "high",
+    pro,
+    500_001,
+    6,
+  )).toThrow("500,000-character ChatGPT composer boundary");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     280_000,
     103_001,
     "gpt-5.6-sol",
     "high",
     pro,
-    500_000,
+    495_000,
+    6,
+  )).toThrow("ChatGPT message boundary");
+  expect(() => assertChatGptWebMultipartInputWithinLimits(
+    280_000,
+    103_001,
+    "gpt-5.6-sol",
+    "high",
+    pro,
+    495_000,
     6,
   )).toThrow("ChatGPT message boundary");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
@@ -3609,41 +3825,39 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
 test("Bigger Context stages use the lowest account mode that can carry the stage", () => {
   const plus = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
   const pro = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true };
-  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 30_000, 200_000).effort).toBe("low");
-  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 30_000, 300_000).effort).toBe("medium");
-  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 80_000, 300_000).effort).toBe("medium");
-  // The same text must have the same available input budget inline, staged or in the final part.
-  // 80k is the early compaction trigger; the remaining input budget includes an 8192-token reserve.
-  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 80_169, 276_680).effort).toBe("medium");
-  for (const tokens of [81_807, 81_808]) {
-    const inline = () => assertChatGptWebInputWithinLimits(tokens + 8_192, tokens, "gpt-5.6-sol", "high", plus, 300_000);
-    const stage = () => resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, tokens, 300_000);
-    const final = () => assertChatGptWebMultipartInputWithinLimits(
-      tokens + 10_000, tokens, "gpt-5.6-sol", "high", plus, 300_000, 6,
-      { stagingEffort: "medium", maxStageMessageTokens: 500, maxStageChars: 2_000, finalMessageTokens: tokens, finalMessageChars: 300_000 },
-    );
-    for (const preflight of [inline, stage, final]) {
-      if (tokens === 81_807) expect(preflight).not.toThrow();
-      else expect(preflight).toThrow();
-    }
-  }
+  // Two-part Sol: upstream cheapest-mode order, with the documented Instant headroom margin.
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 30_000, 200_000, 2).effort).toBe("low");
+  // Two-part Sol razor edge (trace 003b96e77cf6): the plain estimate 32,746 sat 61 tokens under
+  // the ~32,807 usable Instant budget while the formatted stage measured ~33,401 — the headroom
+  // gate must escalate to Medium instead of staging on the boundary.
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 32_746, 200_000, 2).effort).toBe("medium");
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 33_401, 200_000, 2).effort).toBe("medium");
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 31_000, 200_000, 2).effort).toBe("low");
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 30_000, 300_000, 2).effort).toBe("medium");
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 31_488, 300_000, 2).effort).toBe("medium");
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 2_000, 1_044_476, 2).effort).toBe("medium");
   expect(() => resolveChatGptWebMultipartStagingMode(
-    "gpt-5.6-sol",
-    plus,
-    81_808,
-    300_000,
+    "gpt-5.6-sol", plus, 2_000, 1_048_573, 2,
   )).toThrow("No ChatGPT effort");
-  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 100_000, 500_000).effort).toBe("low");
-  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 100_000, 600_000).effort).toBe("max");
-  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 104_000, 1_200_000).effort).toBe("max");
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 31_489, 300_000, 2).effort).toBe("medium");
+  // Six-part Sol: staging is never Instant — Medium carries the 90k-class transport, and the
+  // failed trace 003b96e77cf6 (33,401-token stages, High final) must stage at Medium, not Low.
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 33_401, 140_000, 6).effort).toBe("medium");
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 2_000, 20_000, 6).effort).toBe("medium");
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 47_244, 200_000, 6).effort).toBe("medium");
+  // Pro: lowest NON-Instant mode that fits, escalating to Max only where required.
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 100_000, 400_000, 6).effort).toBe("medium");
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 100_000, 600_000, 6).effort).toBe("max");
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 103_488, 1_200_000, 6).effort).toBe("max");
   expect(() => resolveChatGptWebMultipartStagingMode(
     "gpt-5.6-luna",
     { localToolsEnabled: false, solAvailable: false, extraHighAvailable: false, proAvailable: false },
     10_000,
     20_000,
+    2,
   )).toThrow("Luna-only");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
-    100_000,
+    20_000,
     30_000,
     "gpt-5.6-sol",
     "low",
@@ -3660,6 +3874,36 @@ test("Bigger Context stages use the lowest account mode that can carry the stage
   )).not.toThrow();
 });
 
+test("multipart staging modes resolve from raw measured stage sizes under V-B", () => {
+  const plus = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+  const acceptedLike = "word ".repeat(29_000);
+  const dense = "a!b@c#d$e%f^g&h*".repeat(2_500);
+  expect(estimateTokensForTransportValidation(acceptedLike)).toBeGreaterThan(estimateTokens(acceptedLike));
+  expect(estimateTokensForTransportValidation(dense)).toBeGreaterThan(estimateTokens(dense));
+  expect(() => resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 30_694, 110_612, 6)).not.toThrow();
+  // V-B: the 32k Plus edge is no longer enforced; the Medium budget (81,807) carries the stage.
+  expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", plus, 33_178, 119_894, 6).effort).toBe("medium");
+});
+
+test("a partial multipart acknowledgement makes even a proven later-stage rejection non-retryable", () => {
+  const session = {
+    runtime: {
+      submission: { phase: "accepted", lastAcknowledgedMultipartStage: 2 },
+    },
+  } as unknown as ChatGptTurnSession;
+  const rejected = new ChatGptWebAdapterError("stage 3 rejected", {
+    status: 413,
+    errorType: "invalid_request_error",
+    code: "message_length_exceeds_limit",
+    retryable: true,
+    submissionRejected: true,
+  });
+  expect(submittedTurnFailure(session, rejected)).toMatchObject({
+    code: "chatgpt_multipart_partial_failure",
+    retryable: false,
+  });
+});
+
 test("browser diagnostics redact context envelopes and capability values", () => {
   const diagnostic = redactChatGptUiDiagnostic(
     "<codex_context_json>private context</codex_context_json> turn_12345678901234567890 binding_12345678901234567890",
@@ -3669,10 +3913,43 @@ test("browser diagnostics redact context envelopes and capability values", () =>
   expect(diagnostic).toContain("<codex_context_json>[redacted]</codex_context_json>");
 });
 
+test("browser diagnostic error classification keeps codes but never raw provider text", () => {
+  const privateUiMessage = "ChatGPT displayed an error for this response. private-visible-detail-123";
+  const providerUi = classifyChatGptBrowserDiagnosticError(new Error(privateUiMessage));
+  expect(providerUi).toEqual({ kind: "provider_ui_error", name: "Error" });
+  expect(JSON.stringify(providerUi)).not.toContain("private-visible-detail-123");
+
+  const rejected = classifyChatGptBrowserDiagnosticError(new ChatGptWebAdapterError(
+    "private request body detail",
+    {
+      status: 413,
+      errorType: "invalid_request_error",
+      code: "context_length_exceeded",
+      retryable: false,
+      submissionRejected: true,
+    },
+  ));
+  expect(rejected).toEqual({
+    kind: "adapter_error",
+    name: "ChatGptWebAdapterError",
+    status: 413,
+    errorType: "invalid_request_error",
+    code: "context_length_exceeded",
+    retryable: false,
+    submissionRejected: true,
+  });
+  expect(JSON.stringify(rejected)).not.toContain("private request body detail");
+});
+
 test("browser diagnostic state drops every rendered text field before persistence", () => {
   const diagnostic = sanitizeChatGptBrowserDiagnosticState({
     url: "https://chatgpt.com/c/private-conversation-id",
     title: "private conversation title",
+    documentComplete: false,
+    composer: { unrecognizedEditors: [{
+      tag: "textarea", role: null, attributes: { placeholder: true, id: false },
+      inForm: false, focused: true, value: "private draft", placeholder: "private hint",
+    }] },
     location: { origin: "https://chatgpt.com", pathSegments: 2, temporaryChat: false },
     connectorRows: [{
       tag: "a",
@@ -3686,6 +3963,10 @@ test("browser diagnostic state drops every rendered text field before persistenc
   const encoded = JSON.stringify(diagnostic);
   expect(encoded).not.toContain("private");
   expect(diagnostic).toEqual({
+    documentComplete: false,
+    composer: { unrecognizedEditors: [{
+      tag: "textarea", role: null, attributes: { placeholder: true, id: false }, inForm: false, focused: true,
+    }] },
     location: { origin: "https://chatgpt.com", pathSegments: 2, temporaryChat: false },
     connectorRows: [{ tag: "a", role: "button", textChars: 28 }],
     overlays: [{ role: "status", textChars: 18 }],
@@ -3930,7 +4211,7 @@ test("browser DOM health fails closed on a vanished or empty ChatGPT response", 
   const missing = new ChatGptTurnDomHealthTracker(1_000, 500);
   const absent = {
     responsePresent: false,
-    running: true,
+    running: false,
     currentText: "",
     completionActionVisible: false,
   };
@@ -3956,6 +4237,17 @@ test("browser DOM health fails closed on a vanished or empty ChatGPT response", 
   expect(missingCompletionAction.update(completedWithoutMarker, 1_000)).toBeUndefined();
   expect(missingCompletionAction.update(completedWithoutMarker, 1_749)).toBeUndefined();
   expect(missingCompletionAction.update(completedWithoutMarker, 1_750)).toContain("DOM may have changed");
+});
+
+test("visible generation suspends DOM health and restarts its grace when Stop disappears", () => {
+  const tracker = new ChatGptTurnDomHealthTracker(1_000, 500);
+  const absent = { responsePresent: false, running: false, currentText: "", completionActionVisible: false };
+  expect(tracker.update(absent, 0)).toBeUndefined();
+  expect(tracker.update({ ...absent, running: true }, 500)).toBeUndefined();
+  expect(tracker.update({ ...absent, running: true }, 60_000)).toBeUndefined();
+  expect(tracker.update(absent, 61_000)).toBeUndefined();
+  expect(tracker.update(absent, 61_999)).toBeUndefined();
+  expect(tracker.update(absent, 62_000)).toContain("did not create a response DOM");
 });
 
 test("stalled-turn diagnostics record DOM metrics without response or overlay content", () => {
@@ -4002,7 +4294,7 @@ test("suspending DOM health for proven MCP progress restarts the missing-respons
   const tracker = new ChatGptTurnDomHealthTracker(1_000, 500);
   const absent = {
     responsePresent: false,
-    running: true,
+    running: false,
     currentText: "",
     completionActionVisible: false,
   };
@@ -4027,7 +4319,7 @@ test("clearing the missing-response window preserves whether a response was ever
     currentText: "partial",
     completionActionVisible: false,
   };
-  const absent = { ...present, responsePresent: false, currentText: "" };
+  const absent = { ...present, responsePresent: false, running: false, currentText: "" };
 
   expect(tracker.update(present, 1_000)).toBeUndefined();
   expect(tracker.update(absent, 1_500)).toBeUndefined();
@@ -4098,7 +4390,7 @@ test("live external progress still records that a response DOM was observed", ()
   const tracker = new ChatGptTurnDomHealthTracker(1_000, 500);
   const absent = {
     responsePresent: false,
-    running: true,
+    running: false,
     currentText: "",
     completionActionVisible: false,
   };
@@ -4194,7 +4486,7 @@ test("the daemon prefers the browser helper that shipped beside its own entrypoi
 
 
 test("multipart observation surfaces Stopped thinking on its first observation even with live MCP work", async () => {
-  const absent = { last() { return this; }, filter() { return this; }, isVisible: async () => false };
+  const absent = { last() { return this; }, filter() { return this; }, first() { return this; }, isVisible: async () => false };
   const page = { isClosed: () => false, locator: () => absent };
   const binding = { locator: { getByText: () => absent, getByTestId: () => absent } };
   const snapshot = { responsePresent: true, stoppedThinkingVisible: true, visibleText: "", completionActionVisible: false };

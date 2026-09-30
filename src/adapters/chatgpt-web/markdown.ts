@@ -168,6 +168,8 @@ interface CommittedChatGptMarkdownSegment {
   linkTargets?: string[];
   sourceStart?: number;
   sourceEnd?: number;
+  /** This block's own contribution to this.markdown (separator included); enables re-open suffixes. */
+  markdownLength?: number;
 }
 
 export class ChatGptMarkdownConsistencyError extends Error {
@@ -202,6 +204,8 @@ export class ChatGptMarkdownBuffer {
   private markdown = "";
   private lastGroup: string | undefined;
   private consistencyError: ChatGptMarkdownConsistencyError | undefined;
+  /** A re-opened last-committed block awaiting its suffix commit (re-keyed renderer continuation). */
+  private reopened?: { key: string; committedIndex: number };
 
   constructor(
     private readonly transform: (markdown: string) => string = markdown => markdown,
@@ -256,8 +260,7 @@ export class ChatGptMarkdownBuffer {
       const candidate = this.candidates.get(candidateId);
       if (!candidate?.streamable || candidate.streamableAt === undefined) break;
       if (now - Math.max(candidate.changedAt, candidate.streamableAt) < this.stabilityMs) break;
-      delta += this.commit(candidate);
-      this.committed.push(this.committedSegment(candidate));
+      delta += this.commitBlock(candidate);
       this.candidates.delete(candidateId);
       committedCount += 1;
     }
@@ -269,8 +272,7 @@ export class ChatGptMarkdownBuffer {
     if (this.consistencyError) throw this.consistencyError;
     let delta = "";
     for (const segment of this.latest) {
-      delta += this.commit(segment);
-      this.committed.push(this.committedSegment(segment));
+      delta += this.commitBlock(segment);
     }
     this.candidates.clear();
     this.latest = [];
@@ -308,11 +310,30 @@ export class ChatGptMarkdownBuffer {
       if (committedIndex !== undefined) {
         const committed = this.committed[committedIndex]!;
         if (sawPending || committedIndex < highestCommittedIndex || committed.text !== segment.text) {
-          return this.changedCommittedBlockError(
-            sawPending || committedIndex < highestCommittedIndex ? "block_order_changed" : "text_changed",
-            segment,
-            committed,
-          );
+          // Re-keyed-renderer continuation: only the LAST committed block may re-open, and only
+          // when its projection grew by a pure text extension of what was already delivered
+          // (trace 2ee611b31fab: the renderer re-keyed the live response mid-stream). The
+          // delivered prefix is never re-emitted; the eventual commit contributes only the
+          // suffix, and any non-prefix change still fails closed.
+          const reopenable = !sawPending
+            && committedIndex === this.committed.length - 1
+            && segment.text.length > committed.text.length
+            && segment.text.startsWith(committed.text);
+          if (!reopenable) {
+            return this.changedCommittedBlockError(
+              sawPending || committedIndex < highestCommittedIndex ? "block_order_changed" : "text_changed",
+              segment,
+              committed,
+            );
+          }
+          this.reopened = { key: segment.key, committedIndex };
+        }
+        if (this.reopened?.key === segment.key && this.reopened.committedIndex === committedIndex) {
+          // The re-opened block returns to the pending projection so observe() commits its
+          // suffix through the continuation path.
+          pending.push(segment);
+          sawPending = true;
+          continue;
         }
         highestCommittedIndex = committedIndex;
         // Link destinations are answer content even when textContent remains identical.
@@ -355,6 +376,9 @@ export class ChatGptMarkdownBuffer {
 
     if (segment.sourceStart !== undefined) return undefined;
     if (!segment.tag) return undefined;
+    // Empty text is not an identity: separate rules and images can share it. An empty block
+    // must append as its own block instead of matching an earlier committed block by tag+empty.
+    if (!segment.text.trim()) return undefined;
     const semanticMatches = this.committed
       .map((committed, index) => ({ committed, index }))
       .filter(({ committed }) => committed.tag === segment.tag && committed.text === segment.text);
@@ -370,6 +394,8 @@ export class ChatGptMarkdownBuffer {
     if (exact.length === 1) return true;
     if (segment.sourceStart !== undefined) return false;
     if (!segment.tag) return false;
+    // Empty text is not an identity: never align an empty pending block to a committed block.
+    if (!segment.text.trim()) return false;
     return this.latest.filter(candidate => (
       candidate.tag === segment.tag && candidate.text === segment.text
     )).length === 1;
@@ -411,8 +437,31 @@ export class ChatGptMarkdownBuffer {
     );
   }
 
-  private commit(segment: ChatGptMarkdownSegment): string {
+  /**
+   * Commits one segment to the markdown ledger (including its committed bookkeeping). When the
+   * segment re-opens the last committed block (re-keyed renderer continuation), the block
+   * already sits at the tail of this.markdown with its delivered prefix; only the verified
+   * markdown suffix is appended, the committed entry grows in place, and the returned delta is
+   * suffix-only. Any non-prefix change fails closed as a consistency error.
+   */
+  private commitBlock(segment: ChatGptMarkdownSegment): string {
+    const reopenedIndex = this.reopened?.key === segment.key ? this.reopened.committedIndex : undefined;
+    const reopenedMatch = reopenedIndex !== undefined ? this.committed[reopenedIndex] : undefined;
     const block = this.transform(chatGptHtmlToMarkdown(segment.html));
+    if (reopenedMatch && reopenedIndex !== undefined && reopenedMatch.markdownLength !== undefined) {
+      this.reopened = undefined;
+      if (!block) return "";
+      const previousBlock = this.markdown.slice(this.markdown.length - reopenedMatch.markdownLength);
+      if (!block.startsWith(previousBlock)) {
+        throw this.changedCommittedBlockError("text_changed", segment, reopenedMatch);
+      }
+      const suffix = block.slice(previousBlock.length);
+      this.markdown += suffix;
+      this.lastGroup = segment.group;
+      this.committed[reopenedIndex] = { ...reopenedMatch, text: segment.text, markdownLength: block.length };
+      return suffix;
+    }
+    this.reopened = undefined;
     if (!block) return "";
     const separator = this.markdown
       ? segment.group !== undefined && segment.group === this.lastGroup ? "\n" : "\n\n"
@@ -420,6 +469,7 @@ export class ChatGptMarkdownBuffer {
     const delta = `${separator}${block}`;
     this.markdown += delta;
     this.lastGroup = segment.group;
+    this.committed.push({ ...this.committedSegment(segment), markdownLength: block.length });
     return delta;
   }
 }

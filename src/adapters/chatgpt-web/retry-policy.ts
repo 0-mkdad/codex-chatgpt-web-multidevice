@@ -1,4 +1,11 @@
 import { ChatGptWebAdapterError } from "./adapter-error";
+import {
+  ChatGptRateLimitStateStore,
+  PersistedRateLimitCircuit,
+  rateLimitScopeHash,
+  rateLimitStatePath,
+} from "./rate-limit-state";
+import { getConfigDir } from "../../config";
 
 /** Maximum number of automatic browser-turn retries after the initial send. */
 export const MAX_CHATGPT_WEB_TURN_RETRIES = 3;
@@ -41,6 +48,7 @@ interface RetryPolicyDependencies {
   now?: () => number;
   random?: () => number;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  stateStore?: ChatGptRateLimitStateStore;
 }
 
 function exhaustedError(entry: RetryBudgetEntry): ChatGptWebAdapterError {
@@ -91,6 +99,9 @@ export class ChatGptWebTurnRetryPolicy {
   private readonly now: () => number;
   private readonly random: () => number;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
+  private readonly stateStore?: ChatGptRateLimitStateStore;
+
+  private restored = false;
 
   constructor(
     private readonly ttlMs = RETRY_BUDGET_TTL_MS,
@@ -99,6 +110,40 @@ export class ChatGptWebTurnRetryPolicy {
     this.now = dependencies.now ?? Date.now;
     this.random = dependencies.random ?? Math.random;
     this.sleep = dependencies.sleep ?? defaultSleep;
+    this.stateStore = dependencies.stateStore;
+  }
+
+  /**
+   * Restores a persisted OPEN circuit on first scope contact. An expired window is ignored (and
+   * cleaned from the file); a corrupt file was already failed-open by the store itself.
+   */
+  private restorePersistedCircuit(scope: string, circuit: RateLimitCircuit): void {
+    if (this.restored || !this.stateStore) return;
+    this.restored = true;
+    const persisted = this.stateStore.restoreOpenCircuits().get(rateLimitScopeHash(scope));
+    if (!persisted || persisted.openUntil <= this.now()) return;
+    if (circuit.state === "CLOSED") {
+      circuit.state = "OPEN";
+      circuit.openUntil = persisted.openUntil;
+      console.warn(
+        `[chatgpt-web] rate-limit circuit restored OPEN after restart scope=${rateLimitScopeHash(scope)}`
+          + ` openUntilMsLeft=${Math.max(0, persisted.openUntil - this.now())} reason=${persisted.reason}`,
+      );
+    }
+  }
+
+  private persistCircuit(scope: string, circuit: RateLimitCircuit, reason: string, status = 429): void {
+    if (!this.stateStore) return;
+    const persisted: PersistedRateLimitCircuit | undefined = circuit.state === "OPEN"
+      ? {
+        openUntil: circuit.openUntil,
+        reason: reason.slice(0, 96),
+        status,
+        retryAfterMs: Math.max(0, circuit.openUntil - this.now()),
+        updatedAt: this.now(),
+      }
+      : undefined;
+    this.stateStore.put(rateLimitScopeHash(scope), persisted);
   }
 
   recordRetryableFailure(
@@ -129,7 +174,7 @@ export class ChatGptWebTurnRetryPolicy {
     };
     this.entries.set(key, entry);
     if (rateLimited && !options.rateLimitPressureAlreadyRecorded) {
-      this.openRateLimitCircuit(key, error.retryAfterMs, now);
+      this.openRateLimitCircuit(key, error.retryAfterMs, now, error.code);
     }
     else {
       const scope = this.scopeFor(key);
@@ -256,7 +301,7 @@ export class ChatGptWebTurnRetryPolicy {
     return circuit.state === "OPEN" ? 1 : normalLimit;
   }
 
-  private openRateLimitCircuit(key: string, retryAfterMs: number | undefined, now: number): void {
+  private openRateLimitCircuit(key: string, retryAfterMs: number | undefined, now: number, reason = "rate_limit_pressure"): void {
     const scope = this.scopeFor(key);
     const circuit = this.circuitForScope(scope);
     circuit.failures += 1;
@@ -268,6 +313,7 @@ export class ChatGptWebTurnRetryPolicy {
     circuit.probeKey = undefined;
     circuit.openUntil = Math.max(circuit.openUntil, now + cooldownMs);
     this.notifyCircuitChange(scope);
+    this.persistCircuit(scope, circuit, reason);
     console.warn(
       `[chatgpt-web] rate-limit circuit OPEN scope=${scope.slice(0, 12)}`
       + ` cooldownMs=${cooldownMs} source=${key.slice(0, 12)}`,
@@ -280,6 +326,7 @@ export class ChatGptWebTurnRetryPolicy {
     circuit.openUntil = 0;
     circuit.probeKey = undefined;
     this.notifyCircuitChange(scope);
+    this.persistCircuit(scope, circuit, "closed");
     console.info(`[chatgpt-web] rate-limit circuit CLOSED scope=${scope.slice(0, 12)}`);
   }
 
@@ -324,6 +371,7 @@ export class ChatGptWebTurnRetryPolicy {
     if (!circuit) {
       circuit = { state: "CLOSED", failures: 0, openUntil: 0 };
       this.circuits.set(scope, circuit);
+      if (this.stateStore && !this.restored) this.restorePersistedCircuit(scope, circuit);
     }
     return circuit;
   }
@@ -335,4 +383,6 @@ export class ChatGptWebTurnRetryPolicy {
   }
 }
 
-export const chatGptWebTurnRetryPolicy = new ChatGptWebTurnRetryPolicy();
+export const chatGptWebTurnRetryPolicy = new ChatGptWebTurnRetryPolicy(undefined, {
+  stateStore: new ChatGptRateLimitStateStore(rateLimitStatePath(getConfigDir())),
+});

@@ -4,6 +4,7 @@ import {
   CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE,
   availableChatGptWebModelRoutes,
   resolveChatGptWebContextLimits,
+  resolveChatGptWebSafeMessageTokenBudget,
 } from "../src/chatgpt-web-models";
 import { modelsRequest } from "../src/server";
 
@@ -16,6 +17,7 @@ test("proxies official /models auth and query, then appends grouped and legacy W
   config.subagentProtocol = "native";
   config.extraHighAvailable = true;
   config.proAvailable = true;
+  config.experimentalBiggerContext = true;
   const response = await modelsRequest(request, config, async input => {
     upstream = input;
     return Response.json({
@@ -79,6 +81,57 @@ test("proxies official /models auth and query, then appends grouped and legacy W
     expect(model.priority).toBe(1);
     expect(model.multi_agent_version).toBe("v2");
   }
+  expect(body.models.find(model => model.slug === "chatgpt-web/gpt-5.6-sol")).toMatchObject({
+    context_window: 333_579,
+    max_context_window: 333_579,
+    effective_context_window_percent: 85,
+    auto_compact_token_limit: 285_000,
+  });
+});
+
+test("/models advertises Bigger Context logically without multiplying the browser message budget", async () => {
+  const config = defaultConfig("full");
+  config.subagentProtocol = "native";
+  config.extraHighAvailable = true;
+  config.proAvailable = false;
+  config.experimentalBiggerContext = true;
+  const response = await modelsRequest(
+    new Request("http://127.0.0.1:17841/v1/models", {
+      headers: { authorization: "Bearer codex-oauth-token" },
+    }),
+    config,
+    async () => Response.json({ models: [{
+      slug: "gpt-5.6-sol",
+      display_name: "5.6 Sol",
+      visibility: "list",
+      supported_in_api: true,
+      supported_reasoning_levels: [],
+      tool_mode: "code_mode_only",
+    }] }),
+  );
+  const body = await response.json() as {
+    models: Array<{
+      slug: string;
+      context_window?: number;
+      max_context_window?: number;
+      effective_context_window_percent?: number;
+      auto_compact_token_limit?: number;
+    }>;
+  };
+  expect(body.models.find(model => model.slug === "chatgpt-web/gpt-5.6-sol")).toMatchObject({
+    context_window: 270_000,
+    max_context_window: 270_000,
+    effective_context_window_percent: 89,
+    auto_compact_token_limit: 240_000,
+  });
+  const biggerBudget = resolveChatGptWebSafeMessageTokenBudget("gpt-5.6-sol", "high", config);
+  const regularBudget = resolveChatGptWebSafeMessageTokenBudget("gpt-5.6-sol", "high", {
+    ...config,
+    experimentalBiggerContext: false,
+  });
+  // V-B: the safe budget no longer includes the 32k Plus per-message edge — 90,000 − 8,192 − 1 − 512.
+  expect(biggerBudget).toBe(81_295);
+  expect(biggerBudget).toBe(regularBudget);
 });
 
 test("Luna-only account exposes no paid ChatGPT Web routes", async () => {

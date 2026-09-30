@@ -143,6 +143,37 @@ export function hasCurrentChatGptEnvironmentContext(parsed: CodexParsedRequest):
   return false;
 }
 
+function rawInputItemText(value: Record<string, unknown>): string {
+  const content = value.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map(part => {
+    const item = record(part);
+    return typeof item?.text === "string" ? item.text : "";
+  }).join("\n");
+}
+
+/**
+ * Parsed authority of the request's historical environment fragments, when the request carries no
+ * current-turn environment claim and every fragment parses to exactly one authority. Used to
+ * recognize a thread's own resent start envelope on continuation turns; undefined means the
+ * fragments are a current claim, ambiguous, or malformed and must keep failing closed.
+ */
+export function parseChatGptHistoricalEnvelope(parsed: CodexParsedRequest): ChatGptTurnEnvironment | undefined {
+  if (!hasRawChatGptEnvironmentContext(parsed) || hasCurrentChatGptEnvironmentContext(parsed)) return undefined;
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const texts = input.filter(item => hasEnvironmentContextFragment(record(item)))
+    .map(item => rawInputItemText(record(item)!))
+    .filter(text => text.length > 0);
+  if (texts.length === 0) return undefined;
+  try {
+    return parseChatGptEnvironmentText(parsed, texts.join("\n"));
+  } catch {
+    return undefined;
+  }
+}
+
 export interface ChatGptUnattributedEnvironmentMessage {
   id: string;
   content: unknown;
@@ -381,39 +412,168 @@ export function extractChatGptSteeringEnvironmentClaim(parsed: CodexParsedReques
   return undefined;
 }
 
+export interface ChatGptNoCwdEnvironmentDelta {
+  sandboxType: "dangerFullAccess" | "workspaceWrite" | "readOnly";
+  declaresWorkspaceRoots: boolean;
+}
+
+const CHATGPT_UNRESTRICTED_CALENDAR_DELTA_PATTERN = /^<environment_context>\s*<current_date>\d{4}-\d{2}-\d{2}<\/current_date>\s*(?:<timezone>[^<>]+<\/timezone>\s*)?<filesystem>\s*<permission_profile type="disabled">\s*<file_system type="unrestricted"\s*\/>\s*<\/permission_profile>\s*<\/filesystem>\s*<\/environment_context>$/;
+
+const CHATGPT_MANAGED_NO_CWD_PROFILE_DELTA_PATTERN = /^<environment_context>\s*<current_date>\d{4}-\d{2}-\d{2}<\/current_date>\s*(?:<timezone>[^<>]+<\/timezone>\s*)?<filesystem>\s*<workspace_roots>([\s\S]*?)<\/workspace_roots>\s*<permission_profile type="managed">\s*<file_system type="restricted">[\s\S]*<\/file_system>\s*<\/permission_profile>\s*<\/filesystem>\s*<\/environment_context>$/;
+
+/** Structural mid-turn no-cwd profile repeat. Returns decoded workspace roots when restated. */
+function noCwdEnvironmentDeltaShape(
+  text: string,
+  metadata: Record<string, unknown>,
+): ChatGptNoCwdEnvironmentDelta | undefined {
+  if (/<\/?(?:cwd|environments|sandbox_mode)\b/i.test(text)) return undefined;
+  const sandboxType = sandboxTypeFromEnvironment(text);
+  if (!sandboxType) return undefined;
+  if (CHATGPT_UNRESTRICTED_CALENDAR_DELTA_PATTERN.test(text)) {
+    if (sandboxType !== "dangerFullAccess") return undefined;
+    return { sandboxType, declaresWorkspaceRoots: false };
+  }
+  const managed = CHATGPT_MANAGED_NO_CWD_PROFILE_DELTA_PATTERN.exec(text);
+  if (!managed || (sandboxType !== "workspaceWrite" && sandboxType !== "readOnly")) return undefined;
+  const section = managed[1]!;
+  const rootMatches = [...section.matchAll(/<root>([^<]+)<\/root>/g)];
+  const rootOpenings = [...section.matchAll(/<root\b[^>]*>/gi)].length;
+  const rootClosings = [...section.matchAll(/<\/root\s*>/gi)].length;
+  if (rootMatches.length === 0 || rootOpenings !== rootMatches.length || rootClosings !== rootMatches.length) return undefined;
+  const declaredRoots = rootMatches.map(match => decodeXmlText(match[1]!.trim()));
+  if (declaredRoots.some(path => !isAbsolute(path))) return undefined;
+  const workspaces = record(metadata.workspaces);
+  const metadataRoots = workspaces ? [...new Set(Object.keys(workspaces).map(pathIdentity))] : [];
+  if (metadataRoots.length === 0 || metadataRoots.some(root => !isAbsolute(root))) return undefined;
+  // A delta restating workspace_roots can never widen authority: every declared root must sit
+  // inside canonical metadata workspaces or be the authenticated Codex visualization directory.
+  const bound = declaredRoots.map(pathIdentity).every(root => (
+    metadataRoots.some(metadataRoot => matchesPath(metadataRoot, root))
+    || isCurrentOrParentThreadVisualizationRoot(root, metadata)
+  ));
+  if (!bound) return undefined;
+  return { sandboxType, declaresWorkspaceRoots: true };
+}
+
 /**
  * Native world-state diffs omit unchanged cwd/shell at midnight but repeat the filesystem
- * profile. Recognize the observed unrestricted calendar fragment as a claim only: the store
- * still requires this exact turn's native rollout and corroborating current sandbox metadata.
- * Unknown profiles/fields are deliberately not classified as permission-neutral updates.
+ * profile. Two exact shapes are observed from native Codex: the unrestricted calendar fragment,
+ * and the managed/restricted profile repeat that restates <workspace_roots> without a cwd
+ * (Codex Desktop 0.155.0-alpha.9.2). Both are claims only: the store still requires this exact
+ * turn's native rollout to corroborate them. Unknown profiles/fields are deliberately not
+ * classified as permission-neutral updates.
  */
-export function hasChatGptCalendarEnvironmentDelta(parsed: CodexParsedRequest): boolean {
+export function matchChatGptNoCwdEnvironmentDelta(parsed: CodexParsedRequest): ChatGptNoCwdEnvironmentDelta | undefined {
   const metadata = clientTurnMetadata(parsed);
   const turnId = extractChatGptTurnIdentity(parsed).turnId;
-  if (!metadata || !turnId) return false;
+  if (!metadata || !turnId) return undefined;
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
   const activeIndex = input.findLastIndex(value => isNativeInstruction(record(value), metadata));
   const active = record(input[activeIndex]);
-  if (itemTurnId(active) !== turnId || typeof active?.id !== "string" || !active.id) return false;
+  if (itemTurnId(active) !== turnId || typeof active?.id !== "string" || !active.id) return undefined;
 
   let deltas = 0;
+  let matched: ChatGptNoCwdEnvironmentDelta | undefined;
   for (let index = activeIndex + 1; index < input.length; index += 1) {
     const item = record(input[index]);
     if (!hasEnvironmentContextFragment(item)) continue;
     if (item.role !== "user" || itemTurnId(item) !== turnId || typeof item.id !== "string" || !item.id
-      || !hasAssistantOutputBetween(input, activeIndex + 1, index)) return false;
+      || !hasAssistantOutputBetween(input, activeIndex + 1, index)) return undefined;
     const text = rawMessageText(item).trim();
-    // Match the whole native fragment, not just the presence of a disabled profile: another
-    // profile, a malformed cwd, or any additional permission declaration must fail closed.
-    if (!/^<environment_context>\s*<current_date>\d{4}-\d{2}-\d{2}<\/current_date>\s*(?:<timezone>[^<>]+<\/timezone>\s*)?<filesystem>\s*<permission_profile type="disabled">\s*<file_system type="unrestricted"\s*\/>\s*<\/permission_profile>\s*<\/filesystem>\s*<\/environment_context>$/.test(text)
+    // Match the whole native fragment, not just the presence of a profile: another profile, a
+    // malformed cwd, or any additional permission declaration must fail closed.
+    const shape = noCwdEnvironmentDeltaShape(text, metadata);
+    if (!shape
       || !sandboxMetadataMatchesEnvironment(canonicalSandboxMetadata(metadata), text)
       || [metadata.sandbox_mode, metadata.sandbox].some(value => (
         value !== undefined && !sandboxMetadataMatchesEnvironment(value, text)
-      ))) return false;
+      ))) return undefined;
+    if (matched && matched.sandboxType !== shape.sandboxType) return undefined;
+    matched = shape;
     deltas += 1;
   }
-  return deltas > 0;
+  return deltas > 0 ? matched : undefined;
+}
+
+export function hasChatGptCalendarEnvironmentDelta(parsed: CodexParsedRequest): boolean {
+  return matchChatGptNoCwdEnvironmentDelta(parsed) !== undefined;
+}
+
+function midTurnClaimSandboxCorroborates(metadata: Record<string, unknown>, text: string): boolean {
+  if (!sandboxMetadataMatchesEnvironment(canonicalSandboxMetadata(metadata), text)) return false;
+  return ![metadata.sandbox_mode, metadata.sandbox].some(value => (
+    value !== undefined && !sandboxMetadataMatchesEnvironment(value, text)
+  ));
+}
+
+/**
+ * A full environment envelope re-declared after the active instruction (a mid-turn update, e.g.
+ * a cwd change) is a claim only: the store must authenticate it against this exact turn's native
+ * rollout, or reject it. Recognized no-cwd profile deltas stay with
+ * matchChatGptNoCwdEnvironmentDelta; unattributed or ambiguous fragments fail closed here.
+ */
+export function extractChatGptMidTurnEnvironmentClaim(parsed: CodexParsedRequest): ChatGptTurnEnvironment | undefined {
+  const metadata = clientTurnMetadata(parsed);
+  const turnId = extractChatGptTurnIdentity(parsed).turnId;
+  if (!metadata || !turnId) return undefined;
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const activeIndex = input.findLastIndex(value => isNativeInstruction(record(value), metadata));
+  const active = record(input[activeIndex]);
+  if (itemTurnId(active) !== turnId || typeof active?.id !== "string" || !active.id) return undefined;
+
+  const claims: string[] = [];
+  for (let index = activeIndex + 1; index < input.length; index += 1) {
+    const item = record(input[index]);
+    if (!hasEnvironmentContextFragment(item)) continue;
+    if (item.role !== "user" || itemTurnId(item) !== turnId || typeof item.id !== "string" || !item.id
+      || !hasAssistantOutputBetween(input, activeIndex + 1, index)) return undefined;
+    const parts = typeof item.content === "string" ? [item.content]
+      : Array.isArray(item.content) ? item.content.map(part => record(part)?.text) : [];
+    const envelopes = parts.filter((value): value is string =>
+      typeof value === "string"
+      && /^<environment_context>[\s\S]*<\/environment_context>$/.test(value.trim()));
+    if (envelopes.length !== 1) return undefined;
+    claims.push(envelopes[0]!);
+  }
+  if (claims.length !== 1) return undefined;
+  try {
+    const claim = parseChatGptEnvironmentText(parsed, claims[0]!);
+    if (!midTurnClaimSandboxCorroborates(metadata, claims[0]!)) return undefined;
+    return claim;
+  } catch {
+    return undefined;
+  }
+}
+
+export interface ChatGptEnvironmentResolutionProbes {
+  environmentFragmentCount: number;
+  currentTurnFragmentCount: number;
+  currentCwdClaimPresent: boolean;
+  currentWorkspaceRootsPresent: boolean;
+}
+
+/** Presence-only failure probes. Never returns message content, paths, or identifiers. */
+export function chatGptEnvironmentResolutionProbes(parsed: CodexParsedRequest): ChatGptEnvironmentResolutionProbes {
+  const turnId = extractChatGptTurnIdentity(parsed).turnId;
+  const body = record(parsed._rawBody);
+  const input = Array.isArray(body?.input) ? body.input : [];
+  let environmentFragmentCount = 0;
+  let currentTurnFragmentCount = 0;
+  let currentCwdClaimPresent = false;
+  let currentWorkspaceRootsPresent = false;
+  for (const value of input) {
+    const item = record(value);
+    if (!hasEnvironmentContextFragment(item)) continue;
+    environmentFragmentCount += 1;
+    if (turnId === undefined || itemTurnId(item) !== turnId) continue;
+    currentTurnFragmentCount += 1;
+    const text = rawMessageText(item!);
+    currentCwdClaimPresent ||= /<cwd>/i.test(text);
+    currentWorkspaceRootsPresent ||= /<workspace_roots>/i.test(text);
+  }
+  return { environmentFragmentCount, currentTurnFragmentCount, currentCwdClaimPresent, currentWorkspaceRootsPresent };
 }
 
 function environmentBeforeUser(input: unknown[], userIndex: number, expectedTurnId?: string, metadata?: Record<string, unknown>): string | undefined {

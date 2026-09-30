@@ -6,6 +6,17 @@ import { inspectCodexIntegration } from "./codex-integration";
 import { browserLoginStateExists, loginVerificationMarkerPath } from "./browser-login";
 import { getServiceStatus } from "./service";
 import { tunnelStatus } from "./tunnel";
+import { interpretTunnelHealthProbe, type TunnelHealthProbeResult } from "./tunnel-health";
+import { interpretSubagentCompatibility } from "./multi-agent-doctor";
+import { readCodexSubagentProtocol } from "./codex-integration";
+import { readJournal } from "./codex-integration-journal";
+import { availableChatGptWebModelRoutes } from "./chatgpt-web-models";
+import {
+  findFeatureAssignment,
+  findMultiAgentV2Assignment,
+  findTopLevelAssignment,
+} from "./codex-integration-document";
+import { getCodexConfigPath } from "./codex-integration-shared";
 import { getTunnelServiceStatus } from "./tunnel-service";
 import {
   inspectLauncherBrowserHost,
@@ -27,6 +38,68 @@ export interface DoctorReport {
   ok: boolean;
   mode?: AppConfig["mode"];
   checks: DoctorCheck[];
+}
+
+export interface ModelRoutingEvaluation {
+  effectiveModel: string;
+  route: "browser-bridge" | "native-passthrough";
+  bypassesBridge: boolean;
+}
+
+/** The `chatgpt-web/` prefix is the opt-in contract for the browser bridge queue; any other
+ *  model string is relayed to the native Codex backend without touching the queue. */
+export function evaluateModelRouting(model: string | undefined): ModelRoutingEvaluation {
+  const effectiveModel = (model ?? "").trim();
+  const bypassesBridge = !effectiveModel.startsWith("chatgpt-web/");
+  return {
+    effectiveModel,
+    route: bypassesBridge ? "native-passthrough" : "browser-bridge",
+    bypassesBridge,
+  };
+}
+
+export function modelRoutingCheck(config?: AppConfig, configPath: string = getCodexConfigPath()): DoctorCheck {
+  let model: string | undefined;
+  try {
+    if (!existsSync(configPath)) {
+      return { id: "model-routing", status: "ok", message: "Codex config not found; model routing check skipped" };
+    }
+    const assignment = findTopLevelAssignment(readFileSync(configPath, "utf8").split(/\r?\n/), "model");
+    model = assignment.present ? assignment.value : undefined;
+  } catch (error) {
+    return {
+      id: "model-routing",
+      status: "warning",
+      message: "Could not evaluate the Codex default model routing",
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+  const evaluation = evaluateModelRouting(model);
+  if (evaluation.bypassesBridge) {
+    // Advisory only: list the canonical availability-filtered browser routes from the same
+    // catalog that feeds the client. Never synthesize a mapping for the current default model.
+    let supported = "";
+    if (config) {
+      try {
+        const slugs = availableChatGptWebModelRoutes(config).map(route => route.slug);
+        if (slugs.length > 0) supported = ` Supported browser-route models: ${slugs.join(", ")}.`;
+      } catch {
+        supported = "";
+      }
+    }
+    return {
+      id: "model-routing",
+      status: "warning",
+      message: "Default model bypasses Codex Web GPT MultiDevice and uses native passthrough. "
+        + "Select a supported chatgpt-web/* model to route turns through the browser bridge queue.",
+      detail: `effective model: ${evaluation.effectiveModel || "(unset)"}; effective route: ${evaluation.route}.${supported}`,
+    };
+  }
+  return {
+    id: "model-routing",
+    status: "ok",
+    message: `Default model routes through the browser bridge queue (effective model: ${evaluation.effectiveModel}; effective route: ${evaluation.route})`,
+  };
 }
 
 function secureFile(path: string): boolean {
@@ -59,6 +132,67 @@ function launcherOwnershipError(config: AppConfig, health: Record<string, unknow
     return `Responses proxy pid ${String(health.pid)} does not match launcher-owned pid ${String(state.daemonPid)}`;
   }
   return undefined;
+}
+
+
+function subagentCompatibilityCheck(config: AppConfig): DoctorCheck {
+  let journalPresent = false;
+  let journalProtocol: string | undefined;
+  try {
+    const journal = readJournal();
+    journalPresent = Boolean(journal?.installed);
+    journalProtocol = readCodexSubagentProtocol(config.subagentProtocol);
+  } catch {
+    journalPresent = false;
+  }
+  let tomlMultiAgentPresent = false;
+  let tomlMultiAgent: boolean | undefined;
+  let tomlMultiAgentV2Present = false;
+  let tomlMultiAgentV2: boolean | undefined;
+  let tomlError: string | undefined;
+  try {
+    const lines = readFileSync(getCodexConfigPath(), "utf8").split("\n");
+    const multiAgent = findFeatureAssignment(lines, "multi_agent");
+    tomlMultiAgentPresent = multiAgent.present;
+    tomlMultiAgent = multiAgent.value === "true" ? true : multiAgent.value === "false" ? false : undefined;
+    const multiAgentV2 = findMultiAgentV2Assignment(lines);
+    tomlMultiAgentV2Present = multiAgentV2.present;
+    tomlMultiAgentV2 = multiAgentV2.value === "true" ? true : multiAgentV2.value === "false" ? false : undefined;
+  } catch (error) {
+    tomlError = error instanceof Error ? error.message : String(error);
+  }
+  const verdict = interpretSubagentCompatibility({
+    configProtocol: config.subagentProtocol,
+    journalProtocol,
+    journalPresent,
+    tomlMultiAgentPresent,
+    tomlMultiAgent,
+    tomlMultiAgentV2Present,
+    tomlMultiAgentV2,
+    tomlError,
+  });
+  return { id: "subagents", status: verdict.status, message: verdict.message, detail: verdict.detail };
+}
+
+async function tunnelHealthProbe(): Promise<TunnelHealthProbeResult> {
+  const url = process.env.CODEX_CHATGPT_WEB_TUNNEL_HEALTH_URL?.trim();
+  if (!url) return { kind: "unsupported" };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2_000);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    return { kind: "response", status: response.status, bodyText: await response.text() };
+  } catch (error) {
+    if (controller.signal.aborted) return { kind: "timeout" };
+    return { kind: "unreachable", detail: error instanceof Error ? error.message : String(error) };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function tunnelHealthCheck(): Promise<DoctorCheck> {
+  const verdict = interpretTunnelHealthProbe(await tunnelHealthProbe());
+  return { id: "tunnel-health", status: verdict.status, message: verdict.message, detail: verdict.detail };
 }
 
 async function proxyCheck(config: AppConfig): Promise<DoctorCheck> {
@@ -156,6 +290,8 @@ export async function runDoctor(): Promise<DoctorReport> {
   } else {
     checks.push({ id: "codex", status: "ok", message: "Codex native model route is installed" });
   }
+  checks.push(modelRoutingCheck(config));
+  checks.push(subagentCompatibilityCheck(config));
 
   const service = getServiceStatus();
   if (config.browserHost === "launcher") {
@@ -209,6 +345,7 @@ export async function runDoctor(): Promise<DoctorReport> {
     checks.push(runtime.ok
       ? { id: "tunnel-runtime", status: "ok", message: "Tunnel runtime reports healthy and ready" }
       : { id: "tunnel-runtime", status: "error", message: "Tunnel runtime is not ready", detail: runtime.detail });
+    checks.push(await tunnelHealthCheck());
     checks.push({
       id: "connector",
       status: "warning",

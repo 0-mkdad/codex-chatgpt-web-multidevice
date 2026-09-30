@@ -38,6 +38,15 @@ export const CHATGPT_WEB_MEDIUM_HIGH_CONTEXT_WINDOW = 90_000;
 export const CHATGPT_WEB_MEDIUM_HIGH_AUTO_COMPACT_TOKEN_LIMIT = 80_000;
 export const CHATGPT_WEB_INSTANT_COMPOSER_CHAR_LIMIT = 211_256;
 export const CHATGPT_WEB_MEDIUM_HIGH_COMPOSER_CHAR_LIMIT = 1_048_572;
+/**
+ * Plus Medium/High can expose a much larger model context than one browser submission accepts.
+ * A real 2026-09-24 rejection occurred at 32,527 visible o200k tokens after 30,007 and 27,746
+ * token stages were accepted in the same transaction. Treat 32k as the per-message server edge;
+ * the safe resolver below keeps additional headroom instead of submitting exactly at that edge.
+ */
+export const CHATGPT_WEB_PLUS_REASONING_MESSAGE_TOKEN_LIMIT = 32_000;
+export const CHATGPT_WEB_TRANSPORT_TOKEN_SAFETY_MARGIN = 512;
+export const CHATGPT_WEB_TRANSPORT_CHAR_SAFETY_MARGIN = 4_096;
 /** Hidden ChatGPT product prompt and Codex Native schema reserve included in usage estimates. */
 export const CHATGPT_WEB_PLATFORM_RESERVE_TOKENS = 8_192;
 /** Reserve for each attachment in the final browser message; inert stages carry no images. */
@@ -76,7 +85,22 @@ export const CHATGPT_WEB_PRO_MODEL_COMPOSER_CHAR_LIMIT = 1_635_000;
  * history out of later browser requests without asking Codex to compact its canonical history.
  */
 export const CHATGPT_WEB_LUNA_CONTEXT_WINDOW = 1_050_000;
+/**
+ * V-B experiment (2026-09-25): Bigger Context keeps advertising the tripled logical Codex window
+ * exactly as v6.1.0 did, and the transport layer is restored to the coupled v6.1.0 allowance
+ * (base window scaled by the multipart part count) instead of the stricter unmultiplied caps.
+ */
 export const CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER = 3;
+
+/**
+ * Instant staging headroom (2026-09-26). Trace 003b96e77cf6 selected Low staging from a PLAIN
+ * token estimate (32,746) while the formatted stage measured 33,401 with the conservative
+ * transport estimator — a 655-token divergence that pushed the stage past the ~32,807-token
+ * usable Instant input (41,000 window minus 8,192 platform reserve) and ChatGPT rejected it with
+ * "message too long". This operational margin covers that estimator divergence plus slack when
+ * Instant staging is still allowed (two-part transactions only). It is NOT a provider limit.
+ */
+export const CHATGPT_WEB_INSTANT_STAGING_HEADROOM_TOKENS = 1_024;
 
 export interface ChatGptWebContextLimits {
   contextWindow: number;
@@ -102,8 +126,8 @@ function contextLimits(
 ): ChatGptWebContextLimits {
   return {
     contextWindow,
-    // Codex reports this effective window in its context indicator. Align it with the practical
-    // pre-compaction budget instead of exposing an unreachable underlying model window.
+    // Preserve the prior Codex catalog semantics: the effective hard ceiling tracks the
+    // practical pre-compaction budget. Browser transport limits are resolved independently.
     effectiveContextWindowPercent: Math.round((autoCompactTokenLimit / contextWindow) * 100),
     autoCompactTokenLimit,
   };
@@ -178,6 +202,9 @@ export function resolveChatGptWebTransportLimits(
       return { browserComposerCharLimit: CHATGPT_WEB_INSTANT_COMPOSER_CHAR_LIMIT };
     }
     if (effort === "medium" || effort === "high" || (effort === "xhigh" && capabilities.extraHighAvailable)) {
+      // V-B experiment (2026-09-25): restores the v6.1.0 Plus Medium/High transport envelope. The
+      // measured 32,000-token one-message edge (CHATGPT_WEB_PLUS_REASONING_MESSAGE_TOKEN_LIMIT)
+      // stays exported for the shadow comparison in transport-policy-vb and is not enforced here.
       return { browserComposerCharLimit: CHATGPT_WEB_MEDIUM_HIGH_COMPOSER_CHAR_LIMIT };
     }
     throw new Error(`ChatGPT Plus transport limit is not defined for unavailable effort: ${effort}`);
@@ -219,6 +246,30 @@ export function resolveChatGptWebMessageTokenBudget(
     contextWindow - CHATGPT_WEB_PLATFORM_RESERVE_TOKENS - imageTokens - 1,
     browserMessageTokenLimit ?? Infinity,
   ));
+}
+
+/** Safe one-message budget used for physical browser submissions. */
+export function resolveChatGptWebSafeMessageTokenBudget(
+  backendModel: typeof CHATGPT_WEB_BACKEND_MODEL,
+  effort: ChatGptWebAdapterEffort,
+  capabilities: ChatGptWebAccountCapabilities,
+  imageTokens = 0,
+): number {
+  return Math.max(
+    0,
+    resolveChatGptWebMessageTokenBudget(backendModel, effort, capabilities, imageTokens)
+      - CHATGPT_WEB_TRANSPORT_TOKEN_SAFETY_MARGIN,
+  );
+}
+
+/** Safe browser character boundary; the raw measured limit remains available for diagnostics. */
+export function resolveChatGptWebSafeComposerCharLimit(
+  backendModel: ChatGptWebBackendModel,
+  effort: ChatGptWebAdapterEffort,
+  capabilities: ChatGptWebAccountCapabilities,
+): number | undefined {
+  const limit = resolveChatGptWebTransportLimits(backendModel, effort, capabilities).browserComposerCharLimit;
+  return limit === undefined ? undefined : Math.max(0, limit - CHATGPT_WEB_TRANSPORT_CHAR_SAFETY_MARGIN);
 }
 
 interface ChatGptWebModelRouteBase {

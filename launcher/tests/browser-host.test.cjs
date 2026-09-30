@@ -73,6 +73,7 @@ test("descriptor publishes native surface identities without inspecting renderer
 test("mode transitions publish targets before setup inspection and restore them on rollback", async () => {
   const dir = fs.mkdtempSync(require("node:path").join(require("node:os").tmpdir(), "browser-mode-targets-"));
   let savedMode = "manual";
+  const announcementModes = [];
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     surfaceId: "h".repeat(32),
     view: { webContents: { isDestroyed: () => false, getOrCreateDevToolsTargetId: () => "home-target" } },
@@ -81,6 +82,7 @@ test("mode transitions publish targets before setup inspection and restore them 
     profile: "production", cdpPort: 40000, partition: "persist:codex-web-gpt-chatgpt",
     control: {}, helper: {}, descriptorPath: require("node:path").join(dir, "descriptor.json"),
     markOwnedSurface: async () => {},
+    configureAnnouncementDismissal: async enabled => announcementModes.push(enabled),
   });
   const targets = () => JSON.parse(fs.readFileSync(fixture.descriptorPath, "utf8")).surfaceTargets;
   const automaticTargets = { [fixture.surfaceId]: "home-target" };
@@ -111,6 +113,12 @@ test("mode transitions publish targets before setup inspection and restore them 
     savedMode = "manual";
     assert.deepEqual(targets(), {});
     assert.equal(fixture.currentOperation(), null);
+    await assert.rejects(fixture.withInteractionModeChange("automatic", async commit => {
+      await commit();
+      throw new Error("runtime failed after browser commit");
+    }), /runtime failed after browser commit/);
+    assert.deepEqual(targets(), {});
+    assert.deepEqual(announcementModes, [false, true, false, true, false, true, false]);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -579,6 +587,44 @@ test("hidden turn tabs receive an explicit renderer viewport before moving offsc
   assert.equal(tab.deviceEmulationDirty, false);
 });
 
+test("hidden primary checks retain a renderer viewport across resize and navigation, then restore native bounds", () => {
+  const calls = [];
+  let size = [1120, 720];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    primaryRendererReady: false, primaryDeviceEmulationDirty: true,
+    primaryDeviceEmulationViewport: null,
+    bounds: { x: 280, y: 64, width: 840, height: 656 },
+    window: { getContentSize: () => size },
+    view: {
+      setBounds: value => calls.push(["bounds", value]), setVisible: value => calls.push(["visible", value]),
+      webContents: {
+        enableDeviceEmulation: value => calls.push(["emulate", value.viewSize]),
+        disableDeviceEmulation: () => calls.push(["disable"]),
+      },
+    },
+  });
+  fixture.presentPrimaryView(false);
+  assert.equal(calls.some(([event]) => event === "emulate"), false);
+  fixture.primaryRendererReady = true;
+  fixture.presentPrimaryView(false);
+  assert.deepEqual(calls.slice(-3), [["emulate", { width: 1120, height: 720 }],
+    ["bounds", { x: 1121, y: 721, width: 1120, height: 720 }], ["visible", true]]);
+  fixture.presentPrimaryView(false);
+  assert.equal(calls.filter(([event]) => event === "emulate").length, 1);
+  fixture.primaryDeviceEmulationDirty = true;
+  fixture.presentPrimaryView(false);
+  size = [1280, 800];
+  fixture.presentPrimaryView(false);
+  assert.deepEqual(fixture.primaryDeviceEmulationViewport, { width: 1280, height: 800 });
+  assert.equal(calls.filter(([event]) => event === "emulate").length, 3);
+  fixture.presentPrimaryView(true);
+  assert.deepEqual(calls.slice(-3), [["bounds", fixture.bounds], ["disable"], ["visible", true]]);
+  assert.equal(fixture.primaryDeviceEmulationViewport, null);
+  fixture.getBrowserInteractionMode = () => "manual";
+  fixture.presentPrimaryView(false);
+  assert.equal(calls.filter(([event]) => event === "emulate").length, 3);
+});
+
 test("turn tabs use the hidden viewport when the launcher window is hidden", () => {
   const events = [];
   const tab = {
@@ -809,7 +855,7 @@ test("guest and incomplete server sessions do not prove launcher authentication"
   assert.equal(result.status, "signed-out");
 });
 
-test("launcher authentication requires the Temporary Chat composer and complete server session", async () => {
+test("launcher authentication is established by the complete server session", async () => {
   const fixture = {
     state: { authenticated: false },
     activeTraceId: null,
@@ -836,6 +882,41 @@ test("launcher authentication requires the Temporary Chat composer and complete 
   assert.equal(result.status, "ready");
 });
 
+test("a verified session stays signed in while its composer is unavailable", async () => {
+  const vm = require("node:vm");
+  const { createDocument } = require("@mixmark-io/domino");
+  const url = "https://chatgpt.com/?temporary-chat=true";
+  for (const owned of [true, false]) {
+    const document = createDocument(`<form ${owned ? "data-chatgpt-composer" : ""}>
+      <div data-composer-markdown contenteditable="true" role="textbox"></div></form>`);
+    const editor = document.querySelector("[data-composer-markdown]");
+    Object.defineProperties(editor, {
+      isConnected: { value: true },
+      getBoundingClientRect: { value: () => ({ width: 300, height: 60 }) },
+    });
+    const fixture = {
+      state: { authenticated: false }, activeTraceId: null, manualOperation: null,
+      view: { webContents: {
+        isDestroyed: () => false, getURL: () => url,
+        executeJavaScript: script => vm.runInNewContext(script, {
+          location: { href: url },
+          document: { readyState: "complete", querySelectorAll: selector => document.querySelectorAll(selector) },
+          getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+          URL, AbortController, setTimeout, clearTimeout,
+          fetch: async () => ({ ok: true, status: 200, url: "https://chatgpt.com/api/auth/session",
+            headers: { get: () => "application/json" },
+            json: async () => ({ user: { id: "fixture" }, expires: "2099-01-01T00:00:00Z" }),
+          }),
+        }),
+      } },
+      setState(patch) { this.state = { ...this.state, ...patch }; },
+      snapshot() { return { ...this.state }; }, logger: { info() {} },
+    };
+    const result = await BrowserHost.prototype.probeAuthentication.call(fixture);
+    assert.equal(result.authenticated, true);
+  }
+});
+
 test("session verification distinguishes a missing login from network and invalid-response failures", async () => {
   const vm = require("node:vm");
   const url = "https://chatgpt.com/?temporary-chat=true";
@@ -858,7 +939,10 @@ test("session verification distinguishes a missing login from network and invali
     }, status: "error", message: /timed out/i },
     { name: "server", fetch: async () => response(null, { ok: false, status: 503 }), status: "error", message: /503/ },
     { name: "html", fetch: async () => response(null, { headers: { get: () => "text/html" } }), status: "error" },
-    { name: "redirect", fetch: async () => response(validSession, { url: "https://example.com/api/auth/session" }), status: "error" },
+    { name: "redirect", fetch: async (_url, options) => {
+      assert.equal(options.redirect, "error");
+      throw new TypeError("Redirect rejected");
+    }, status: "error" },
     { name: "invalid JSON", fetch: async () => response(null, { json: async () => { throw new SyntaxError("private-response"); } }), status: "error" },
     { name: "renderer", rendererError: true, status: "error", message: /browser/i },
   ];
@@ -931,6 +1015,107 @@ test("concurrent authentication probes share the same navigation and allow the n
   assert.equal(probes, 2); // initial surface, then the one navigated temporary surface
   await fixture.probeAuthentication();
   assert.equal(probes, 3); // the settled operation must not cache stale authentication
+});
+
+test("shared session changes refresh hidden sign-in state without navigating any tab", async () => {
+  const cookies = new EventEmitter();
+  const requests = [];
+  let payload = {};
+  let mode = "automatic";
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: true, status: "ready" },
+    turnTabs: new Map(),
+    getBrowserInteractionMode: () => mode,
+    view: { webContents: {
+      // The idle host has no ChatGPT document; the shared-session fetch path must run.
+      getURL: () => "about:blank", isDestroyed: () => false,
+      session: {
+      cookies,
+      fetch: async (url, options) => {
+        requests.push({ url, options });
+        await new Promise(resolve => setImmediate(resolve));
+        cookies.emit("changed", {}, { httpOnly: true, domain: "chatgpt.com" }, "overwrite", true);
+        cookies.emit("changed", {}, { httpOnly: true, domain: "chatgpt.com" }, "inserted", false);
+        // Electron net.fetch returns an empty Response.url, unlike renderer fetch.
+        return { url: "", ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => payload };
+      },
+    } } },
+    setState(patch) { this.state = { ...this.state, ...patch }; },
+    logger: { warn() { assert.fail("Session refresh failed"); } },
+  });
+  fixture.bindAuthenticationChanges();
+  const notify = cookie => cookies.emit("changed", {}, cookie, "explicit", true);
+  notify({ httpOnly: false, domain: ".chatgpt.com" });
+  notify({ httpOnly: true, domain: "example.com" });
+  assert.equal(requests.length, 0);
+  notify({ httpOnly: true, domain: ".chatgpt.com" });
+  await fixture.authenticationRefresh;
+  assert.equal(fixture.state.authenticated, false);
+  assert.equal(fixture.state.status, "signed-out");
+  payload = { user: { id: "test" }, expires: "2099-01-01T00:00:00Z" };
+  notify({ httpOnly: true, domain: "chatgpt.com" });
+  await fixture.authenticationRefresh;
+  assert.equal(fixture.state.authenticated, true);
+  assert.equal(fixture.state.status, "ready");
+  assert.equal(requests[0].url, "https://chatgpt.com/api/auth/session");
+  assert.equal(requests[0].options.credentials, "include");
+  assert.equal(requests[0].options.redirect, "error");
+  mode = "manual";
+  notify({ httpOnly: true, domain: "chatgpt.com" });
+  assert.equal(requests.length, 2);
+  mode = "automatic";
+  fixture.destroyed = true;
+  notify({ httpOnly: true, domain: "chatgpt.com" });
+  assert.equal(requests.length, 2);
+});
+
+test("a later sign-out wins over a pending page authentication probe without a native session race", async () => {
+  // Upstream v6.1.3 origin check, adapted: while the host displays a ChatGPT page, the
+  // cookie-driven refresh delegates to that page's own probe instead of a native fetch,
+  // and a probe started before the sign-out must settle without publishing.
+  let finishPage;
+  let requests = 0;
+  const updates = [];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    authenticationRevision: 0, state: { authenticated: false },
+    turnTabs: new Map(),
+    view: { webContents: {
+      getURL: () => "https://chatgpt.com/?temporary-chat=true", isDestroyed: () => false,
+      executeJavaScript: () => new Promise(resolve => { finishPage = resolve; }),
+      session: { fetch: async () => {
+        requests += 1;
+        return { url: "https://chatgpt.com/api/auth/session", ok: true, status: 200, headers: { get: () => "application/json" }, json: async () => ({}) };
+      } },
+    } },
+    setState(patch) { updates.push(patch); this.state = { ...this.state, ...patch }; },
+    snapshot() { return this.state; }, logger: { info() {}, warn() {} },
+  });
+  const page = fixture.probeAuthentication();
+  const first = fixture.refreshAuthenticationFromSession();
+  const second = fixture.refreshAuthenticationFromSession();
+  assert.equal(first, second);
+  finishPage({ composer: true, temporary: true, sessionAuthenticated: true });
+  await page;
+  assert.equal(updates.length, 0, "the pre-sign-out page probe must not publish");
+  finishPage({ composer: true, temporary: true, sessionAuthenticated: false, readyState: "complete" });
+  await second;
+  assert.equal(requests, 0, "a ChatGPT page must be verified by the page, never a parallel native fetch");
+  assert.equal(updates.length, 1);
+  assert.equal(fixture.state.authenticated, false);
+  assert.equal(updates.some(update => update.authenticated === true), false);
+});
+
+test("in-page account navigation schedules authentication refresh only for the main frame", async () => {
+  const contents = Object.assign(new EventEmitter(), { setWindowOpenHandler() {} });
+  let checks = 0;
+  const fixture = { view: { webContents: contents }, setState() {},
+    refreshAuthenticationFromSession: async () => { checks += 1; },
+  };
+  BrowserHost.prototype.bindWebContents.call(fixture);
+  contents.emit("did-navigate-in-page", {}, "https://chatgpt.com/", false);
+  assert.equal(checks, 0);
+  contents.emit("did-navigate-in-page", {}, "https://chatgpt.com/", true);
+  assert.equal(checks, 1);
 });
 
 test("concurrent embedded login requests share one authentication operation", async () => {
@@ -2590,7 +2775,7 @@ test("a completed keyed turn is retained for thirty minutes and preserves its ac
     true,
   );
 
-  assert.deepEqual(result, { cancelledByUser: false });
+  assert.deepEqual(result, { cancelledByUser: false, authenticationRequired: false });
   assert.equal(fixture.turnTabs.get(tab.id), tab);
   assert.equal(tab.status, "ready");
   assert.equal(tab.connectorBound, true);
@@ -2664,7 +2849,7 @@ test("a completed connector turn without binding is released instead of retained
     undefined,
     true,
     false,
-  ), { cancelledByUser: false });
+  ), { cancelledByUser: false, authenticationRequired: false });
 
   assert.equal(fixture.turnTabs.size, 0);
   assert.equal(closed, true);
@@ -3201,6 +3386,7 @@ test("switching from Zero Risk to Automatic marks the already-loaded primary sur
     surfaceId: "automatic-primary-surface",
     view: { webContents: {
       executeJavaScript: async script => { scripts.push(script); },
+      isDestroyed: () => false,
     } },
     snapshot: () => ({ activeTabId: "home" }),
   });
@@ -3209,9 +3395,10 @@ test("switching from Zero Risk to Automatic marks the already-loaded primary sur
     await commit();
     return "configured";
   }), "configured");
-  assert.equal(scripts.length, 1);
+  assert.equal(scripts.length, 2);
   assert.match(scripts[0], /__CODEX_WEB_GPT_SURFACE_ID__/);
   assert.match(scripts[0], /automatic-primary-surface/);
+  assert.match(scripts[1], /configureChatGptAnnouncementDismissal/);
 });
 
 test("a failed Automatic ownership proof stays inside the runtime rollback boundary", async () => {
@@ -3276,6 +3463,7 @@ test("Zero Risk fails closed at every primary-surface inspection boundary", asyn
   });
   await assert.rejects(fixture.applyViewportCss(), /disabled in Zero Risk mode/);
   await assert.rejects(fixture.markOwnedSurface(), /disabled in Zero Risk mode/);
+  await assert.rejects(fixture.configureAnnouncementDismissal(true), /disabled in Zero Risk mode/);
   await assert.rejects(fixture.probeAuthentication(), /disabled in Zero Risk mode/);
   await assert.rejects(fixture.inspectSession(true), /disabled in Zero Risk mode/);
   await assert.rejects(fixture.inspectLimitsPlan(), /disabled in Zero Risk mode/);
@@ -3384,4 +3572,64 @@ test("off-on-off fresh conversation changes retire completed history before it c
     assert.equal(state[property], false);
     assert.equal(fixture.turnTabs.get(manual.id), savedChats ? undefined : manual);
   }
+});
+
+test("turn authentication-required demotes completed outcomes and skips session refresh", async () => {
+  // Upstream v6.1.2 sign-in recovery, adapted: an auth wall during a turn marks the turn,
+  // a signed-out page can never own a trustworthy completion, and automatic session reads
+  // must not flip the launcher back to ready while the flagged turn lives.
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map(),
+    closedTurnOwners: new Map(),
+    userCancelledTurnOwners: new Map(),
+    authenticationRevision: 0,
+    state: { authenticated: true },
+    syncPowerSaveBlocker() {},
+    removeTurnTab() { this.removed = (this.removed ?? 0) + 1; },
+    setState(patch) { this.state = { ...this.state, ...patch }; },
+    snapshot() { return this.state; },
+    logger: { info() {}, warn() {} },
+    publishState: undefined,
+    writeDescriptor() {},
+  });
+  const tab = {
+    id: "tab_auth", traceId: "trace_auth", helperPid: 99, conversationKey: "conv_auth",
+    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
+    message: "",
+  };
+  fixture.turnTabs.set("tab_auth", tab);
+
+  fixture.markTurnAuthenticationRequired(tab);
+  assert.equal(tab.reauthenticationRequired, true);
+  assert.equal(fixture.authenticationRevision, 1);
+  assert.equal(fixture.state.authenticated, false);
+  assert.equal(fixture.state.status, "signed-out");
+  fixture.markTurnAuthenticationRequired(tab);
+  assert.equal(fixture.authenticationRevision, 1, "marking twice must not double-bump");
+
+  // The automatic session refresh skips while a flagged turn lives.
+  await fixture.refreshAuthenticationFromSession();
+  assert.equal(fixture.state.authenticated, false);
+
+  // A completed outcome from the signed-out page is demoted and the flag is reported.
+  const demoted = await fixture.endTurn("trace_auth", 99, "completed", false, "");
+  assert.equal(demoted.authenticationRequired, true);
+  assert.equal(demoted.cancelledByUser, false);
+  assert.equal(tab.status, "error");
+  assert.equal(fixture.removed ?? 0, 1, "a demoted turn is released, never retained");
+
+  // The flag clears once the flagged turn has been reported and released.
+  assert.equal(tab.reauthenticationRequired, false);
+
+  // An unflagged completed turn reports authenticationRequired: false and retains normally.
+  const clean = {
+    id: "tab_ok", traceId: "trace_ok", helperPid: 99, conversationKey: "conv_ok",
+    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
+    message: "",
+  };
+  fixture.turnTabs.set("tab_ok", clean);
+  const retained = await fixture.endTurn("trace_ok", 99, "completed", false, "", true, false);
+  assert.equal(retained.authenticationRequired, false);
+  assert.equal(clean.status, "ready");
+  assert.equal(fixture.removed ?? 0, 1, "a healthy turn is retained without release");
 });

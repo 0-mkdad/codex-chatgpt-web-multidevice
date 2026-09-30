@@ -172,10 +172,11 @@ preserved but inactive in Zero Risk mode.
 Bigger Context partitions complete ordered records against each message's available token and
 composer budgets. Inert stages carry text; the final message also carries all retained attachments,
 the execution contract and any output schema. Their reserves are deducted before partitioning,
-then preflight checks the actual compiled messages and total transaction. The selected execution
-effort and attachment references remain unchanged. Large transactions use up to six messages;
-the advertised context and compaction thresholds remain three times the base limits. More parts
-reduce message size, not the amount of history retained.
+then preflight checks the actual compiled messages, every cumulative stage prefix, and the final
+transaction against the selected model window. The selected execution effort and attachment
+references remain unchanged. Large transactions use up to six messages. The advertised context and
+compaction thresholds remain the measured base limits because all parts share one ChatGPT
+conversation. More parts reduce physical message size, not the model context consumed by history.
 
 In Full mode, routed compaction v1/v2 uses the exact retained source agent and a one-shot MCP control
 capability that accepts only the bound checkpoint; it cannot claim or invoke the ordinary Codex tool
@@ -186,7 +187,30 @@ control, and ends. The old manual chat is retired; the next compacted Codex requ
 browser chat and its locally compiled prompt is copied to the clipboard. A missing Automatic
 retained source falls back to a dedicated read-only browser chat built from canonical Codex
 history; a missing Zero Risk source uses the same explicit manual checkpoint contract. An invalid or
-ambiguous handoff still fails explicitly. Browser-only mode
+ambiguous handoff still fails explicitly.
+
+Compaction queue lifecycle (6.1.10): waiting for browser capacity and failing to make progress
+after execution began are separate phases with separate budgets. The 300s execution/settlement
+deadline (`MAX_COMPACTION_EXECUTION_STALL_MS`) arms only at the browser-slot admission boundary
+(`slot_granted`) — or when the compaction begins driving an already-admitted retained source — and
+is re-armed by meaningful forward progress (accepted submissions, multipart acknowledgements). A
+compaction waiting in the logical queue consumes a dedicated, much larger queue-wait budget
+(`CODEX_CHATGPT_WEB_COMPACTION_QUEUE_TIMEOUT_MS`, default 60 minutes) and expires with the typed
+`compaction_queue_timeout` error, never the settlement error. The scheduler admits the oldest
+waiting compaction before ordinary queued work (`compaction` priority class), bounded by
+`MAX_CONSECUTIVE_COMPACTION_ADMISSIONS` (2) so neither class can starve the other; priority only
+reorders admission and never bypasses the operational concurrency limit or the physical tab
+ceiling, and correctness holds at operational concurrency 1. The shared single-flight compaction
+operation (`runStructuredCompactionOnce` + durable handoff store) is detached from its original
+HTTP observer: a disconnect detaches the observer while the operation continues, equivalent retries
+attach to the same queued/running operation, and only authoritative cancellation (native turn
+interrupt, tab loss, deadline expiry after admission, queue-budget expiry, runtime shutdown)
+destroys it. Queue telemetry (`compaction_queue_entered`, `compaction_slot_granted`,
+`compaction_queue_cancelled`, `compaction_queue_timeout`) records identity hashes and counters
+only. The retained checkpoint's one-shot MCP control capability is likewise created only at
+browser admission, so its bounded TTL can never expire while the turn is still queued.
+
+Browser-only mode
 uses the same read-only summarization path, then returns the native replacement-history shape expected
 by Codex. A prompt-level checkpoint marker is translated into a visible Codex trace item;
 every later tool action in the same turn continues to present the current turn capability. Visible

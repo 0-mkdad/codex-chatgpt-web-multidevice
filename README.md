@@ -75,7 +75,7 @@ Zero Risk does not read or operate the ChatGPT page. Choose the model and `Codex
 
 The launcher can track estimated usage through its own browser for Pro $100 and Pro $200 plans. It records accepted sends on this device, shows rolling 24-hour and 7-day counts, and flags when observed usage reaches 75% of a published reference limit. Activity outside this launcher is excluded, and these estimates do not show the account's remaining allowance or reset time. Tracking is unavailable in Zero Risk.
 
-**Bigger Context (experimental)** sends large turns in up to six ordered parts and raises the advertised context and compaction thresholds to 3×. Small turns stay on the usual single-message path. Multi-part turns resend more context and can increase rate limits or cooldowns; this setting is off by default.
+**Bigger Context (experimental)** sends large browser payloads in two or six ordered parts when one ChatGPT message would exceed the safe message or composer boundary. Small turns stay on the usual single-message path. All parts remain in the same ChatGPT conversation, so their accumulated transcript must still fit the selected model's measured context window and normal compaction threshold. Multi-part turns use extra requests and can increase rate limits or cooldowns; this setting is off by default.
 
 <a id="full-harness"></a>
 
@@ -92,9 +92,9 @@ The launcher's **MCP** page guides the complete setup. For the exact clicks, see
 >
 > See the [repository discussions](https://github.com/0-mkdad/codex-chatgpt-web-multidevice/discussions) for the current
 > ChatGPT message allowances for **GPT-5.6 Sol Pro** and **GPT-6 Pro**. Context limits depend on
-> the account type and selected effort. Plus Medium/High uses a measured 90,000-token window, or
-> up to 270,000 tokens with experimental **3× context** enabled, with native Codex compaction
-> supported throughout.
+> the account type and selected effort. Plus Medium/High uses a measured 90,000-token window.
+> Experimental **Bigger Context** can split one large browser payload into multiple messages, but
+> those messages still share that same model window and native Codex compaction threshold.
 
 1. Finish the required setup, open **MCP**, create a Tunnel and regular API key for this computer, then press **Connect harness**.
 2. In the launcher, set this computer's **Connector name**. Use a different name on each computer; the default is **Codex Native2**. Enable ChatGPT **Developer Mode** and create a new Tunnel connector with that exact name, **Authentication: None**, and **Allow all actions**.

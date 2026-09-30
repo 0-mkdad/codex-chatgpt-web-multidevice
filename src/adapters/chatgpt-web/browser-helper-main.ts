@@ -35,6 +35,7 @@ interface RunMessage {
     conversationKey?: string;
     compaction?: boolean;
     captureLunaCheckpoint?: boolean;
+    captureResumeCheckpoint?: boolean;
     externalProgress?: boolean;
   };
 }
@@ -183,6 +184,12 @@ async function run(message: RunMessage): Promise<void> {
   if (message.turn.captureLunaCheckpoint !== undefined && typeof message.turn.captureLunaCheckpoint !== "boolean") {
     throw new Error("Browser helper Luna checkpoint flag is invalid");
   }
+  if (message.turn.captureResumeCheckpoint !== undefined && typeof message.turn.captureResumeCheckpoint !== "boolean") {
+    throw new Error("Browser helper resume checkpoint flag is invalid");
+  }
+  if (message.turn.captureLunaCheckpoint && message.turn.captureResumeCheckpoint) {
+    throw new Error("Browser helper cannot capture both Luna and resume checkpoints");
+  }
   if (message.turn.externalProgress !== undefined && typeof message.turn.externalProgress !== "boolean") {
     throw new Error("Browser helper external progress flag is invalid");
   }
@@ -284,6 +291,17 @@ async function run(message: RunMessage): Promise<void> {
         throw new Error("Browser helper could not persist ChatGPT submission evidence");
       }
     },
+    onMultipartStageSendActivated: stageIndex => new Promise<void>((resolve, reject) => {
+      if (sendActivationWaiters.has(message.id)) {
+        reject(new Error("Browser helper multipart Send activation already awaits acknowledgement"));
+        return;
+      }
+      sendActivationWaiters.set(message.id, { resolve, reject });
+      if (!writeProtocol({ type: "event", id: message.id, event: "multipart_stage_send_activated", stageIndex })) {
+        sendActivationWaiters.delete(message.id);
+        reject(new Error("Browser helper could not request the multipart Send activation boundary"));
+      }
+    }),
     onMultipartStageAcknowledged: stageIndex => {
       if (!writeProtocol({ type: "event", id: message.id, event: "multipart_stage_acknowledged", stageIndex })) {
         throw new Error("Browser helper could not persist multipart acknowledgement evidence");
@@ -304,6 +322,15 @@ async function run(message: RunMessage): Promise<void> {
         type: "event",
         id: message.id,
         event: "luna_checkpoint",
+        ...captured,
+      }),
+    } : {}),
+    ...(message.turn.captureResumeCheckpoint ? {
+      captureResumeCheckpoint: true,
+      onResumeCheckpoint: captured => writeProtocol({
+        type: "event",
+        id: message.id,
+        event: "resume_checkpoint",
         ...captured,
       }),
     } : {}),
@@ -428,6 +455,21 @@ input.on("line", line => {
         return;
       }
     }
+    if (prepared.contextTransportSummary !== undefined) {
+      const summary = prepared.contextTransportSummary;
+      const valid = !!summary && typeof summary === "object"
+        && Number.isSafeInteger(summary.chars) && summary.chars > 0
+        && Number.isSafeInteger(summary.bytes) && summary.bytes > 0
+        && Number.isSafeInteger(summary.chunkChars) && summary.chunkChars > 0
+        && Number.isSafeInteger(summary.totalChunks) && summary.totalChunks > 0
+        && Number.isSafeInteger(summary.estimatedTokens) && summary.estimatedTokens > 0
+        && Number.isSafeInteger(summary.logicalContextWindow) && summary.logicalContextWindow > 0;
+      if (!valid) {
+        writeProtocol({ type: "error", id: message.id, message: "Browser helper MCP context summary is invalid" });
+        abortControllers.get(message.id)?.abort();
+        return;
+      }
+    }
     const selection = preparedSelections.get(message.id);
     if (!selection) {
       writeProtocol({ type: "error", id: message.id, message: "Browser helper has no pending prompt selection" });
@@ -535,4 +577,4 @@ process.once("SIGTERM", () => {
 });
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
-writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "multipart-stage-ack", "skill-attachments"] });
+writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "multipart-stage-send", "multipart-stage-ack", "skill-attachments", "resume-checkpoint"] });

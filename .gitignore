@@ -18,3 +18,4 @@ launcher/artifacts/
 output/
 .tmp/
 notes.md
+/.agents/skills/github-pairing/

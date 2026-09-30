@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { ChatGptWebMcpContextTransportSummary } from "./context-transport";
 import type { AdapterEvent, CodexParsedRequest } from "../../types";
 import type { BrokerToolRequest } from "./turn-broker";
 import { ChatGptWebAdapterError, chatGptBrowserTabClosedError, chatGptTurnSupersededError } from "./adapter-error";
@@ -193,9 +194,21 @@ interface ChatGptTurnRuntimeBase {
   releaseRetainedConversation?: () => Promise<void>;
   /** Idempotently retire the turn-bound MCP capability after browser and observer settlement. */
   retireCapability?: () => void | Promise<void>;
-  submission?: { phase: "prepared" | "send_activated" | "accepted" };
+  submission?: {
+    phase: "prepared" | "send_activated" | "accepted";
+    /** Highest inert Bigger Context stage whose physical Send barrier was durably recorded. */
+    lastSentMultipartStage?: number;
+    /** Highest inert Bigger Context stage whose exact transaction ACK was observed. */
+    lastAcknowledgedMultipartStage?: number;
+  };
   /** Present only when the visible ChatGPT tab is driven manually through the Codex Zero Risk MCP contract. */
   manualControl?: { surfaceNonce: string };
+  /**
+   * MCP context compaction: resolves once the compaction prepare registered the broker turn and
+   * installed the transport; `undefined` when the turn fell back to a non-MCP transport. The
+   * summary acceptance is fenced on broker completeness.
+   */
+  mcpContext?: { installed: Promise<{ token: string; summary: ChatGptWebMcpContextTransportSummary } | undefined> };
   lifecycleProgress?: ChatGptTurnLifecycleProgress;
   cancel: (reason?: Error) => void;
 }
@@ -740,7 +753,7 @@ export class ChatGptTurnSessions {
     await this.retirements.get(key);
   }
 
-  async retireAndWait(key: string, signal?: AbortSignal): Promise<boolean> {
+  async retireAndWait(key: string, signal?: AbortSignal, reason?: Error): Promise<boolean> {
     const pending = this.retirements.get(key);
     if (pending) {
       await awaitWithAbort(pending, signal);
@@ -751,7 +764,7 @@ export class ChatGptTurnSessions {
 
     this.entries.delete(key);
     this.forgetConversationHead(session);
-    await awaitWithAbort(this.beginRetirement(key, session), signal);
+    await awaitWithAbort(this.beginRetirement(key, session, reason), signal);
     return true;
   }
 
@@ -785,7 +798,10 @@ export class ChatGptTurnSessions {
   }
 
   clear(): number {
-    const cancelled = this.entries.size;
+    // Only genuinely active executions are cancellations. Terminal sessions retained for replay
+    // retire as a no-op and must not inflate the cancelled-turn telemetry (an idle shutdown with
+    // zero live browser turns must report zero, matching activity().active_browser_turns).
+    const cancelled = [...this.entries.values()].filter(session => session.isActive()).length;
     for (const [key, session] of this.entries) this.beginRetirement(key, session);
     this.entries.clear();
     this.conversationHeads.clear();

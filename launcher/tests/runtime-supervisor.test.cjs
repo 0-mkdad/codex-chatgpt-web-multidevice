@@ -12,8 +12,31 @@ const {
   MAX_RESTARTS_PER_WINDOW,
   RuntimeSupervisor,
   managedTunnelConnectArgs,
+  parseChatGptWebStructuredTraceLine,
   validateConfig,
 } = require("../electron/runtime-supervisor.cjs");
+
+test("runtime supervisor recognizes only the bounded structured ChatGPT trace envelope", () => {
+  const valid = parseChatGptWebStructuredTraceLine(`[chatgpt-web-trace] ${JSON.stringify({
+    version: 1,
+    at: "2026-09-25T10:00:00.000Z",
+    level: "warning",
+    event: "multipart_stage_sent",
+    detail: { traceId: "abc123", stageIndex: 2, retryCount: 0 },
+  })}`);
+  assert.deepEqual(valid, {
+    version: 1,
+    at: "2026-09-25T10:00:00.000Z",
+    level: "warning",
+    event: "multipart_stage_sent",
+    detail: { traceId: "abc123", stageIndex: 2, retryCount: 0 },
+  });
+  assert.equal(parseChatGptWebStructuredTraceLine("ordinary runtime output"), null);
+  assert.equal(parseChatGptWebStructuredTraceLine("[chatgpt-web-trace] not-json"), null);
+  assert.equal(parseChatGptWebStructuredTraceLine(`[chatgpt-web-trace] ${JSON.stringify({
+    version: 2, at: "2026-09-25T10:00:00.000Z", level: "info", event: "x", detail: {},
+  })}`), null);
+});
 
 async function freePort() {
   return await new Promise((resolve, reject) => {

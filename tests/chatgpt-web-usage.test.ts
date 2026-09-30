@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
 import { estimateChatGptWebInputTokens, resolveBiggerContextMultipartParts } from "../src/adapters/chatgpt-web/usage";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
-import { compiledChatGptWebMessages, estimateChatGptWebImageTokens, estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
+import { compiledChatGptWebMessages, estimateChatGptWebImageTokens, estimateCompiledChatGptWebInputTokens, estimateCompiledChatGptWebMultipartPrefixTokens } from "../src/adapters/chatgpt-web/input-tokens";
 import { assertChatGptWebMultipartInputWithinLimits, resolveChatGptWebMultipartStagingMode } from "../src/adapters/chatgpt-web/browser-worker";
-import { estimateTokens } from "../src/lib/token-estimate";
+import { estimateTokensForTransportValidation } from "../src/lib/token-estimate";
 import type { CodexParsedRequest } from "../src/types";
 
 const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true };
@@ -28,7 +28,6 @@ test("multipart selection accounts for whole-record and composer fit before subm
   const plus = { ...capabilities, extraHighAvailable: false, proAvailable: false };
   for (const [contents, expected] of [
     [["small task"], undefined],
-    [[50_000, 40_000, 50_000, 5_000].map(n => "word ".repeat(n)), 6],
     [Array.from({ length: 3 }, () => " ".repeat(450_000)), 2],
   ] as const) {
     const parsed = request("");
@@ -41,6 +40,14 @@ test("multipart selection accounts for whole-record and composer fit before subm
         .toEqual([...contents]);
     }
   }
+  // V-B: a large history is transported (six parts), never rejected by the planner.
+  const tooLarge = request("");
+  tooLarge.context.messages = Array.from({ length: 12 }, (_, index) => ({
+    role: "user" as const,
+    content: "word ".repeat(14_000),
+    timestamp: index + 1,
+  }));
+  expect(resolveBiggerContextMultipartParts(tooLarge, plus)).toBe(6);
   // Low-token text can still exceed the reasoning model's server character ceiling.
   // Stage the complete record instead of sending it inline or dropping its contents.
   const sparsePro = request("x".repeat(600_000));
@@ -49,9 +56,9 @@ test("multipart selection accounts for whole-record and composer fit before subm
   expect(stagedPro.multipart!.parts.flatMap(part => JSON.parse(part).records).map(record => record.message.content))
     .toEqual([sparsePro.context.messages[0]!.content]);
   const proMessages = compiledChatGptWebMessages(stagedPro);
-  expect(proMessages[1]!.length).toBeLessThanOrEqual(500_000);
+  expect(proMessages[1]!.length).toBeLessThanOrEqual(495_904);
   expect(resolveChatGptWebMultipartStagingMode(
-    "gpt-5.6-sol", capabilities, estimateTokens(proMessages[0]!), proMessages[0]!.length,
+    "gpt-5.6-sol", capabilities, estimateTokensForTransportValidation(proMessages[0]!), proMessages[0]!.length, 2,
   ).effort).toBe("max");
 }, 60_000);
 
@@ -74,12 +81,12 @@ test("multipart planning leaves room for final attachments and execution instruc
   ]) {
     const caps = { ...capabilities, proAvailable: scenario.proAvailable };
     const parsed = request("");
-    const texts = Array.from({ length: 36 }, (_, index) => `record ${index}: ${"word ".repeat(5_000)}`);
+    const texts = Array.from({ length: 12 }, (_, index) => `record ${index}: ${"word ".repeat(500)}`);
     parsed.context.messages = texts.map((content, index) => ({ role: "user", content, timestamp: index + 1 }));
     const images = Array.from({ length: scenario.images }, (_, index) => ({
       type: "image" as const, imageUrl: `data:image/png;base64,partition-image-${index}`, detail: "original" as const,
     }));
-    if (images.length) parsed.context.messages.push({ role: "user", content: images, timestamp: 37 });
+    if (images.length) parsed.context.messages.push({ role: "user", content: images, timestamp: 13 });
     if (scenario.schema) parsed.options.outputFormat = {
       type: "json_schema", name: "result", strict: true, schema: { type: "string", description: "schema ".repeat(24_000) },
     };
@@ -91,15 +98,30 @@ test("multipart planning leaves room for final attachments and execution instruc
       .toEqual(images.map(image => ({ imageUrl: image.imageUrl, detail: image.detail })));
     if (scenario.schema) expect(compiled.multipart!.commit).toContain(JSON.stringify(parsed.options.outputFormat!.schema));
     const messages = compiledChatGptWebMessages(compiled);
-    const tokens = messages.map(text => estimateTokens(text));
+    const tokens = messages.map(text => estimateTokensForTransportValidation(text));
     const chars = messages.map(text => text.length);
     const maxStageMessageTokens = Math.max(...tokens.slice(0, -1));
     const maxStageChars = Math.max(...chars.slice(0, -1));
-    const stage = resolveChatGptWebMultipartStagingMode(parsed.modelId, caps, maxStageMessageTokens, maxStageChars);
-    expect(() => assertChatGptWebMultipartInputWithinLimits(
-      estimateCompiledChatGptWebInputTokens(compiled, parsed.modelId), Math.max(...tokens),
+    const prefix = estimateCompiledChatGptWebMultipartPrefixTokens(compiled, parsed.modelId)!;
+    const stage = resolveChatGptWebMultipartStagingMode(
+      parsed.modelId, caps, maxStageMessageTokens, maxStageChars, 6,
+    );
+    // Upstream ceiling (restored 2026-09-26): the compaction fixture (~78k) sits far inside the
+    // experimental 270k six-part transaction ceiling, so the preflight must admit it.
+    const estimatedInputTokens = estimateCompiledChatGptWebInputTokens(compiled, parsed.modelId);
+    expect(estimatedInputTokens).toBeLessThan(90_000 * 3);
+    const limitsCall = () => assertChatGptWebMultipartInputWithinLimits(
+      estimatedInputTokens, Math.max(...tokens),
       parsed.modelId, "high", caps, Math.max(...chars), 6,
-      { stagingEffort: stage.effort, maxStageMessageTokens, maxStageChars, finalMessageTokens: tokens.at(-1)!, finalMessageChars: chars.at(-1)!, finalImageTokens: estimateChatGptWebImageTokens(compiled) },
-    )).not.toThrow();
+      {
+        stagingEffort: stage.effort,
+        maxStageMessageTokens,
+        maxStageChars,
+        finalMessageTokens: prefix.finalMessageTokens,
+        finalMessageChars: chars.at(-1)!,
+        finalImageTokens: estimateChatGptWebImageTokens(compiled),
+      },
+    );
+    expect(limitsCall).not.toThrow();
   }
 }, 30_000);

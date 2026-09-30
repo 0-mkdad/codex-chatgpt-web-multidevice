@@ -100,7 +100,7 @@ describe("native /models augmentation", () => {
     }, { ...config, proAvailable: false })).toThrow("Cannot group different context budgets");
   });
 
-  test("publishes Bigger Context limits in the Codex model catalog", () => {
+  test("advertises Bigger Context with the expanded logical Codex window in the model catalog", () => {
     const config = defaultConfig("full");
     config.extraHighAvailable = true;
     config.proAvailable = true;
@@ -108,6 +108,7 @@ describe("native /models augmentation", () => {
     const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
     const pro = models.find(model => model.slug === "chatgpt-web/pro")!;
     expect(pro.context_window).toBe(336_579);
+    expect(pro.effective_context_window_percent).toBe(85);
     expect(pro.auto_compact_token_limit).toBe(285_000);
   });
 
@@ -254,6 +255,7 @@ describe("native /models augmentation", () => {
       display_name: CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE.displayName,
       input_modalities: ["text"],
       context_window: 336_579,
+      effective_context_window_percent: 85,
       auto_compact_token_limit: 285_000,
     });
   });

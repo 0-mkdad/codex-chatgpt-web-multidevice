@@ -17,6 +17,7 @@ import {
   CHATGPT_WEB_MODEL_ROUTES,
   requireChatGptWebModelRoute,
   resolveChatGptWebContextLimits,
+  resolveChatGptWebSafeMessageTokenBudget,
   resolveChatGptWebTransportLimits,
 } from "../src/chatgpt-web-models";
 import { defaultConfig } from "../src/config";
@@ -163,6 +164,7 @@ describe("fixed ChatGPT Web model routes", () => {
     expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, "low", plus)).toEqual({
       browserComposerCharLimit: 211_256,
     });
+    // V-B: Plus Medium/High transport carries no per-message token cap (v6.1.0 envelope).
     expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, "medium", plus)).toEqual({
       browserComposerCharLimit: 1_048_572,
     });
@@ -215,7 +217,26 @@ describe("fixed ChatGPT Web model routes", () => {
     });
   });
 
-  test("triples Sol context and compaction limits only when Bigger Context is enabled", () => {
+  test("Bigger Context expands Codex logical metadata while preserving browser transport limits", () => {
+    const plusBigger = resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "high", {
+      ...plus,
+      experimentalBiggerContext: true,
+    });
+    expect(plusBigger).toEqual({
+      contextWindow: 270_000,
+      effectiveContextWindowPercent: 89,
+      autoCompactTokenLimit: 240_000,
+    });
+    // V-B: the safe budget derives from the restored v6.1.0 envelope — 90,000 − 8,192 − 1 − 512.
+    expect(resolveChatGptWebSafeMessageTokenBudget(CHATGPT_WEB_BACKEND_MODEL, "high", {
+      ...plus,
+      experimentalBiggerContext: true,
+    })).toBe(81_295);
+    expect(resolveChatGptWebSafeMessageTokenBudget(CHATGPT_WEB_BACKEND_MODEL, "high", plus)).toBe(81_295);
+    expect(resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, "high", {
+      ...plus,
+      experimentalBiggerContext: true,
+    })).toEqual({ browserComposerCharLimit: 1_048_572 });
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "max", {
       ...pro,
       experimentalBiggerContext: true,

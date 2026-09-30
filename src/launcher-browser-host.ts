@@ -653,6 +653,7 @@ export async function notifyLauncherTurn(
   reused?: boolean;
   connectorBound?: boolean;
   cancelledByUser?: boolean;
+  authenticationRequired?: boolean;
   trackUsage?: boolean;
 }> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
@@ -705,7 +706,11 @@ export async function notifyLauncherTurn(
       if (typeof body.cancelledByUser !== "boolean") {
         throw new Error("Launcher browser control channel returned an invalid turn release result");
       }
-      return { cancelledByUser: body.cancelledByUser };
+      return {
+        cancelledByUser: body.cancelledByUser,
+        // The launcher flags a turn whose page hit a sign-in wall; absent means not required.
+        ...(body.authenticationRequired === true ? { authenticationRequired: true } : {}),
+      };
     }
     return {};
   } catch (error) {

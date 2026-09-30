@@ -398,6 +398,7 @@ export function createLauncherDevAdapter(
       browserDiagnosticsPath: join(runtimeStateRoot, "diagnostics", "browser-turns"),
       threadEnvironmentStatePath: join(runtimeStateRoot, "thread-environments.json"),
       lunaCheckpointStatePath: join(runtimeStateRoot, "luna-checkpoints.json"),
+      resumeCheckpointStatePath: join(runtimeStateRoot, "resume-checkpoints.json"),
       turnTimeoutMs: 60 * 60_000,
       experimentalSkillAttachments: config.experimentalSkillAttachments,
       experimentalFreshConversationPerTurn: config.experimentalFreshConversationPerTurn,
@@ -602,6 +603,8 @@ export class DevChatDriver {
       proAvailable: this.config.proAvailable,
     });
     const limits = resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, this.config);
+    // The shared model limits already contain Bigger Context's logical Codex window. Reusing that
+    // value here keeps the DEV indicator and its local compaction trigger aligned with /models.
     const autoCompactTokenLimit = limits.autoCompactTokenLimit;
     const contextWindow = limits.contextWindow;
     return {

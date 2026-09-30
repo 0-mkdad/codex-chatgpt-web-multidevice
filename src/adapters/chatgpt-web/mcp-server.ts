@@ -5,11 +5,17 @@ import * as z from "zod/v4";
 import { namespacedToolName, type CodexTool } from "../../types";
 import { VERSION } from "../../version";
 import type { ChatGptTurnEnvironment } from "./environment";
+import {
+  chatGptWebMcpContextReadQuery,
+  type ChatGptWebMcpContextManifest,
+} from "./context-transport";
 import { CODEX_COMPACTION_CONTROL_WIRE_NAME } from "./native-compaction-control";
 import { callTurnBroker, TurnBrokerTimeoutError, type BrokerToolResult } from "./turn-broker";
 import { observeMcpToolCalls } from "./mcp-observation";
+import { CHATGPT_TURN_REFERENCE_RECOVERY_MARKER, CODEX_TURN_REFERENCE_RECOVERY_WIRE_NAME } from "./reference-recovery";
 
 interface ClaimedTurn {
+  contextTransport?: ChatGptWebMcpContextManifest;
   bindingId: string;
   activityId: string;
   environment: ChatGptTurnEnvironment & { expiresAt?: number };
@@ -471,9 +477,13 @@ export async function runChatGptMcpServer(options: {
       try {
         await settleTurnActivity(turnToken, activityId);
       } catch (cleanupError) {
+        // Preserve the original claim failure on the aggregate: cleanup must not bury the
+        // root cause that Codex needs to diagnose the claim path.
         throw new AggregateError(
           [error, cleanupError],
-          "Codex Native claim failed and its broker activity could not be retired",
+          `Codex Native claim failed: ${error instanceof Error ? error.message : String(error)}`
+            + ". Its broker activity could not be retired.",
+          { cause: error },
         );
       }
       throw error;
@@ -788,6 +798,25 @@ export async function runChatGptMcpServer(options: {
       extra,
       async claimed => {
         const { query, offset, limit, include_schema } = input;
+        // The reserved read-only context retrieval: chunk N of the turn's immutable MCP context.
+        // Nothing else may run through the inventory while the context is incomplete; the broker
+        // enforces that on every execution path.
+        const contextTransport = claimed.contextTransport;
+        const reservedContextQuery = contextTransport
+          ? chatGptWebMcpContextReadQuery(contextTransport.contextId)
+          : undefined;
+        if (contextTransport && reservedContextQuery && query?.trim() === reservedContextQuery) {
+          if (limit !== 1 || include_schema !== false) {
+            throw new Error("Codex MCP context inventory reads require limit=1 and include_schema=false");
+          }
+          const response = await callTurnBroker<Record<string, unknown>>(options.brokerSocketPath, {
+            method: "context_read",
+            bindingId: claimed.bindingId,
+            contextId: contextTransport.contextId,
+            chunk: offset,
+          }, 5_000, extra.signal);
+          return result(response);
+        }
         const bound = claimed.environment;
         const needle = query?.trim().toLowerCase();
         const visibleTools = safeVisibleTools(bound, contract);
@@ -868,7 +897,13 @@ export async function runChatGptMcpServer(options: {
     "codex_tool_call",
     {
       title: "Call any tool from the current Codex harness",
-      description: afterSafeStart(contract, "Invoke an exact wire_name returned by codex_tool_inventory. The outer Codex runtime performs the call, approvals, and UI lifecycle."),
+      description: afterSafeStart(contract, [
+        "Invoke an exact wire_name returned by codex_tool_inventory. The outer Codex runtime performs the call, approvals, and UI lifecycle.",
+        ...(contract === "native" ? [
+          `A pending context-compaction request can also provide the reserved ${CODEX_COMPACTION_CONTROL_WIRE_NAME} operation, which is not listed by inventory.`,
+          "Use only that request's issued control token and arguments {handoff_id, summary}. This operation submits the conversation summary to the pending Codex task; it does not execute commands, access files, or invoke other tools.",
+        ] : []),
+      ].join(" ")),
       inputSchema: {
         ...turnReferenceInput(contract),
         wire_name: z.string().min(1).max(1_000),
@@ -880,6 +915,17 @@ export async function runChatGptMcpServer(options: {
     async (toolInput, extra) => {
       const { wire_name, arguments: args, input } = toolInput;
       const requestId = turnReference(contract, toolInput);
+      if (contract === "native" && wire_name === CODEX_TURN_REFERENCE_RECOVERY_WIRE_NAME) {
+        if (input !== undefined || typeof args?.rejection_ticket !== "string"
+          || !/^rejection_[A-Za-z0-9_-]{32}$/.test(args.rejection_ticket)) {
+          throw new Error("Turn reference recovery requires the exact rejection_ticket and no freeform input");
+        }
+        console.error(`[chatgpt-web-mcp] turn_reference_recovery_request scope=${requestScopeSummary(extra)}`);
+        await callTurnBroker(options.brokerSocketPath, {
+          method: "request_recovery", token: requestId, rejectionTicket: args.rejection_ticket,
+        }, 5_000, extra.signal);
+        return result({ accepted: true, completion_marker: CHATGPT_TURN_REFERENCE_RECOVERY_MARKER });
+      }
       if (contract === "native" && wire_name === CODEX_COMPACTION_CONTROL_WIRE_NAME) {
         if (input !== undefined) {
           throw new Error("Compaction control handoff does not accept freeform input");

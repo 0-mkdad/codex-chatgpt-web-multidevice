@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { atomicWriteFile } from "../../config";
+import { criticalStoreLoadFailure } from "./store-diagnostics";
 import { parseDataUrl } from "../image";
 import type {
   CodexContentPart,
@@ -6,7 +10,8 @@ import type {
 } from "../../types";
 import { extractChatGptCompactionSourceRevision } from "./environment";
 import type { ChatGptBrowserWorker } from "./browser-worker";
-import { ChatGptCompactionHandoffAccepted } from "./adapter-error";
+import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
+import { MAX_COMPACTION_EXECUTION_STALL_MS } from "./concurrency";
 import type { CompactionTransactionHandle } from "./compaction-transaction";
 import type { ChatGptWebCapabilities } from "./model";
 import {
@@ -16,6 +21,88 @@ import {
 } from "./native-compaction-control";
 import type { BrokerToolResult, TurnBroker, TurnBrokerOwner } from "./turn-broker";
 import type { ChatGptTurnSession } from "./turn-execution";
+
+
+/**
+ * Durable, idempotent record of committed compaction handoffs.
+ *
+ * The summary lifetime must not be tied to the HTTP request that started the compaction: a
+ * Codex client timeout can orphan an otherwise successful handoff, and a retry must receive the
+ * SAME committed summary instead of replaying the transport. Keys are stored hashed; summaries
+ * are stored whole so a retry can be answered without any browser work.
+ */
+export class ChatGptCompactionHandoffStore {
+  private readonly entries = new Map<string, { summary: string; committedAt: string; traceId: string }>();
+  private loaded = false;
+
+  constructor(private readonly path?: string) {}
+
+  lookup(executionKey: string): { summary: string; committedAt: string; traceId: string } | undefined {
+    this.load();
+    return this.entries.get(this.key(executionKey));
+  }
+
+  /**
+   * Commit the compacted summary for this turn. Idempotent: committing the identical summary
+   * again reports `duplicate: true`; committing a DIFFERENT summary for the same turn is a
+   * handoff conflict and fails closed rather than creating two competing compacted histories.
+   */
+  commit(executionKey: string, summary: string, traceId: string): { duplicate: boolean } {
+    this.load();
+    const key = this.key(executionKey);
+    const existing = this.entries.get(key);
+    if (existing) {
+      if (existing.summary !== summary) {
+        throw new Error("ChatGPT compaction handoff conflict: a different summary was already committed for this turn");
+      }
+      return { duplicate: true };
+    }
+    this.entries.set(key, { summary, committedAt: new Date().toISOString(), traceId });
+    this.persist();
+    return { duplicate: false };
+  }
+
+  private key(executionKey: string): string {
+    return createHash("sha256").update(executionKey).digest("hex");
+  }
+
+  private load(): void {
+    if (this.loaded) return;
+    try {
+      if (!this.path || !existsSync(this.path)) {
+        this.loaded = true;
+        return;
+      }
+      const parsed = JSON.parse(readFileSync(this.path, "utf8")) as {
+        version?: number;
+        entries?: Record<string, { summary?: unknown; committedAt?: unknown; traceId?: unknown }>;
+      };
+      if (parsed.version !== 1 || !parsed.entries || typeof parsed.entries !== "object") {
+        throw new Error(`Invalid ChatGPT compaction handoff store: ${this.path}`);
+      }
+      for (const [key, value] of Object.entries(parsed.entries)) {
+        if (typeof value?.summary !== "string" || typeof value.committedAt !== "string" || typeof value.traceId !== "string") {
+          throw new Error(`Invalid ChatGPT compaction handoff entry: ${this.path}`);
+        }
+        this.entries.set(key, { summary: value.summary, committedAt: value.committedAt, traceId: value.traceId });
+      }
+      // Only a fully validated load marks the store as loaded; corruption keeps failing closed.
+      this.loaded = true;
+    } catch (error) {
+      throw criticalStoreLoadFailure("CompactionHandoff", this.path, error);
+    }
+  }
+
+  private persist(): void {
+    if (!this.path) return;
+    const payload = {
+      version: 1,
+      entries: Object.fromEntries(this.entries),
+    };
+    atomicWriteFile(this.path, `${JSON.stringify(payload, null, 2)}
+`);
+  }
+}
 
 export const LATEST_USER_PROMPT_MARKER = "CODEX_LATEST_USER_PROMPT_JSON";
 
@@ -128,7 +215,13 @@ function currentToolResults(
   return results;
 }
 
-export const MAX_COMPACTION_HANDOFF_TIMEOUT_MS = 5 * 60_000;
+/**
+ * Execution/settlement budget for an admitted compaction: the maximum time without meaningful
+ * progress after a browser slot has been granted. It must never measure queue wait — a queued
+ * compaction has not begun executing (see MAX_COMPACTION_EXECUTION_STALL_MS). Retained name kept
+ * for the handoff-scoped deadline this module arms at admission.
+ */
+export const MAX_COMPACTION_HANDOFF_TIMEOUT_MS = MAX_COMPACTION_EXECUTION_STALL_MS;
 
 function boundedCompactionTimeout(timeoutMs: number): number {
   return Math.min(timeoutMs, MAX_COMPACTION_HANDOFF_TIMEOUT_MS);
@@ -274,6 +367,13 @@ export async function settleActiveZeroRiskCompactionSource(
   });
 }
 
+export interface RetainedCompactionHandoffLifecycle {
+  /** The checkpoint browser turn was accepted into the logical queue (queue phase began). */
+  onQueued?: () => void;
+  /** The scheduler granted the checkpoint turn a browser slot (execution phase began). */
+  onAdmitted?: () => void;
+}
+
 export async function requestRetainedCompactionHandoff(
   worker: ChatGptBrowserWorker,
   parsed: CodexParsedRequest,
@@ -283,35 +383,68 @@ export async function requestRetainedCompactionHandoff(
   traceId: string,
   signal?: AbortSignal,
   timeoutMs = MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
+  lifecycle?: RetainedCompactionHandoffLifecycle,
 ): Promise<string> {
   const conversationKey = source.conversationKey();
   if (!conversationKey) throw new Error("The completed ChatGPT source has no retained conversation identity");
   const operationTimeoutMs = boundedCompactionTimeout(timeoutMs);
   const deadline = new AbortController();
-  const deadlineTimer = setTimeout(
-    () => deadline.abort(new Error(`ChatGPT compaction handoff timed out after ${operationTimeoutMs}ms`)),
-    operationTimeoutMs,
+  const handoffTimeoutError = new ChatGptWebAdapterError(
+    `ChatGPT compaction handoff did not complete within ${operationTimeoutMs}ms after browser admission`,
+    { status: 409, errorType: "invalid_request_error", code: "compaction_handoff_timeout", retryable: false },
   );
-  deadlineTimer.unref?.();
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  // The handoff deadline covers only the admitted execution of the checkpoint message. While
+  // that turn is queued there is no handoff execution to time out, so arming waits for the
+  // browser slot instead of starting at request time.
+  const armHandoffDeadline = (): void => {
+    if (deadline.signal.aborted) return;
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    deadlineTimer = setTimeout(
+      () => deadline.abort(handoffTimeoutError),
+      operationTimeoutMs,
+    );
+    deadlineTimer.unref?.();
+  };
   const operationSignal = signal
     ? AbortSignal.any([signal, deadline.signal])
     : deadline.signal;
   const browserAbort = new AbortController();
   const abortBrowser = () => browserAbort.abort(operationSignal.reason);
   let transaction: CompactionTransactionHandle | undefined;
+  let transactionPromise: Promise<CompactionTransactionHandle> | undefined;
+  let handoffWaiter: Promise<string> | undefined;
   let browser: Promise<string> | undefined;
   if (operationSignal.aborted) abortBrowser();
   else operationSignal.addEventListener("abort", abortBrowser, { once: true });
-  try {
-    const transactionPromise = broker.beginCompactionTransaction(traceId, operationTimeoutMs);
-    void transactionPromise.then(lateTransaction => {
-      if (operationSignal.aborted && transaction !== lateTransaction) {
+  // Admission gate: every broker binding below waits for the browser slot. The one-shot control
+  // capability is created only at admission — binding it while the checkpoint turn is queued
+  // would let its bounded TTL expire before any handoff could begin.
+  let resolveAdmission!: () => void;
+  const admissionPromise = new Promise<void>(resolve => { resolveAdmission = resolve; });
+  const beginTransactionAtAdmission = (): Promise<CompactionTransactionHandle> => {
+    transactionPromise ??= admissionPromise.then(() =>
+      broker.beginCompactionTransaction(traceId, operationTimeoutMs)
+    ).then(lateTransaction => {
+      if (operationSignal.aborted) {
         broker.abortCompactionTransaction(lateTransaction.token);
+        throw operationSignal.reason instanceof Error
+          ? operationSignal.reason
+          : new Error("ChatGPT compaction handoff aborted before admission");
       }
-    }, () => {});
-    transaction = await withCompactionAbort(transactionPromise, operationSignal);
-    const instruction = structuredCompactionHandoffInstruction(transaction);
-    const prepare = async () => ({ text: instruction, images: [], release: () => {} });
+      transaction = lateTransaction;
+      return lateTransaction;
+    });
+    return transactionPromise;
+  };
+  // The waiter must register the moment the control capability exists and before the browser
+  // turn can settle, so an immediate terminal response can never outrun the handoff race.
+  // Admission itself waits only for the capability, never for the summary.
+  try {
+    const instructionAtAdmission = async () => structuredCompactionHandoffInstruction(
+      await beginTransactionAtAdmission(),
+    );
+    const prepare = async () => ({ text: await instructionAtAdmission(), images: [], release: () => {} });
     browser = worker.run({
       traceId,
       modelId: parsed.modelId,
@@ -320,21 +453,46 @@ export async function requestRetainedCompactionHandoff(
       // not receive an ordinary Codex tool environment for this checkpoint message.
       capabilities: { ...capabilities, localToolsEnabled: false },
       nativeConnector: true,
+      compaction: true,
       prepare,
       prepareResume: prepare,
       conversationKey,
       requireRetainedConversation: true,
       abortSignal: browserAbort.signal,
       onTextDelta: () => {},
+      ...(lifecycle?.onQueued ? { onQueued: lifecycle.onQueued } : {}),
+      onSlotGranted: async () => {
+        armHandoffDeadline();
+        lifecycle?.onAdmitted?.();
+        resolveAdmission();
+        await beginTransactionAtAdmission();
+        handoffWaiter ??= broker.waitForCompactionHandoff(transaction!.token, operationSignal);
+      },
     });
-    const browserFailure = browser.then<never>(
-      () => new Promise<never>(() => {}),
-      error => { throw error; },
-    );
+    // The waiter registration is chained onto the admission settlement BEFORE the check
+    // continuation below: in production the worker defers onSlotGranted through the microtask
+    // queue, so a check attached ahead of registration would always observe handoffWaiter as
+    // undefined and fail every retained handoff. The ??= keeps registration idempotent when the
+    // slot-grant callback wins the race instead.
+    const handoffRegistered = beginTransactionAtAdmission().then(adoptedTransaction => {
+      handoffWaiter ??= broker.waitForCompactionHandoff(adoptedTransaction.token, operationSignal);
+    });
+    const handoff = handoffRegistered.then(() => {
+      if (!handoffWaiter) throw new Error("ChatGPT compaction handoff waiter was not registered at admission");
+      return handoffWaiter;
+    });
+    const browserWithoutHandoff = browser.then<never>(() => {
+      // The control handler accepts the summary before replying to ChatGPT. A fully
+      // settled response without that receipt cannot become a successful checkpoint.
+      throw new ChatGptWebAdapterError(
+        "ChatGPT finished without sending the context summary to Codex. Check its response for a refusal or tool error.",
+        { status: 409, errorType: "invalid_request_error", code: "compaction_handoff_missing", retryable: false },
+      );
+    });
     const summary = await withCompactionAbort(
       Promise.race([
-        broker.waitForCompactionHandoff(transaction.token, operationSignal),
-        browserFailure,
+        handoff,
+        browserWithoutHandoff,
       ]),
       operationSignal,
     );
@@ -360,7 +518,7 @@ export async function requestRetainedCompactionHandoff(
       ).catch(() => {});
     }
     operationSignal.removeEventListener("abort", abortBrowser);
-    clearTimeout(deadlineTimer);
+    if (deadlineTimer) clearTimeout(deadlineTimer);
   }
 }
 

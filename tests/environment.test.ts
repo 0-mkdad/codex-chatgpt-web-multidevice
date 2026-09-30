@@ -1,9 +1,13 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, toNamespacedPath } from "node:path";
 import { chatGptTurnUserRevisionHistory, extractChatGptCompactionSourceRevision, extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractChatGptTurnUserRevision } from "../src/adapters/chatgpt-web/environment";
+import {
+  CHATGPT_WEB_ROLLOUT_PROFILE_ALLOW_IDENTICAL_WRITES,
+  directWriteDuplicateAnalysis,
+} from "../src/adapters/chatgpt-web/codex-rollout-environment";
 import { chatGptTurnExecutionKey } from "../src/adapters/chatgpt-web/turn-execution";
 import { rememberCompactionContinuation } from "../src/adapters/chatgpt-web/compaction-continuation";
 import { encodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
@@ -734,6 +738,54 @@ describe("trusted Codex task environment continuity", () => {
     };
 
     expect(new ChatGptThreadEnvironmentStore(statePath).resolve(next)).toEqual({
+      cwd: root,
+      roots: [root],
+      writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" },
+      tools: nextTools,
+    });
+  });
+
+  test("resolves a resumed same-thread continuation whose resent history carries the earlier environment item", () => {
+    const store = new ChatGptThreadEnvironmentStore();
+    store.resolve(currentWire());
+
+    const nextTools: CodexTool[] = [{ name: "resume_tool", description: "resume", parameters: { type: "object" } }];
+    const resumed = currentWire();
+    resumed.context.tools = nextTools;
+    resumed._rawBody = {
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread_current", turn_id: "turn_next" }),
+      },
+      input: [
+        {
+          type: "message",
+          id: "msg_context",
+          role: "user",
+          content: [{ type: "input_text", text: environmentXml }],
+        },
+        {
+          type: "message",
+          id: "msg_first_turn",
+          role: "user",
+          content: [{ type: "input_text", text: "Inspect the workspace" }],
+        },
+        {
+          type: "message",
+          id: "msg_assistant",
+          role: "assistant",
+          content: [{ type: "output_text", text: "PARENT_DONE" }],
+        },
+        {
+          type: "message",
+          id: "msg_active",
+          role: "user",
+          content: [{ type: "input_text", text: "Continue the same task" }],
+        },
+      ],
+    };
+
+    expect(store.resolve(resumed)).toEqual({
       cwd: root,
       roots: [root],
       writableRoots: [root],
@@ -1669,6 +1721,59 @@ describe("trusted Codex task environment continuity", () => {
     ).sandboxPolicy).toEqual({ type: "readOnly", networkAccess: true });
   });
 
+  test("native workspace-write grants survive duplicate entries, external output roots and cache reload", () => {
+    const fixture = resumedRootFixture();
+    const output = resolve(root, "..", "native-authorized-output");
+    const entries = [
+      { path: { type: "special", value: { kind: "root" } }, access: "read" },
+      { path: { type: "path", path: root }, access: "write" },
+      { path: { type: "special", value: { kind: "slash_tmp" } }, access: "write" },
+      { path: { type: "special", value: { kind: "tmpdir" } }, access: "write" },
+      { path: { type: "path", path: output }, access: "write" },
+      { path: { type: "path", path: output }, access: "write" },
+      { path: { type: "path", path: join(root, ".git") }, access: "read", missing_path_behavior: "skip" },
+    ];
+    const context = childTurnContext(rolloutTurnId, {
+      workspace_roots: [root],
+      sandbox_policy: { type: "workspace-write", writable_roots: [output], network_access: false },
+      permission_profile: { type: "managed", file_system: { type: "restricted", entries }, network: "restricted" },
+      file_system_sandbox_policy: { kind: "restricted", entries },
+    });
+    const cache = join(fixture.codexHome, "thread-environments.json");
+    for (const child of [false, true]) {
+      const request = child ? environmentlessChild(rolloutTurnId, "workspace-write") : fixture.request;
+      if (!child) {
+        const body = request._rawBody as { client_metadata: Record<string, string> };
+        const metadata = JSON.parse(body.client_metadata["x-codex-turn-metadata"]);
+        body.client_metadata["x-codex-turn-metadata"] = JSON.stringify({ ...metadata, sandbox_mode: "workspace-write" });
+      }
+      writeFileSync(fixture.rolloutPath, [
+        child ? childSessionMeta() : { type: "session_meta", payload: { id: rolloutThreadId, source: "vscode" } }, context,
+      ].map(value => JSON.stringify(value)).join("\n") + "\n");
+      for (let reload = 0; reload < 2; reload++) {
+        const actual = new ChatGptThreadEnvironmentStore(cache, Date.now, fixture.codexHome).resolve(request);
+        expect(actual.roots).toEqual([root]);
+        expect(actual.writableRoots).toEqual([root, output]);
+        expect(actual.sandboxPolicy).toEqual({ type: "workspaceWrite", writableRoots: [root, output], networkAccess: false });
+      }
+    }
+    // Adding an uncorroborated grant to either stored representation must fail.
+    const saved = readFileSync(cache, "utf8");
+    for (const field of ["writableRoots", "sandboxPolicy"] as const) {
+      const state = JSON.parse(saved);
+      const row = state.threads[rolloutThreadId];
+      (field === "writableRoots" ? row.writableRoots : row.sandboxPolicy.writableRoots).push(resolve(root, "..", "unapproved"));
+      writeFileSync(cache, JSON.stringify(state));
+      expect(() => new ChatGptThreadEnvironmentStore(cache, Date.now, fixture.codexHome).resolve(environmentlessChild(rolloutTurnId, "workspace-write")))
+        .toThrow("Invalid persisted ChatGPT workspace-write policy");
+    }
+    // The explicit legacy grant alone cannot authorize a missing profile write.
+    entries.splice(4, 2);
+    writeFileSync(fixture.rolloutPath, [childSessionMeta(), context].map(value => JSON.stringify(value)).join("\n") + "\n");
+    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, fixture.codexHome).resolve(environmentlessChild(rolloutTurnId, "workspace-write")))
+      .toThrow("workspace-write permission profile is inconsistent");
+  });
+
   test("fails closed when canonical rollout proof is absent or permission fields diverge", () => {
     const codexHome = mkdtempSync(join(tmpdir(), "codex-chatgpt-rollout-fail-closed-"));
     temporaryRoots.push(codexHome);
@@ -1759,5 +1864,292 @@ describe("trusted Codex task environment continuity", () => {
     });
     expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(malformed))
       .toThrow("missing cwd");
+  });
+
+  describe("V-C rollout profile duplicate tolerance", () => {
+    test("keeps the V-C flag on for this regression suite", () => {
+      expect(CHATGPT_WEB_ROLLOUT_PROFILE_ALLOW_IDENTICAL_WRITES).toBe(true);
+    });
+
+    function vcWrite(path: string): Record<string, unknown> {
+      return { path: { type: "path", path }, access: "write" };
+    }
+
+    function vcGuard(path: string): Record<string, unknown> {
+      return { path: { type: "path", path }, access: "read", missing_path_behavior: "skip" };
+    }
+
+    function vcWorkspaceEntries(writes: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+      return [
+        { path: { type: "special", value: { kind: "root" } }, access: "read" },
+        ...writes,
+        { path: { type: "special", value: { kind: "slash_tmp" } }, access: "write" },
+        { path: { type: "special", value: { kind: "tmpdir" } }, access: "write" },
+      ];
+    }
+
+    function vcFixture(
+      entries: Array<Record<string, unknown>>,
+      options: {
+        cwd?: string;
+        workspaceRoots?: string[];
+        writableRoots?: string[];
+        networkAccess?: boolean;
+        profileNetwork?: string;
+      } = {},
+    ): { codexHome: string; request: CodexParsedRequest } {
+      const codexHome = mkdtempSync(join(tmpdir(), "codex-chatgpt-vc-duplicates-"));
+      temporaryRoots.push(codexHome);
+      const rolloutPath = join(codexHome, "sessions", "2026", "09", "04",
+        `rollout-2026-09-04T15-30-36-${rolloutThreadId}.jsonl`);
+      const cwdRoot = options.cwd ?? root;
+      const workspaceRoots = options.workspaceRoots ?? [cwdRoot];
+      mkdirSync(dirname(rolloutPath), { recursive: true });
+      writeFileSync(rolloutPath, [
+        JSON.stringify(childSessionMeta()),
+        JSON.stringify(childTurnContext(rolloutTurnId, {
+          cwd: cwdRoot,
+          workspace_roots: workspaceRoots,
+          sandbox_policy: {
+            type: "workspace-write",
+            ...(options.writableRoots ? { writable_roots: options.writableRoots } : {}),
+            network_access: options.networkAccess ?? false,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+          },
+          permission_profile: {
+            type: "managed",
+            file_system: { type: "restricted", entries },
+            network: options.profileNetwork ?? "restricted",
+          },
+          file_system_sandbox_policy: { kind: "restricted", entries },
+        })),
+      ].join("\n") + "\n");
+      return {
+        codexHome,
+        request: environmentlessChild(rolloutTurnId, "workspace-write", workspaceRoots),
+      };
+    }
+
+    test("resolves a clean multi-root workspace-write profile without duplicates", () => {
+      const auxiliary = resolve(root, "rollout-vc-auxiliary");
+      const { codexHome, request } = vcFixture(vcWorkspaceEntries([
+        vcWrite(root),
+        vcWrite(auxiliary),
+      ]), { workspaceRoots: [root, auxiliary], writableRoots: [auxiliary] });
+      expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request)).toEqual({
+        cwd: root,
+        roots: [root, auxiliary],
+        writableRoots: [root, auxiliary],
+        sandboxPolicy: { type: "workspaceWrite", writableRoots: [root, auxiliary], networkAccess: false },
+        tools: [],
+      });
+    });
+
+    test("keeps a single-root workspace-write profile unchanged", () => {
+      const { codexHome, request } = vcFixture(vcWorkspaceEntries([vcWrite(root)]));
+      expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request)).toEqual({
+        cwd: root,
+        roots: [root],
+        writableRoots: [root],
+        sandboxPolicy: { type: "workspaceWrite", writableRoots: [root], networkAccess: false },
+        tools: [],
+      });
+    });
+
+    test("collapses byte-identical duplicate direct writes (3 writes / 2 unique)", () => {
+      const auxiliary = resolve(root, "rollout-vc-auxiliary");
+      const { codexHome, request } = vcFixture(vcWorkspaceEntries([
+        vcWrite(root),
+        vcWrite(auxiliary),
+        vcWrite(root),
+      ]), { workspaceRoots: [root, auxiliary], writableRoots: [auxiliary] });
+      expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request)).toEqual({
+        cwd: root,
+        roots: [root, auxiliary],
+        writableRoots: [root, auxiliary],
+        sandboxPolicy: { type: "workspaceWrite", writableRoots: [root, auxiliary], networkAccess: false },
+        tools: [],
+      });
+    });
+
+    test("resolves the poisoned multi-root profile (7 writes / 3 unique) and traces the collapse", () => {
+      const parentRoot = resolve(root, "rollout-vc-parent");
+      const projectRoot = resolve(parentRoot, "project");
+      const vizRoot = resolve(root, "rollout-vc-visualization");
+      const entries = [
+        { path: { type: "special", value: { kind: "root" } }, access: "read" },
+        vcWrite(parentRoot),
+        vcWrite(projectRoot),
+        vcWrite(vizRoot),
+        { path: { type: "special", value: { kind: "slash_tmp" } }, access: "write" },
+        { path: { type: "special", value: { kind: "tmpdir" } }, access: "write" },
+        vcWrite(parentRoot),
+        vcWrite(vizRoot),
+        vcWrite(projectRoot),
+        vcWrite(vizRoot),
+        vcGuard(join(parentRoot, ".git")),
+        vcGuard(join(projectRoot, ".git")),
+        vcGuard(join(vizRoot, ".git")),
+        vcGuard(join(parentRoot, ".agents")),
+        vcGuard(join(projectRoot, ".agents")),
+        vcGuard(join(vizRoot, ".agents")),
+        vcGuard(join(parentRoot, ".codex")),
+        vcGuard(join(projectRoot, ".codex")),
+        vcGuard(join(vizRoot, ".codex")),
+        vcGuard(join(projectRoot, ".codex")),
+      ];
+      expect(entries.filter(entry => entry.access === "write"
+        && (entry.path as Record<string, string>).type === "path").length).toBe(7);
+      const { codexHome, request } = vcFixture(entries, {
+        cwd: projectRoot,
+        workspaceRoots: [parentRoot, projectRoot, vizRoot],
+        writableRoots: [parentRoot, vizRoot],
+      });
+      const traces: string[] = [];
+      const info = spyOn(console, "info").mockImplementation((...args) => {
+        traces.push(args.join(" "));
+      });
+      try {
+        expect(new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request)).toEqual({
+          cwd: projectRoot,
+          roots: [parentRoot, projectRoot, vizRoot],
+          writableRoots: [projectRoot, parentRoot, vizRoot],
+          sandboxPolicy: { type: "workspaceWrite", writableRoots: [projectRoot, parentRoot, vizRoot], networkAccess: false },
+          tools: [],
+        });
+      } finally {
+        info.mockRestore();
+      }
+      const collapseLine = traces.find(line => line.includes('"event":"rollout_profile_duplicate_collapse"'));
+      expect(collapseLine).toBeDefined();
+      expect(collapseLine).toContain('"outcome":"accepted-identical"');
+      expect(collapseLine).toContain('"direct_entries_before":7');
+      expect(collapseLine).toContain('"unique_path_groups":3');
+      expect(collapseLine).toContain('"entries_after":3');
+      expect(collapseLine).toContain('"duplicate_groups":3');
+      for (const secret of [parentRoot, projectRoot, vizRoot]) expect(collapseLine!).not.toContain(secret);
+    });
+
+    test("rejects a conflicting duplicate and traces rejected-conflicting", () => {
+      const parentRoot = resolve(root, "rollout-vc-parent");
+      const projectRoot = resolve(parentRoot, "project");
+      const vizRoot = resolve(root, "rollout-vc-visualization");
+      const entries = [
+        { path: { type: "special", value: { kind: "root" } }, access: "read" },
+        vcWrite(parentRoot),
+        vcWrite(projectRoot),
+        vcWrite(vizRoot),
+        { path: { type: "special", value: { kind: "slash_tmp" } }, access: "write" },
+        { path: { type: "special", value: { kind: "tmpdir" } }, access: "write" },
+        vcWrite(parentRoot),
+        vcWrite(vizRoot),
+        vcWrite(projectRoot),
+        { ...vcWrite(vizRoot), unknown_policy: "divergent" },
+      ];
+      const { codexHome, request } = vcFixture(entries, {
+        cwd: projectRoot,
+        workspaceRoots: [parentRoot, projectRoot, vizRoot],
+        writableRoots: [parentRoot, vizRoot],
+      });
+      const traces: string[] = [];
+      const capture = (...args: unknown[]) => {
+        traces.push(args.join(" "));
+      };
+      const info = spyOn(console, "info").mockImplementation(capture);
+      const warn = spyOn(console, "warn").mockImplementation(capture);
+      try {
+        expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request))
+          .toThrow("workspace-write permission profile is inconsistent");
+      } finally {
+        info.mockRestore();
+        warn.mockRestore();
+      }
+      const collapseLine = traces.find(line => line.includes('"event":"rollout_profile_duplicate_collapse"'));
+      expect(collapseLine).toBeDefined();
+      expect(collapseLine).toContain('"outcome":"rejected-conflicting"');
+    });
+
+    test("keeps network mismatch fatal even when every duplicate is identical", () => {
+      const parentRoot = resolve(root, "rollout-vc-parent");
+      const projectRoot = resolve(parentRoot, "project");
+      const vizRoot = resolve(root, "rollout-vc-visualization");
+      const entries = [
+        { path: { type: "special", value: { kind: "root" } }, access: "read" },
+        vcWrite(parentRoot),
+        vcWrite(projectRoot),
+        vcWrite(vizRoot),
+        { path: { type: "special", value: { kind: "slash_tmp" } }, access: "write" },
+        { path: { type: "special", value: { kind: "tmpdir" } }, access: "write" },
+        vcWrite(parentRoot),
+        vcWrite(vizRoot),
+        vcWrite(projectRoot),
+        vcWrite(vizRoot),
+      ];
+      const { codexHome, request } = vcFixture(entries, {
+        cwd: projectRoot,
+        workspaceRoots: [parentRoot, projectRoot, vizRoot],
+        writableRoots: [parentRoot, vizRoot],
+        networkAccess: false,
+        profileNetwork: "enabled",
+      });
+      expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request))
+        .toThrow("workspace-write permission profile is inconsistent");
+    });
+
+    test("keeps a malformed write entry (missing_path_behavior) fatal before any collapse", () => {
+      const auxiliary = resolve(root, "rollout-vc-auxiliary");
+      const { codexHome, request } = vcFixture(vcWorkspaceEntries([
+        vcWrite(root),
+        vcWrite(auxiliary),
+        { path: { type: "path", path: root }, access: "write", missing_path_behavior: "skip" },
+      ]), { workspaceRoots: [root, auxiliary], writableRoots: [auxiliary] });
+      expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request))
+        .toThrow("workspace-write permission profile is inconsistent");
+    });
+
+    test("duplicate analysis fails closed on any semantic difference within one path group", () => {
+      const writeEntry = { path: { type: "path", path: root }, access: "write" };
+      // Same canonical path identity but different access.
+      expect(directWriteDuplicateAnalysis([
+        { entry: writeEntry, resolved: root },
+        { entry: { path: { type: "path", path: root }, access: "read" }, resolved: root },
+      ]).conflicting).toBe(true);
+      // Same canonical path identity but different path.type.
+      expect(directWriteDuplicateAnalysis([
+        { entry: writeEntry, resolved: root },
+        { entry: { path: { type: "glob_pattern", pattern: `${root}/**` }, access: "write" }, resolved: root },
+      ]).conflicting).toBe(true);
+      // Same canonical path identity but different missing_path_behavior.
+      expect(directWriteDuplicateAnalysis([
+        { entry: writeEntry, resolved: root },
+        { entry: { path: { type: "path", path: root }, access: "write", missing_path_behavior: "skip" }, resolved: root },
+      ]).conflicting).toBe(true);
+      // Same canonical path identity but an extra security-relevant field on one copy.
+      expect(directWriteDuplicateAnalysis([
+        { entry: writeEntry, resolved: root },
+        { entry: { path: { type: "path", path: root }, access: "write", unknown_policy: "future-field" }, resolved: root },
+      ]).conflicting).toBe(true);
+    });
+
+    test("duplicate analysis accepts an identical permission repeated for one canonical identity", () => {
+      const analysis = directWriteDuplicateAnalysis([
+        { entry: { path: { type: "path", path: root }, access: "write" }, resolved: root },
+        { entry: { path: { type: "path", path: resolve(root, ".") }, access: "write" }, resolved: resolve(root, ".") },
+      ]);
+      expect(analysis.conflicting).toBe(false);
+      expect(analysis.pathGroups).toBe(1);
+      expect(analysis.duplicateGroups).toBe(1);
+    });
+
+    test.skipIf(process.platform !== "win32")("duplicate analysis accepts a case/namespace variant of the same Windows identity", () => {
+      const analysis = directWriteDuplicateAnalysis([
+        { entry: { path: { type: "path", path: root }, access: "write" }, resolved: root },
+        { entry: { path: { type: "path", path: toNamespacedPath(root) }, access: "write" }, resolved: toNamespacedPath(root) },
+      ]);
+      expect(analysis.conflicting).toBe(false);
+      expect(analysis.duplicateGroups).toBe(1);
+      expect(analysis.pathGroups).toBe(1);
+    });
   });
 });

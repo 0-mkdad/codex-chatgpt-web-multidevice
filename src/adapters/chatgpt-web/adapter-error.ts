@@ -74,6 +74,26 @@ export function chatGptTurnSupersededError(): ChatGptWebAdapterError {
   );
 }
 
+/** Clean compaction preemption: the source owner was released at a safe tool boundary, so the
+ *  compacted canonical history is a complete replay input and the client may re-drive the turn. */
+export function chatGptCompactionPreemptedError(): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(
+    "ChatGPT web turn preempted by context compaction at a safe tool boundary.",
+    { status: 409, errorType: "invalid_request_error", code: "compaction_preempted", retryable: true },
+  );
+}
+
+/** Fail-closed preemption: native tool executions were still undecided when the owner was
+ *  released, so replaying the turn could duplicate native side effects. The outcome stays
+ *  deliberately unknown until an explicit recovery; blind retry must not re-execute them. */
+export function chatGptExecutionOutcomeUncertainError(pendingNativeExecutions: number): ChatGptWebAdapterError {
+  return new ChatGptWebAdapterError(
+    `ChatGPT web turn preempted by context compaction with ${pendingNativeExecutions} undecided native`
+    + " execution(s); automatic replay is refused.",
+    { status: 409, errorType: "invalid_request_error", code: "execution_outcome_uncertain", retryable: false },
+  );
+}
+
 export function chatGptStoppedThinkingError(): ChatGptWebAdapterError {
   return new ChatGptWebAdapterError(
     "ChatGPT displayed 'Stopped thinking' and could not continue this response. "

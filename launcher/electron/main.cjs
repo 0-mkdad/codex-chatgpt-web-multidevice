@@ -1,3 +1,5 @@
+const { configureWindowsTrust } = require("./windows-trust.cjs");
+configureWindowsTrust();
 const languages = require("./languages.json");
 const fs = require("node:fs");
 const net = require("node:net");
@@ -102,6 +104,10 @@ let catalogVerificationTimer = null;
 let catalogVerificationInFlight = false;
 let updateController = null;
 let limitsController = null;
+// Renderer actions can arrive as soon as loadRenderer starts, before startup has acquired any
+// runtime operation lock. Keep setup/settings behind startup and its recovery as one boundary.
+let finishRuntimeStartup;
+const runtimeStartup = new Promise(resolve => { finishRuntimeStartup = resolve; });
 
 function findFreePort() {
   return new Promise((resolve, reject) => {
@@ -515,7 +521,21 @@ function syncFreshConversationPreference(stateStore, config) {
 }
 
 function registerIpc({ logger, stateStore }) {
-  const handle = (channel, handler) => registerLoggedIpc(ipcMain, logger, channel, handler);
+  // Runtime-mutating renderer actions must wait until startup (and its recovery) has
+  // finished acquiring its runtime operation locks before they can touch the runtime.
+  const runtimeChannels = new Set([
+    "launcher:setup-core", "launcher:setup-mcp", "launcher:uninstall-integration",
+    "launcher:bigger-context", "launcher:skill-attachments", "launcher:fresh-conversation-per-turn",
+    "launcher:use-saved-chats", "launcher:zero-risk-pro", "launcher:browser-interaction-mode",
+    "launcher:mcp-verify", "launcher:doctor", "launcher:cancel-turns",
+    "launcher:browser-login", "launcher:browser-passkey-login", "launcher:browser-passkey-login-continue",
+    "launcher:browser-logout", "launcher:browser-smoke",
+    "launcher:limits-setup", "launcher:update-install", "launcher:complete-onboarding",
+  ]);
+  const handle = (channel, handler) => registerLoggedIpc(ipcMain, logger, channel, async (...args) => {
+    if (runtimeChannels.has(channel)) await runtimeStartup;
+    return handler(...args);
+  });
   handle("launcher:limits", () => limitsController.snapshot());
   handle("launcher:limits-setup", async () => {
     if (runtimeHost.currentOperation()) throw new Error("Finish the current launcher operation before checking Limits.");
@@ -1194,6 +1214,9 @@ async function start() {
   await loadRenderer(mainWindow);
   if (!launcherSmokeTest) void updateController.checkOnce();
   if (launcherSmokeTest) {
+    // The smoke test starts no managed runtime and skips the saved-session refresh, so
+    // release the startup barrier before the verification steps that may abort startup.
+    finishRuntimeStartup();
     const smokeRuntimeRoot = runtimeRootProvider();
     if (app.isPackaged && !smokeRuntimeRoot) {
       throw new Error("Packaged launcher smoke test could not install its durable runtime");
@@ -1266,7 +1289,11 @@ async function start() {
         logger.error("dev_profile.runtime_start_failed", { message });
         const failed = stateStore.update({ mcpSetupComplete: false });
         send("launcher:state-changed", failed);
-      });
+      }).finally(finishRuntimeStartup);
+    } else {
+      // No managed runtime is configured. Startup still owns the saved-session refresh,
+      // so release the renderer barrier only once that recovery has settled.
+      void startupAuthenticationRefresh.catch(() => {}).finally(finishRuntimeStartup);
     }
   } else void (async () => {
     await startupAuthenticationRefresh;
@@ -1401,7 +1428,7 @@ async function start() {
     const state = stateStore.update({ coreSetupComplete: false, codexCatalogVerified: false });
     send("launcher:state-changed", state);
     publishOperation({ name: "runtime-start", status: "failed", message });
-  });
+  }).finally(finishRuntimeStartup);
 
   app.on("before-quit", (event) => {
     if (exitCommitted) return;
@@ -1413,6 +1440,9 @@ async function start() {
 }
 
 void start().catch(async (error) => {
+  // A failed startup must still release the renderer runtime barrier: the fatal dialog
+  // below can keep the process alive while the user chooses Retry or Quit.
+  finishRuntimeStartup();
   startupFailed = true;
   const message = error instanceof Error ? error.message : String(error);
   try {

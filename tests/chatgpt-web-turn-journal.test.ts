@@ -52,6 +52,41 @@ test("turn journal survives a process-style reload without persisting browser co
   expect(reloaded.checkpoint(executionKey)?.responseHash).toMatch(/^[a-f0-9]{64}$/);
 });
 
+test("multipart Send and acknowledgement progress persists with strict ordering", () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-turn-journal-multipart-"));
+  roots.push(root);
+  const path = join(root, "turn-journal.json");
+  const executionKey = "namespace:multipart-turn";
+  const journal = new ChatGptTurnJournal(path, () => 2_000);
+
+  journal.recordMultipartStage(executionKey, "sent", 1, { traceId: "trace-multipart" });
+  expect(new ChatGptTurnJournal(path).checkpoint(executionKey)).toMatchObject({
+    submissionPhase: "send_activated",
+    completion: "running",
+    multipartLastSentStage: 1,
+  });
+  expect(new ChatGptTurnJournal(path).checkpoint(executionKey)?.multipartLastAcknowledgedStage).toBeUndefined();
+
+  journal.recordMultipartStage(executionKey, "acknowledged", 1, { traceId: "trace-multipart" });
+  journal.recordMultipartStage(executionKey, "sent", 2, { traceId: "trace-multipart" });
+  expect(new ChatGptTurnJournal(path).checkpoint(executionKey)).toMatchObject({
+    multipartLastSentStage: 2,
+    multipartLastAcknowledgedStage: 1,
+  });
+  expect(() => journal.recordMultipartStage(executionKey, "sent", 3, { traceId: "trace-multipart" }))
+    .toThrow("send journal ordering violation");
+  expect(() => journal.recordMultipartStage(executionKey, "acknowledged", 1, { traceId: "trace-multipart" }))
+    .toThrow("acknowledgement journal ordering violation");
+
+  journal.recordMultipartStage(executionKey, "acknowledged", 2, { traceId: "trace-multipart" });
+  journal.recordSubmission(executionKey, "accepted", { traceId: "trace-multipart" });
+  expect(new ChatGptTurnJournal(path).checkpoint(executionKey)).toMatchObject({
+    submissionPhase: "accepted",
+    multipartLastSentStage: 2,
+    multipartLastAcknowledgedStage: 2,
+  });
+});
+
 test("running post-Send tombstones do not silently expire while terminal checkpoints do", () => {
   const root = mkdtempSync(join(tmpdir(), "cgw-turn-journal-ttl-"));
   roots.push(root);

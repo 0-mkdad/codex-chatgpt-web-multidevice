@@ -163,7 +163,16 @@ export function resolveBrokerEndpoint(value: string): string {
 }
 
 const atomicWaitCell = new Int32Array(new SharedArrayBuffer(4));
-const WINDOWS_RENAME_RETRY_DELAYS_MS = [25, 50, 100, 150, 250, 350, 500] as const;
+/**
+ * v6.1.11 evaluation (spec item 8): the previous table totaled 1425ms, which live evidence
+ * showed is inside the Defender/file-lock transient window on Windows. The table is extended to
+ * 4675ms, which covers the typical transient lock while staying far below a stall-sized budget.
+ * A ~30s ceiling was deliberately REJECTED: these retries block the calling thread via
+ * Atomics.wait, so a long table would freeze the whole bridge runtime (browser queue included)
+ * on a single locked write. Permanent permission errors still surface after the full table
+ * because EACCES/EPERM/EBUSY are retried but never swallowed.
+ */
+const WINDOWS_RENAME_RETRY_DELAYS_MS = [25, 50, 100, 150, 250, 350, 500, 750, 1000, 1500] as const;
 
 function renameAtomicFile(source: string, destination: string): void {
   for (let attempt = 0; ; attempt += 1) {
@@ -623,6 +632,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       brokerSocketPath: config.brokerSocketPath,
       threadEnvironmentStatePath: join(getConfigDir(), "runtime", "thread-environments.json"),
       lunaCheckpointStatePath: join(getConfigDir(), "runtime", "luna-checkpoints.json"),
+      resumeCheckpointStatePath: join(getConfigDir(), "runtime", "resume-checkpoints.json"),
       turnJournalStatePath: join(getConfigDir(), "runtime", "turn-journal.json"),
       headed: config.headed,
       localToolsEnabled: config.mode === "full",

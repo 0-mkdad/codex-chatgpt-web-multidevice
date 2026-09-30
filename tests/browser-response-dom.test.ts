@@ -2,17 +2,23 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { createContext, runInContext } from "node:vm";
 import type { Locator } from "playwright-core";
-import { ChatGptBrowserWorker, ChatGptCompletionTracker, CHATGPT_COMPLETION_SETTLE_MS } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptBrowserWorker, ChatGptCompletionTracker, ChatGptVisibleTraceTracker, CHATGPT_COMPLETION_SETTLE_MS } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptMarkdownBuffer, type ChatGptMarkdownSegment } from "../src/adapters/chatgpt-web/markdown";
 
 const smokeHtml = readFileSync(new URL("./fixtures/chatgpt-dil-smoke.html", import.meta.url), "utf8");
+const powerCompleteHtml = readFileSync(new URL("./fixtures/chatgpt-power-complete.html", import.meta.url), "utf8");
+const powerStreamingHtml = readFileSync(new URL("./fixtures/chatgpt-power-streaming.html", import.meta.url), "utf8");
+// These captures are also edited as strings below. Windows checkouts use CRLF;
+// normalize before inserting test variants so they exercise the same DOM everywhere.
+const powerActivityHtml = readFileSync(new URL("./fixtures/chatgpt-power-activity.html", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+const activitySummariesHtml = readFileSync(new URL("./fixtures/chatgpt-activity-summaries.html", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 type Snapshot = {
   responsePresent: boolean;
   visibleText: string;
   fullHtml: string;
   markdownSegments: ChatGptMarkdownSegment[];
   completionActionVisible: boolean;
-  traceBlocks: { kind: string; text: string }[];
+  traceBlocks: { kind: "answer" | "commentary" | "status"; text: string }[];
 };
 
 // Execute the production page callback, with only missing Domino browser APIs supplied.
@@ -67,6 +73,52 @@ async function snapshot(html: string): Promise<Snapshot> {
   }
 }
 
+test("captured Activity progress is commentary before any assistant answer exists", async () => {
+  const progress = await snapshot(powerActivityHtml);
+  expect(progress.responsePresent).toBeTrue();
+  expect(progress.markdownSegments).toEqual([]);
+  expect(progress.completionActionVisible).toBeFalse();
+  expect(progress.traceBlocks.filter(block => block.kind === "commentary").map(block => block.text)).toEqual(["Text 5\nText 6\nText 4\nText 8"]);
+  const marker = '<span hidden="" data-chatgpt-agent-turn-start="">\n</span>';
+  expect(powerActivityHtml).toContain(marker);
+  const combined = powerActivityHtml.replace(marker, marker + '<div data-content-search-unit-key="answer"><h4 data-conversation-role="assistant"></h4><div data-markdown-text-style="assistant-message"><p>Final answer.</p></div></div>');
+  const answer = await snapshot(combined);
+  expect(answer.visibleText).toBe("Final answer.");
+  expect(answer.traceBlocks.some(block => block.kind === "commentary")).toBeTrue();
+});
+
+test("captured activity summaries use the status stream and keep actual commentary and answers separate", async () => {
+  const result = await snapshot(activitySummariesHtml);
+  expect(result.visibleText).toBe("answer 1");
+  expect(result.traceBlocks.filter(block => block.kind === "status").map(block => block.text))
+    .toEqual(Array.from({ length: 10 }, (_, index) => `status ${index + 1}`));
+  expect(result.traceBlocks.filter(block => block.kind === "commentary").map(block => block.text))
+    .toEqual(["commentary 1", "commentary 2"]);
+  const tracker = new ChatGptVisibleTraceTracker(0);
+  const events = tracker.observe(result.traceBlocks, true);
+  expect(events.map(event => event.kind)).toEqual([
+    "reasoning", "commentary", ...Array(8).fill("reasoning"), "commentary", "reasoning",
+  ]);
+  expect(tracker.observe(result.traceBlocks, true)).toEqual([]);
+
+  // Text, colour, and header placement do not determine the channel. The final
+  // answer owns its own unit even if its renderer uses the same tone attribute.
+  const changed = await snapshot(activitySummariesHtml
+    .replaceAll("status 1", "commentary 1")
+    .replace('data-markdown-text-style="assistant-message">\n<p>answer 1',
+      'data-markdown-text-style="assistant-message" data-markdown-text-tone="tertiary">\n<p>answer 1'));
+  expect(changed.visibleText).toBe("answer 1");
+  expect(changed.traceBlocks.filter(block => block.kind === "commentary").map(block => block.text))
+    .toEqual(["commentary 1", "commentary 2"]);
+  expect(changed.traceBlocks.find(block => block.kind === "status")?.text).toBe("commentary 1");
+
+  const hidden = await snapshot(activitySummariesHtml
+    .replace('<div data-markdown-text-style="assistant-message" data-markdown-text-tone="tertiary">',
+      '<div style="display:none"><div data-markdown-text-style="assistant-message" data-markdown-text-tone="tertiary">')
+    .replace('<p>status 1</p>\n</div>', '<p>status 1</p>\n</div></div>'));
+  expect(hidden.traceBlocks.some(block => block.text === "status 1")).toBeFalse();
+});
+
 test("keeps an unfinished hyperlink buffered and detects changed destinations after delivery", async () => {
   const page = (href: string) => `<section id="turn"><div class="markdown"><p data-start="0" data-end="99"><strong><a${href}>Open report</a></strong>.</p><p data-start="100" data-end="115">Next paragraph.</p></div></section>`;
   const buffer = new ChatGptMarkdownBuffer(markdown => markdown, 0);
@@ -79,6 +131,22 @@ test("keeps an unfinished hyperlink buffered and detects changed destinations af
   buffer.observe(changed.markdownSegments, 2000);
   expect(buffer.currentSnapshotIsConsistent()).toBeFalse();
   expect(() => buffer.finish()).toThrow("completed text block");
+});
+
+test("empty structural blocks append as their own identity instead of matching committed blocks by empty text", async () => {
+  // Upstream v6.1.2 (76aa5d1): empty text is not an identity — separate hr/image blocks share it,
+  // and the second one must append rather than align to (and absorb) the first.
+  const twoRules = '<section id="turn"><div class="markdown"><p>ALPHA_MARKER</p><hr/><hr/><p>OMEGA_MARKER</p></div><button data-testid="copy-turn-action-button"></button></section>';
+  const response = await snapshot(twoRules);
+  const buffer = new ChatGptMarkdownBuffer(markdown => markdown, 0);
+  buffer.observe(response.markdownSegments, 0);
+  const markdown = buffer.finish().markdown;
+  expect(markdown).toContain("ALPHA");
+  expect(markdown).toContain("OMEGA");
+  const ruleLines = markdown.split("\n").filter(line => /^\s*(-{3,}|\*( \*)*)\s*$/.test(line)).length;
+  expect(ruleLines).toBe(2);
+  expect(buffer.currentSnapshotIsConsistent()).toBeTrue();
+  expect(response.traceBlocks.some(block => block.kind === "answer" && block.text.includes("OMEGA_MARKER"))).toBeTrue();
 });
 
 test("captured DIL smoke response reaches Markdown delivery and stable completion", async () => {
@@ -106,6 +174,42 @@ test("captured DIL smoke response reaches Markdown delivery and stable completio
   }
 });
 
+test("captured power UI excludes the user footer during streaming and completes the assistant answer", async () => {
+  // Captured from the same live DEV turn on 2026-09-25. The user already has Copy/Share
+  // controls while the assistant streams; both live under one data-turn-key.
+  const streaming = await snapshot(powerStreamingHtml);
+  expect(streaming.visibleText).toContain("How a Rainbow Begins");
+  expect(streaming.visibleText).not.toContain("No tools or apps");
+  expect(streaming.completionActionVisible).toBeFalse();
+  const complete = await snapshot(powerCompleteHtml);
+  expect(complete.visibleText).toEndWith("STREAM_END_927");
+  expect(complete.completionActionVisible).toBeTrue();
+  const buffer = new ChatGptMarkdownBuffer();
+  buffer.observe(complete.markdownSegments, 0);
+  const markdown = buffer.finish().markdown;
+  expect(markdown).toContain("## How a Rainbow Begins");
+  expect(markdown).toContain("1. Sunlight enters the droplet and refracts.");
+  expect(markdown).toEndWith("STREAM\\_END\\_927");
+  const translated = await snapshot(powerCompleteHtml.replaceAll('aria-label="Copy"', 'aria-label="복사"'));
+  expect(translated.completionActionVisible).toBeTrue();
+  const noAssistant = await snapshot(powerCompleteHtml.replaceAll('data-conversation-role="assistant"', 'data-conversation-role="user"'));
+  expect(noAssistant.visibleText).toBe("");
+  expect(noAssistant.completionActionVisible).toBeFalse();
+  const userMarkdown = await snapshot(powerCompleteHtml.replace('data-user-message-bubble="true">',
+    'data-user-message-bubble="true"><div class="markdown">USER CONTENT</div>'));
+  expect(userMarkdown.visibleText).toBe(complete.visibleText);
+});
+
+test("captured power response keeps its Markdown ledger through final rendering", async () => {
+  const streaming = await snapshot(powerStreamingHtml);
+  const complete = await snapshot(powerCompleteHtml);
+  const buffer = new ChatGptMarkdownBuffer(markdown => markdown, 0);
+  buffer.observe(streaming.markdownSegments, 0);
+  buffer.observe(complete.markdownSegments, 1000);
+  expect(buffer.currentSnapshotIsConsistent()).toBeTrue();
+  expect(buffer.finish().markdown).toEndWith("STREAM\\_END\\_927");
+});
+
 test("DIL response extraction preserves ownership, commentary and completion boundaries", async () => {
   for (const html of [
     smokeHtml.replace('data-message-author-role="assistant"', 'data-message-author-role="user"'),
@@ -121,4 +225,23 @@ test("DIL response extraction preserves ownership, commentary and completion bou
   const noCopy = await snapshot(smokeHtml.replace('data-testid="copy-turn-action-button"', 'data-testid="other-action"'));
   expect(noCopy.visibleText).toBe("CODEX WEB GPT READY");
   expect(noCopy.completionActionVisible).toBeFalse();
+});
+
+test("a re-keyed replacement node extends committed text by suffix only, never duplicating", async () => {
+  // C10: after adoption the new projection must reconcile with committed content — the
+  // delivered "abcdef" prefix is never re-emitted; only the "ghi" suffix streams.
+  const turn = (text: string) => `<section id="turn"><div class="markdown"><p>${text}</p><p>tail</p></div><button data-testid="copy-turn-action-button"></button></section>`;
+  const buffer = new ChatGptMarkdownBuffer(markdown => markdown, 0);
+  const first = await snapshot(turn("abcdef"));
+  // The leading block settles immediately (zero stability window) and "abcdef" is delivered.
+  expect(buffer.observe(first.markdownSegments, 0)).toBe("abcdef");
+  expect(buffer.observe(first.markdownSegments, 1000)).toBe("");
+  // The renderer re-keys the group and re-renders the response with three more characters.
+  const second = await snapshot(turn("abcdefghi"));
+  // The re-opened block commits its markdown suffix only: "ghi", never the delivered prefix.
+  const delta = buffer.observe(second.markdownSegments, 2000);
+  expect(delta).not.toContain("abcdef");
+  expect(delta).toBe("ghi");
+  expect(buffer.currentSnapshotIsConsistent()).toBeTrue();
+  expect(buffer.finish().markdown.trim()).toStartWith("abcdefghi");
 });

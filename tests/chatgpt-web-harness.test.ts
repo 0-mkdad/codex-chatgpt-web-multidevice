@@ -24,8 +24,10 @@ import { ChatGptTurnJournal } from "../src/adapters/chatgpt-web/turn-journal";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
 import { ChatGptExternalTurnProgress, ChatGptMirroredTurnProgress, chatGptExternalProgressIsLive, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import { CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS, chatGptMcpInvocationTimeout } from "../src/adapters/chatgpt-web/mcp-server";
+import { CHATGPT_TURN_REFERENCE_RECOVERY_MARKER, CODEX_TURN_REFERENCE_RECOVERY_WIRE_NAME } from "../src/adapters/chatgpt-web/reference-recovery";
 import { defaultBrokerEndpoint } from "../src/config";
 import { estimateChatGptWebUsage } from "../src/adapters/chatgpt-web/usage";
+import { ChatGptResumeCheckpointStore, hashChatGptLunaAnswer } from "../src/adapters/chatgpt-web/rolling-checkpoint";
 import { decodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { parseRequest } from "../src/responses/parser";
 import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig, CodexTool } from "../src/types";
@@ -145,6 +147,18 @@ async function invokeAfterBrowserBoundary<T>(
   }
   await progress.acknowledgeToolBatch(snapshot.lastToolBatchRevision);
   return await invocation;
+}
+
+let directBrokerRequestSequence = 0;
+async function dispatchTurnBrokerForTest<T>(
+  broker: TurnBroker,
+  request: Record<string, unknown>,
+): Promise<T> {
+  const direct = broker as unknown as {
+    dispatch: (request: Record<string, unknown>, signal?: AbortSignal) => Promise<T>;
+  };
+  directBrokerRequestSequence += 1;
+  return await direct.dispatch({ id: `test_direct_${directBrokerRequestSequence}`, ...request });
 }
 
 interface GatewayProgramCall {
@@ -268,6 +282,15 @@ function proRequest(environmentText = environmentXml): CodexParsedRequest {
   return request;
 }
 
+function resumeWireMessage(role: "developer" | "user" | "assistant", text: string, turnId: string): Record<string, unknown> {
+  return {
+    type: "message",
+    role,
+    content: [{ type: role === "assistant" ? "output_text" : "input_text", text }],
+    internal_chat_message_metadata_passthrough: { turn_id: turnId },
+  };
+}
+
 function toolResult(value: Record<string, unknown>): BrokerToolResult {
   return {
     content: [{ type: "text", text: JSON.stringify(value) }],
@@ -283,6 +306,135 @@ function canonicalJson(value: unknown): string {
   }
   return JSON.stringify(value) ?? "null";
 }
+
+test("resume uses checkpoint plus delta for browser transport while Codex usage retains the canonical long history", async () => {
+  const threadId = `thread_resume_usage_${Date.now()}`;
+  const sourceTurnId = "turn_resume_usage_source";
+  const priorTurnId = "turn_resume_usage_prior";
+  const nextTurnId = "turn_resume_usage_next";
+  const checkpointPath = join(tempRoot, `resume-usage-${Date.now()}.json`);
+  const priorInput = Array.from({ length: 12 }, (_, index) => resumeWireMessage(
+    "user",
+    `EARLIER_CONTEXT_RECORD_${index}_${"word ".repeat(6_000)}`,
+    priorTurnId,
+  ));
+  const sourceInput = [...priorInput, resumeWireMessage("user", "Summarize the accumulated coding history.", sourceTurnId)];
+  const requestFor = (turnId: string, input: Record<string, unknown>[]) => {
+    const parsedRequest = parseRequest({
+      model: "gpt-5.6-sol",
+      input,
+      stream: true,
+      reasoning: { effort: "high" },
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
+      },
+    });
+    parsedRequest.modelId = "gpt-5.6-sol";
+    parsedRequest.options.reasoning = "high";
+    return parsedRequest;
+  };
+  const parentAnswer = "The long source turn completed.";
+  const source = requestFor(sourceTurnId, sourceInput);
+  new ChatGptResumeCheckpointStore(checkpointPath).commit(source, {
+    checkpoint: {
+      version: 2,
+      summary: [
+        "Objective:", "Continue the audited coding task.",
+        "State:", "- Twelve ordered history records were reviewed before the source turn.",
+        "Constraints:", "- Preserve the original decisions and exact task intent.",
+        "Evidence:", "- The source response completed successfully.",
+        "Decisions:", "- Resume with the latest delta.",
+        "Exact Data:", "- No source record text is copied here.",
+        "Pending:", "- Continue with the next regression check.",
+      ].join("\n"),
+    },
+    answerHash: hashChatGptLunaAnswer(parentAnswer),
+  }, parentAnswer);
+
+  const nextRequest = requestFor(nextTurnId, [
+    ...sourceInput,
+    resumeWireMessage("assistant", parentAnswer, sourceTurnId),
+    resumeWireMessage("developer", "Keep the latest safety constraint.", nextTurnId),
+    resumeWireMessage("user", "Continue with the next regression check.", nextTurnId),
+  ]);
+  const capabilities = {
+    localToolsEnabled: false,
+    solAvailable: true,
+    extraHighAvailable: false,
+    proAvailable: false,
+    experimentalBiggerContext: true,
+  };
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web",
+    baseUrl: `browser://chatgpt-resume-usage-${Date.now()}`,
+    chatgptWeb: {
+      localToolsEnabled: false,
+      solAvailable: true,
+      extraHighAvailable: false,
+      proAvailable: false,
+      experimentalBiggerContext: true,
+      resumeCheckpointStatePath: checkpointPath,
+    },
+  };
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run.bind(worker);
+  const answer = "The resumed turn completed.";
+  const preparedTexts: string[] = [];
+  const preparedPartCounts: Array<number | undefined> = [];
+  (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+    const prepared = await turn.prepare();
+    preparedTexts.push(prepared.multipart ? JSON.stringify(prepared.multipart.parts) : prepared.text);
+    preparedPartCounts.push(prepared.multipart?.parts.length);
+    await turn.onPreparedSelected?.(false);
+    turn.onTextDelta(answer);
+    return answer;
+  };
+
+  const info = spyOn(console, "info").mockImplementation(() => {});
+  try {
+    const events: AdapterEvent[] = [];
+    await createChatGptWebAdapter(provider).runTurn!(nextRequest, { headers: new Headers() }, event => events.push(event));
+    expect(preparedPartCounts[0]).toBeUndefined();
+    expect(preparedTexts[0]).toContain("Verified local cumulative task checkpoint");
+    expect(preparedTexts[0]).toContain("Continue with the next regression check.");
+    expect(preparedTexts[0]).not.toContain("EARLIER_CONTEXT_RECORD_0_");
+    expect(info.mock.calls.some(([line]) => String(line).includes("temporary_chat_resume_path=LOCAL_CHECKPOINT_PLUS_DELTA"))).toBeTrue();
+
+    const done = events.findLast((event): event is Extract<AdapterEvent, { type: "done" }> => event.type === "done");
+    if (!done) {
+      const terminal = events.at(-1);
+      throw new Error(terminal?.type === "error"
+        ? `Expected completion; adapter ended with ${terminal.code ?? "unknown"}: ${terminal.message}`
+        : `Expected completion; last adapter event was ${terminal?.type ?? "missing"}`);
+    }
+    const expected = estimateChatGptWebUsage(nextRequest, { answer, reasoning: [] }, capabilities, true);
+    expect(done!.usage?.inputTokens).toBe(expected.inputTokens);
+    expect(done!.usage!.inputTokens).toBeGreaterThan(expected.outputTokens * 20);
+
+    const divergedPrior = priorInput.map((item, index) => index === 0
+      ? resumeWireMessage("user", `CHANGED_PRIOR_HISTORY_SENTINEL_${"word ".repeat(6_000)}`, priorTurnId)
+      : item);
+    const fallbackTurnId = "turn_resume_usage_fallback";
+    const fallbackRequest = requestFor(fallbackTurnId, [
+      ...divergedPrior,
+      sourceInput.at(-1)!,
+      resumeWireMessage("assistant", parentAnswer, sourceTurnId),
+      resumeWireMessage("developer", "Keep the latest safety constraint.", fallbackTurnId),
+      resumeWireMessage("user", "Continue after earlier history changed.", fallbackTurnId),
+    ]);
+    const fallbackEvents: AdapterEvent[] = [];
+    await createChatGptWebAdapter(provider).runTurn!(fallbackRequest, { headers: new Headers() }, event => fallbackEvents.push(event));
+    expect(preparedTexts[1]).toContain("CHANGED_PRIOR_HISTORY_SENTINEL_");
+    expect(preparedTexts[1]).not.toContain("Verified local cumulative task checkpoint");
+    // V-B: the diverged full replay fits the restored two-part transport envelope.
+    expect(preparedPartCounts[1]).toBe(2);
+    expect(info.mock.calls.some(([line]) => String(line).includes("temporary_chat_resume_path=PARTIAL_MULTIPART_REPLAY"))).toBeTrue();
+    expect(fallbackEvents.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+  } finally {
+    info.mockRestore();
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+  }
+});
 
 describe("ChatGPT outer-native harness v4", () => {
   test("extracts authoritative environment, tool registry, and turn identity from the Codex wire envelope", () => {
@@ -1016,6 +1168,291 @@ describe("ChatGPT outer-native harness v4", () => {
     sessions.clear();
   });
 
+  test("a rejected unknown 36-char tool reference starts one fenced fresh browser continuation", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-reference-recovery-${process.pid}-${Date.now()}`);
+    const journalPath = join(tempRoot, `reference-recovery-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: "browser://chatgpt-reference-recovery-test",
+      chatgptWeb: { brokerSocketPath: socketPath, turnJournalStatePath: journalPath, localToolsEnabled: true, solAvailable: true },
+    };
+    const broker = TurnBroker.forSocket(socketPath);
+    const unrelatedToken = await broker.register(extractChatGptTurnEnvironment(rawWireRequest(environmentXml)), 60_000, "unrelated-turn");
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    const tokens: string[] = [];
+    const prompts: string[] = [];
+    let browserSends = 0;
+    let rejectedClaims = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      prompts.push(prepared.text);
+      const token = prepared.text.match(/turn_[A-Za-z0-9_-]{32}/)?.[0];
+      if (!token) throw new Error("prepared native prompt omitted the broker reference");
+      tokens.push(token);
+      turn.onSendActivated?.();
+      turn.onSubmitted?.();
+      browserSends += 1;
+      if (browserSends === 1) {
+        // A valid foreign token is accepted as the foreign turn by today's broker. The
+        // connector supplies no attested origin; the recovery path must not reclassify it as A.
+        const foreignClaim = await dispatchTurnBrokerForTest<{ bindingId: string }>(broker, {
+          method: "claim", token: unrelatedToken, activityId: "activity_foreign_recovery_0001",
+        });
+        if (!foreignClaim.bindingId.startsWith("binding_")) throw new Error("foreign claim was not accepted");
+        let ticket: string | undefined;
+        try {
+          await dispatchTurnBrokerForTest(broker, { method: "claim", token: token.slice(0, -1) });
+        } catch (error) {
+          rejectedClaims += 1;
+          ticket = (error as { rejectionTicket?: string }).rejectionTicket;
+        }
+        if (!ticket) throw new Error("unknown reference lacked a recovery rejection ticket");
+        await dispatchTurnBrokerForTest(broker, { method: "request_recovery", token, rejectionTicket: ticket });
+        const revision = await turn.completionFence!.begin();
+        if (revision === undefined || !await turn.completionFence!.commit(revision)) {
+          throw new Error("source browser generation did not reach a completion fence");
+        }
+        turn.onTextDelta(CHATGPT_TURN_REFERENCE_RECOVERY_MARKER);
+        return CHATGPT_TURN_REFERENCE_RECOVERY_MARKER;
+      }
+      turn.onTextDelta("Recovered continuation");
+      const revision = await turn.completionFence!.begin();
+      if (revision === undefined || !await turn.completionFence!.commit(revision)) {
+        throw new Error("fresh browser generation did not complete");
+      }
+      return "Recovered continuation";
+    };
+    try {
+      const events: AdapterEvent[] = [];
+      const request = rawWireRequest(environmentXml);
+      request.context.messages.unshift(
+        { role: "user", content: `${SUMMARY_PREFIX}\nCommitted post-compaction checkpoint`, timestamp: 0 },
+        { role: "assistant", content: [{ type: "toolCall", id: "call_known_prior", name: "exec_command", arguments: { cmd: "pwd" } }], timestamp: 0.1 },
+        { role: "toolResult", toolCallId: "call_known_prior", toolName: "exec_command", content: "known completed native work", isError: false, timestamp: 0.2 },
+      );
+      await createChatGptWebAdapter(provider).runTurn!(
+        request, { headers: new Headers() }, event => events.push(event),
+      );
+      expect(rejectedClaims).toBe(1);
+      expect(browserSends).toBe(2);
+      expect(tokens).toHaveLength(2);
+      expect(tokens[1]).not.toBe(tokens[0]);
+      expect(prompts[1]).toContain("fresh browser continuation");
+      expect(prompts[1]).toContain("Committed post-compaction checkpoint");
+      expect(prompts[1]).toContain("known completed native work");
+      const executionKey = `${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(request)}`;
+      const journal = new ChatGptTurnJournal(journalPath);
+      expect(journal.checkpoint(executionKey)?.completion).toBe("error");
+      expect(journal.checkpoint(`${executionKey}:reference-recovery-1`)?.completion).toBe("final");
+      expect(events.filter(event => event.type === "text_delta").map(event => event.text).join(""))
+        .toBe("Recovered continuation");
+      expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
+      await expect(dispatchTurnBrokerForTest(broker, { method: "claim", token: tokens[0] }))
+        .rejects.toThrow("retired_turn_reference");
+      const unrelatedClaim = await dispatchTurnBrokerForTest<{ bindingId: string }>(broker, {
+        method: "claim", token: unrelatedToken, activityId: "activity_foreign_recovery_0002",
+      });
+      expect(unrelatedClaim.bindingId).toStartWith("binding_");
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      broker.revoke(unrelatedToken);
+      await broker.close();
+    }
+  });
+
+  test("a second rejected reference ends recovery without a third browser send", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-reference-loop-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web", baseUrl: "browser://chatgpt-reference-loop-test",
+      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: true, solAvailable: true },
+    };
+    const broker = TurnBroker.forSocket(socketPath);
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserSends = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      const token = prepared.text.match(/turn_[A-Za-z0-9_-]{32}/)?.[0];
+      if (!token) throw new Error("turn token missing");
+      turn.onSendActivated?.();
+      turn.onSubmitted?.();
+      browserSends += 1;
+      let ticket: string | undefined;
+      try {
+        await dispatchTurnBrokerForTest(broker, { method: "claim", token: token.slice(0, -1) });
+      } catch (error) {
+        ticket = (error as { rejectionTicket?: string }).rejectionTicket;
+      }
+      if (!ticket) throw new Error("rejection ticket missing");
+      await dispatchTurnBrokerForTest(broker, { method: "request_recovery", token, rejectionTicket: ticket });
+      const revision = await turn.completionFence!.begin();
+      if (revision === undefined || !await turn.completionFence!.commit(revision)) {
+        throw new Error("completion fence missing");
+      }
+      turn.onTextDelta(CHATGPT_TURN_REFERENCE_RECOVERY_MARKER);
+      return CHATGPT_TURN_REFERENCE_RECOVERY_MARKER;
+    };
+    try {
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        rawWireRequest(environmentXml), { headers: new Headers() }, event => events.push(event),
+      );
+      expect(browserSends).toBe(2);
+      expect(events.find(event => event.type === "error")).toMatchObject({
+        type: "error", code: "turn_reference_recovery_exhausted", retryable: false,
+      });
+      expect(events.some(event => event.type === "text_delta"
+        && event.text.includes(CHATGPT_TURN_REFERENCE_RECOVERY_MARKER))).toBeFalse();
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await broker.close();
+    }
+  });
+
+  test("a recovered browser generation resumes across its native tool result without replay", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-reference-recovery-tool-${process.pid}-${Date.now()}`);
+    const journalPath = join(tempRoot, `reference-recovery-tool-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: "browser://chatgpt-reference-recovery-tool-test",
+      chatgptWeb: { brokerSocketPath: socketPath, turnJournalStatePath: journalPath, localToolsEnabled: true, solAvailable: true },
+    };
+    const broker = TurnBroker.forSocket(socketPath);
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserSends = 0;
+    let rejectedClaims = 0;
+    let recoveredNativeInvocations = 0;
+    let sourceToken = "";
+    let recoveryToken = "";
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      try {
+        const token = prepared.text.match(/turn_[A-Za-z0-9_-]{32}/)?.[0];
+        if (!token) throw new Error("prepared native prompt omitted the broker reference");
+        turn.onSendActivated?.();
+        turn.onSubmitted?.();
+        browserSends += 1;
+        if (browserSends === 1) {
+          sourceToken = token;
+          let ticket: string | undefined;
+          try {
+            await dispatchTurnBrokerForTest(broker, { method: "claim", token: token.slice(0, -1) });
+          } catch (error) {
+            rejectedClaims += 1;
+            ticket = (error as { rejectionTicket?: string }).rejectionTicket;
+          }
+          if (!ticket) throw new Error("unknown reference lacked a recovery rejection ticket");
+          await dispatchTurnBrokerForTest(broker, { method: "request_recovery", token, rejectionTicket: ticket });
+          const revision = await turn.completionFence!.begin();
+          if (revision === undefined || !await turn.completionFence!.commit(revision)) {
+            throw new Error("source browser generation did not reach a completion fence");
+          }
+          turn.onTextDelta(CHATGPT_TURN_REFERENCE_RECOVERY_MARKER);
+          return CHATGPT_TURN_REFERENCE_RECOVERY_MARKER;
+        }
+        if (browserSends !== 2) throw new Error("recovery unexpectedly opened another physical browser generation");
+        recoveryToken = token;
+        const activityId = "activity_recovery_tool_exact_once_0001";
+        const claimed = await dispatchTurnBrokerForTest<{ bindingId: string }>(broker, {
+          method: "claim", token, activityId,
+        });
+        recoveredNativeInvocations += 1;
+        const nativeResult = await invokeAfterBrowserBoundary(turn, () => dispatchTurnBrokerForTest<BrokerToolResult>(broker, {
+          method: "invoke",
+          bindingId: claimed.bindingId,
+          wireName: "exec_command",
+          freeform: false,
+          arguments: { cmd: "recovered exact-once operation" },
+        }));
+        expect(nativeResult.structuredContent).toEqual({ output: "recovered tool result", exit_code: 0 });
+        await dispatchTurnBrokerForTest(broker, { method: "activity_complete", token, activityId });
+        turn.onTextDelta("Recovered after tool");
+        const revision = await turn.completionFence!.begin();
+        if (revision === undefined || !await turn.completionFence!.commit(revision)) {
+          throw new Error("recovery browser generation did not reach a completion fence");
+        }
+        return "Recovered after tool";
+      } finally {
+        prepared.release();
+      }
+    };
+
+    try {
+      const adapter = createChatGptWebAdapter(provider);
+      const request = rawWireRequest(environmentXml);
+      const firstEvents: AdapterEvent[] = [];
+      await adapter.runTurn!(request, { headers: new Headers() }, event => firstEvents.push(event));
+
+      expect(rejectedClaims).toBe(1);
+      expect(browserSends).toBe(2);
+      expect(recoveredNativeInvocations).toBe(1);
+      const recoveredCall = firstEvents.find(
+        (event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start",
+      );
+      if (!recoveredCall) throw new Error("fresh recovery generation did not emit its native tool call");
+      expect(firstEvents.filter(event => event.type === "tool_call_start")).toHaveLength(1);
+      expect(firstEvents.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use", endTurn: false });
+
+      const continuation = structuredClone(request);
+      const toolCall = {
+        role: "assistant" as const,
+        content: [{
+          type: "toolCall" as const,
+          id: recoveredCall.id,
+          name: "exec_command",
+          arguments: { cmd: "recovered exact-once operation" },
+        }],
+        timestamp: 3,
+      };
+      const result = {
+        role: "toolResult" as const,
+        toolCallId: recoveredCall.id,
+        toolName: "exec_command",
+        content: JSON.stringify({ output: "recovered tool result", exit_code: 0 }),
+        isError: false,
+        timestamp: 4,
+      };
+      continuation.context.messages.push(toolCall, result);
+      ((continuation._rawBody as { input: unknown[] }).input).push(
+        {
+          type: "function_call",
+          call_id: recoveredCall.id,
+          name: "exec_command",
+          arguments: JSON.stringify({ cmd: "recovered exact-once operation" }),
+        },
+        {
+          type: "function_call_output",
+          call_id: recoveredCall.id,
+          output: result.content,
+        },
+      );
+
+      const finalEvents: AdapterEvent[] = [];
+      await adapter.runTurn!(continuation, { headers: new Headers() }, event => finalEvents.push(event));
+
+      expect(browserSends).toBe(2);
+      expect(recoveredNativeInvocations).toBe(1);
+      expect(finalEvents.filter(event => event.type === "tool_call_start")).toHaveLength(0);
+      expect(finalEvents.filter(event => event.type === "text_delta").map(event => event.text).join(""))
+        .toBe("Recovered after tool");
+      expect(finalEvents.at(-1)).toMatchObject({ type: "done", endTurn: true });
+      const sourceExecutionKey = `${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(request)}`;
+      const journal = new ChatGptTurnJournal(journalPath);
+      expect(journal.checkpoint(sourceExecutionKey)?.completion).toBe("error");
+      expect(journal.checkpoint(`${sourceExecutionKey}:reference-recovery-1`)?.completion).toBe("final");
+      await expect(dispatchTurnBrokerForTest(broker, { method: "claim", token: sourceToken }))
+        .rejects.toThrow("retired_turn_reference");
+      await expect(dispatchTurnBrokerForTest(broker, { method: "claim", token: recoveryToken }))
+        .rejects.toThrow("retired_turn_reference");
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      chatGptTurnSessions.clear();
+      await broker.close();
+    }
+  });
+
   test("a client disconnect detaches only its stream and the same round reconnects without another browser submission", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h4-abort-retry-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
@@ -1362,6 +1799,513 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(browserStarts).toBe(1);
 
       // A new daemon would have no in-memory browser owner. Preserve only the on-disk checkpoint.
+      chatGptTurnSessions.clear();
+      const restartEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => restartEvents.push(event),
+      );
+      expect(restartEvents.at(-1)).toMatchObject({
+        type: "error",
+        code: "chatgpt_restart_recovery_required",
+        status: 409,
+        retryable: false,
+      });
+      expect(browserStarts).toBe(1);
+    } finally {
+      chatGptTurnSessions.clear();
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+    }
+  });
+
+  test("a committed structured compaction handoff releases the post-Send restart tombstone for the same native turn", async () => {
+    // Greport incident 2026-09-28 (children 01a0e966-9847/-84f8): an accepted mid-generation
+    // turn auto-compacted with fresh-conversation mode; the handoff committed and retired the
+    // accepted source, but its durable "running" journal tombstone remained. Codex's designed
+    // resume of the SAME native turn then failed closed five times with
+    // chatgpt_restart_recovery_required ("before the local runtime restarted") although no
+    // runtime restart occurred. The committed handoff must release that tombstone.
+    const socketPath = brokerTestEndpoint(`cgw-h3-compjournal-${process.pid}-${Date.now()}`);
+    const journalPath = join(tempRoot, `compaction-handoff-journal-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-compaction-journal-${Date.now()}`,
+      chatgptWeb: {
+        browserHost: "launcher",
+        browserHostDescriptorPath: join(tempRoot, "compaction-journal-launcher.json"),
+        brokerSocketPath: socketPath,
+        turnTimeoutMs: 30_000,
+        localToolsEnabled: true,
+        solAvailable: true,
+        extraHighAvailable: true, proAvailable: true,
+        experimentalBiggerContext: true,
+        experimentalFreshConversationPerTurn: true,
+        turnJournalStatePath: journalPath,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      if (browserStarts === 1) {
+        // The original turn goes physical and stays in-flight mid-generation exactly like the
+        // incident: it only settles when the compaction's source retirement aborts it.
+        await turn.onSendActivated?.();
+        await new Promise<never>((_, reject) => {
+          turn.abortSignal?.addEventListener("abort", () => reject(new Error("browser turn aborted by source retirement")), { once: true });
+          setTimeout(() => reject(new Error("browser turn was never retired")), 15_000).unref?.();
+        });
+      }
+      const prepared = await turn.prepare();
+      try {
+        if (prepared.text.includes("This is a Codex history-compaction checkpoint, not a normal task turn.")) {
+          return "The task context was summarized for the compaction handoff.";
+        }
+        turn.onTextDelta("resumed turn final answer");
+        return "resumed turn final answer";
+      } finally {
+        prepared.release();
+      }
+    };
+
+    try {
+      const request = rawWireRequest(environmentXml);
+      const executionKey = `${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(request)}`;
+      const firstEvents: AdapterEvent[] = [];
+      const firstRun = createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => firstEvents.push(event),
+      ).catch(error => error);
+      // Each probe uses a fresh journal instance: the journal caches its file load, and the
+      // adapter writes the tombstone to the same path only after Send activation.
+      let tombstone = new ChatGptTurnJournal(journalPath).checkpoint(executionKey);
+      for (let attempt = 0; attempt < 100 && !tombstone; attempt += 1) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+        tombstone = new ChatGptTurnJournal(journalPath).checkpoint(executionKey);
+      }
+      expect(tombstone).toMatchObject({ submissionPhase: "send_activated" });
+
+      // The mid-turn auto-compaction runs while the accepted turn is still in flight, commits
+      // its handoff, and retires the accepted source.
+      const compactRequest = rawWireRequest(environmentXml);
+      compactRequest._compactionRequest = true;
+      const compactEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(compactRequest, { headers: new Headers() }, event => compactEvents.push(event));
+      expect(compactEvents.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+      expect(browserStarts).toBe(2);
+      await firstRun;
+
+      // Codex resumes the SAME native turn after the committed handoff: the tombstone for the
+      // superseded source is released, so the resume must proceed — not fail closed as a
+      // phantom post-restart replay.
+      const resumeEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(request, { headers: new Headers() }, event => resumeEvents.push(event));
+      expect(browserStarts).toBe(3);
+      expect(resumeEvents.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+      expect(resumeEvents.some(event => event.type === "error")).toBe(false);
+    } finally {
+      chatGptTurnSessions.clear();
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
+  test("a structured compaction that never commits keeps the post-Send restart tombstone fail-closed", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h3-compfail-${process.pid}-${Date.now()}`);
+    const journalPath = join(tempRoot, `compaction-fail-journal-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-compaction-fail-${Date.now()}`,
+      chatgptWeb: {
+        browserHost: "launcher",
+        browserHostDescriptorPath: join(tempRoot, "compaction-fail-launcher.json"),
+        brokerSocketPath: socketPath,
+        turnTimeoutMs: 30_000,
+        localToolsEnabled: true,
+        solAvailable: true,
+        extraHighAvailable: true, proAvailable: true,
+        experimentalBiggerContext: true,
+        experimentalFreshConversationPerTurn: true,
+        turnJournalStatePath: journalPath,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      if (browserStarts === 1) {
+        await turn.onSendActivated?.();
+        throw new Error("observer disappeared after Send activation");
+      }
+      // The fresh compaction browser turn itself fails: no handoff can commit.
+      throw new Error("compaction browser turn failed");
+    };
+
+    try {
+      const request = rawWireRequest(environmentXml);
+      const executionKey = `${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(request)}`;
+      const firstEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(request, { headers: new Headers() }, event => firstEvents.push(event));
+      expect(firstEvents.at(-1)).toMatchObject({ type: "error", code: "chatgpt_submission_ambiguous", retryable: false });
+
+      const compactRequest = rawWireRequest(environmentXml);
+      compactRequest._compactionRequest = true;
+      const compactEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(compactRequest, { headers: new Headers() }, event => compactEvents.push(event));
+      expect(compactEvents.at(-1)).toMatchObject({ type: "error", code: "compaction_handoff_failed" });
+      // No committed handoff means no release: the source tombstone survives (whatever its
+      // settled completion) and the designed fail-closed barrier stays armed.
+      expect(new ChatGptTurnJournal(journalPath).checkpoint(executionKey)).toBeDefined();
+
+      // No committed handoff means no release: re-issuing the accepted turn still fails closed.
+      const resumeEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(request, { headers: new Headers() }, event => resumeEvents.push(event));
+      expect(resumeEvents.at(-1)).toMatchObject({
+        type: "error",
+        code: "chatgpt_restart_recovery_required",
+        status: 409,
+        retryable: false,
+      });
+      expect(browserStarts).toBe(2);
+    } finally {
+      chatGptTurnSessions.clear();
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
+  // Greport incident 2026-09-28T21:00-21:02Z: three fresh-compaction attempts installed a
+  // 26-chunk MCP context transport but ChatGPT read 0-1 chunks before writing a summary and
+  // ending the turn. The authoritative completion fence correctly rejected every attempt; the
+  // defect was that a reader-never-engaged attempt was indistinguishable from a partial-context
+  // summary. These tests drive a real large-payload compaction through the broker fence.
+  test("a large compaction whose context reader never engaged is classified unavailable and keeps the source tombstone", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h3-mcpfence0-${process.pid}-${Date.now()}`);
+    const journalPath = join(tempRoot, `mcp-fence-journal0-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-mcp-fence0-${Date.now()}`,
+      chatgptWeb: {
+        browserHost: "launcher",
+        browserHostDescriptorPath: join(tempRoot, "mcp-fence0-launcher.json"),
+        brokerSocketPath: socketPath,
+        turnTimeoutMs: 30_000,
+        localToolsEnabled: true,
+        solAvailable: true,
+        extraHighAvailable: true, proAvailable: true,
+        experimentalBiggerContext: true,
+        experimentalFreshConversationPerTurn: true,
+        turnJournalStatePath: journalPath,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      if (browserStarts === 1) {
+        await turn.onSendActivated?.();
+        throw new Error("observer disappeared after Send activation");
+      }
+      const prepared = await turn.prepare();
+      try {
+        if (!prepared.text.includes("This is a Codex history-compaction checkpoint, not a normal task turn.")) {
+          turn.onTextDelta("resumed turn final answer");
+          return "resumed turn final answer";
+        }
+        return "The task context was summarized.";
+      } finally {
+        prepared.release();
+      }
+    };
+    try {
+      const request = rawWireRequest(environmentXml);
+      const executionKey = `${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(request)}`;
+      const firstEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(request, { headers: new Headers() }, event => firstEvents.push(event));
+      expect(firstEvents.at(-1)).toMatchObject({ type: "error", code: "chatgpt_submission_ambiguous" });
+
+      const compactRequest = rawWireRequest(environmentXml);
+      compactRequest._compactionRequest = true;
+      const bigOutput = "context-filler ".repeat(20_000);
+      compactRequest.context.messages.push({
+        role: "toolResult" as const,
+        toolCallId: "call_filler",
+        toolName: "exec_command",
+        content: bigOutput,
+        isError: false,
+        timestamp: 4,
+      });
+      ((compactRequest._rawBody as { input: unknown[] }).input).push(
+        { type: "function_call", call_id: "call_filler", name: "exec_command", arguments: "{}" },
+        { type: "function_call_output", call_id: "call_filler", output: bigOutput },
+      );
+      const compactEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(compactRequest, { headers: new Headers() }, event => compactEvents.push(event));
+      expect(compactEvents.at(-1)).toMatchObject({ type: "error", code: "codex_mcp_context_unavailable" });
+      expect(new ChatGptTurnJournal(journalPath).checkpoint(executionKey)).toBeDefined();
+    } finally {
+      chatGptTurnSessions.clear();
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
+  test("a partially read large compaction still fails closed as incomplete", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h3-mcpfence1-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-mcp-fence1-${Date.now()}`,
+      chatgptWeb: {
+        browserHost: "launcher",
+        browserHostDescriptorPath: join(tempRoot, "mcp-fence1-launcher.json"),
+        brokerSocketPath: socketPath,
+        turnTimeoutMs: 30_000,
+        localToolsEnabled: true,
+        solAvailable: true,
+        extraHighAvailable: true, proAvailable: true,
+        experimentalBiggerContext: true,
+        experimentalFreshConversationPerTurn: true,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      try {
+        if (!prepared.text.includes("This is a Codex history-compaction checkpoint, not a normal task turn.")) {
+          turn.onTextDelta("resumed turn final answer");
+          return "resumed turn final answer";
+        }
+        const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
+        if (!token) throw new Error("turn token missing from compaction prompt");
+        const claimed = await callTurnBroker<{ bindingId: string; contextTransport?: { contextId: string } }>(
+          socketPath, { method: "claim", token, activityId: "activity_mcp_fence_0000001" },
+        );
+        const contextId = claimed.contextTransport?.contextId;
+        if (!contextId) throw new Error("context transport missing from claim");
+        await callTurnBroker(socketPath, { method: "context_read", bindingId: claimed.bindingId, contextId, chunk: 0 });
+        await callTurnBroker(socketPath, { method: "activity_complete", token, activityId: "activity_mcp_fence_0000001" });
+        return "The task context was summarized.";
+      } finally {
+        prepared.release();
+      }
+    };
+    try {
+      const compactRequest = rawWireRequest(environmentXml);
+      compactRequest._compactionRequest = true;
+      const bigOutput = "context-filler ".repeat(20_000);
+      compactRequest.context.messages.push({
+        role: "toolResult" as const,
+        toolCallId: "call_filler",
+        toolName: "exec_command",
+        content: bigOutput,
+        isError: false,
+        timestamp: 4,
+      });
+      ((compactRequest._rawBody as { input: unknown[] }).input).push(
+        { type: "function_call", call_id: "call_filler", name: "exec_command", arguments: "{}" },
+        { type: "function_call_output", call_id: "call_filler", output: bigOutput },
+      );
+      const compactEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(compactRequest, { headers: new Headers() }, event => compactEvents.push(event));
+      expect(compactEvents.at(-1)).toMatchObject({ type: "error", code: "codex_mcp_context_incomplete" });
+    } finally {
+      chatGptTurnSessions.clear();
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
+  test("an explicit reader-unavailable signal is classified unavailable, never a partial summary", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h3-mcpfence2-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-mcp-fence2-${Date.now()}`,
+      chatgptWeb: {
+        browserHost: "launcher",
+        browserHostDescriptorPath: join(tempRoot, "mcp-fence2-launcher.json"),
+        brokerSocketPath: socketPath,
+        turnTimeoutMs: 30_000,
+        localToolsEnabled: true,
+        solAvailable: true,
+        extraHighAvailable: true, proAvailable: true,
+        experimentalBiggerContext: true,
+        experimentalFreshConversationPerTurn: true,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      try {
+        if (prepared.text.includes("This is a Codex history-compaction checkpoint, not a normal task turn.")) {
+          return "MCP_CONTEXT_TRANSPORT_UNAVAILABLE";
+        }
+        turn.onTextDelta("resumed turn final answer");
+        return "resumed turn final answer";
+      } finally {
+        prepared.release();
+      }
+    };
+    try {
+      const compactRequest = rawWireRequest(environmentXml);
+      compactRequest._compactionRequest = true;
+      const bigOutput = "context-filler ".repeat(20_000);
+      compactRequest.context.messages.push({
+        role: "toolResult" as const,
+        toolCallId: "call_filler",
+        toolName: "exec_command",
+        content: bigOutput,
+        isError: false,
+        timestamp: 4,
+      });
+      ((compactRequest._rawBody as { input: unknown[] }).input).push(
+        { type: "function_call", call_id: "call_filler", name: "exec_command", arguments: "{}" },
+        { type: "function_call_output", call_id: "call_filler", output: bigOutput },
+      );
+      const compactEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(compactRequest, { headers: new Headers() }, event => compactEvents.push(event));
+      expect(compactEvents.at(-1)).toMatchObject({ type: "error", code: "codex_mcp_context_unavailable" });
+    } finally {
+      chatGptTurnSessions.clear();
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
+  test("a large compaction with full context reads commits the handoff and releases the source tombstone", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h3-mcpfence3-${process.pid}-${Date.now()}`);
+    const journalPath = join(tempRoot, `mcp-fence-journal3-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-mcp-fence3-${Date.now()}`,
+      chatgptWeb: {
+        browserHost: "launcher",
+        browserHostDescriptorPath: join(tempRoot, "mcp-fence3-launcher.json"),
+        brokerSocketPath: socketPath,
+        turnTimeoutMs: 30_000,
+        localToolsEnabled: true,
+        solAvailable: true,
+        extraHighAvailable: true, proAvailable: true,
+        experimentalBiggerContext: true,
+        experimentalFreshConversationPerTurn: true,
+        turnJournalStatePath: journalPath,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      if (browserStarts === 1) {
+        await turn.onSendActivated?.();
+        throw new Error("observer disappeared after Send activation");
+      }
+      const prepared = await turn.prepare();
+      try {
+        if (!prepared.text.includes("This is a Codex history-compaction checkpoint, not a normal task turn.")) {
+          turn.onTextDelta("resumed turn final answer");
+          return "resumed turn final answer";
+        }
+        const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
+        if (!token) throw new Error("turn token missing from compaction prompt");
+        const totalChunks = Number(prepared.text.match(/context_chunks: (\d+)/)?.[1] ?? "0");
+        if (totalChunks < 2) throw new Error(`expected a multi-chunk compaction transport, got ${totalChunks}`);
+        const claimed = await callTurnBroker<{ bindingId: string; contextTransport?: { contextId: string } }>(
+          socketPath, { method: "claim", token, activityId: "activity_mcp_fence_0000001" },
+        );
+        const contextId = claimed.contextTransport?.contextId;
+        if (!contextId) throw new Error("context transport missing from claim");
+        for (let chunk = 0; chunk < totalChunks; chunk += 1) {
+          await callTurnBroker(socketPath, { method: "context_read", bindingId: claimed.bindingId, contextId, chunk });
+        }
+        await callTurnBroker(socketPath, { method: "activity_complete", token, activityId: "activity_mcp_fence_0000001" });
+        return "The task context was summarized.";
+      } finally {
+        prepared.release();
+      }
+    };
+    try {
+      const request = rawWireRequest(environmentXml);
+      const executionKey = `${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(request)}`;
+      const firstEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(request, { headers: new Headers() }, event => firstEvents.push(event));
+      expect(firstEvents.at(-1)).toMatchObject({ type: "error", code: "chatgpt_submission_ambiguous" });
+
+      const compactRequest = rawWireRequest(environmentXml);
+      compactRequest._compactionRequest = true;
+      const bigOutput = "context-filler ".repeat(20_000);
+      compactRequest.context.messages.push({
+        role: "toolResult" as const,
+        toolCallId: "call_filler",
+        toolName: "exec_command",
+        content: bigOutput,
+        isError: false,
+        timestamp: 4,
+      });
+      ((compactRequest._rawBody as { input: unknown[] }).input).push(
+        { type: "function_call", call_id: "call_filler", name: "exec_command", arguments: "{}" },
+        { type: "function_call_output", call_id: "call_filler", output: bigOutput },
+      );
+      const compactEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(compactRequest, { headers: new Headers() }, event => compactEvents.push(event));
+      expect(compactEvents.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+      expect(new ChatGptTurnJournal(journalPath).checkpoint(executionKey)).toBeUndefined();
+    } finally {
+      chatGptTurnSessions.clear();
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
+  test("restart after an inert multipart stage Send but before its ACK does not replay the stage", async () => {
+    const journalPath = join(tempRoot, `restart-multipart-stage-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-restart-multipart-stage-${Date.now()}`,
+      chatgptWeb: {
+        localToolsEnabled: false,
+        solAvailable: true,
+        extraHighAvailable: true,
+        proAvailable: true,
+        turnJournalStatePath: journalPath,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      browserStarts += 1;
+      await turn.onMultipartStageSendActivated?.(1);
+      throw new Error("observer disappeared after multipart stage 1 Send and before ACK");
+    };
+
+    try {
+      const request = rawWireRequest(environmentXml);
+      const executionKey = `${chatGptWebExecutionNamespace(provider)}:${chatGptTurnExecutionKey(request)}`;
+      const firstEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => firstEvents.push(event),
+      );
+      expect(firstEvents.at(-1)).toMatchObject({
+        type: "error",
+        code: "chatgpt_submission_ambiguous",
+        retryable: false,
+      });
+      expect(new ChatGptTurnJournal(journalPath).checkpoint(executionKey)).toMatchObject({
+        submissionPhase: "send_activated",
+        multipartLastSentStage: 1,
+      });
+      expect(new ChatGptTurnJournal(journalPath).checkpoint(executionKey)?.multipartLastAcknowledgedStage).toBeUndefined();
+      expect(browserStarts).toBe(1);
+
       chatGptTurnSessions.clear();
       const restartEvents: AdapterEvent[] = [];
       await createChatGptWebAdapter(provider).runTurn!(
@@ -2731,6 +3675,7 @@ describe("ChatGPT outer-native harness v4", () => {
       browserStarts += 1;
       if (turn.requireRetainedConversation) {
         retainedCompactionMessages += 1;
+        await turn.onSlotGranted?.();
         const prepared = await turn.prepareResume!();
         try {
           const controlToken = prepared.text.match(/turn_token (control_[a-f0-9]{32})/)?.[1];
@@ -3091,7 +4036,9 @@ describe("ChatGPT outer-native harness v4", () => {
       // ChatGPT caches the complete tools/list contract under a connector identity.
       // An intentional hash change therefore requires an explicit connector refresh or identity migration.
       expect(createHash("sha256").update(canonicalJson(publicConnectorAbi)).digest("hex"))
-        .toBe("9bb14902149337b52ce8598889497b1aba5a3265f28291df950bb38b5700a421");
+        .toBe("f4c9b6d6cf5822028f139aa33749ea4d9f834d4f8ea27359b404a17ca93d068a");
+      expect(listed.tools.find(tool => tool.name === "codex_tool_call")?.description)
+        .toContain("reserved codex.control.compaction_handoff operation, which is not listed by inventory");
       for (const tool of listed.tools) {
         const properties = tool.inputSchema.properties as Record<string, unknown>;
         expect(properties.turn_token).toEqual({ type: "string", minLength: 20, maxLength: 256 });
@@ -3736,7 +4683,8 @@ describe("ChatGPT outer-native harness v4", () => {
         turn_token: "turn_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       });
       expect(invalid.isError).toBe(true);
-      expect(JSON.stringify(invalid.content)).toContain("turn token is invalid, expired, or revoked");
+      expect(JSON.stringify(invalid.content)).toContain("unknown_turn_reference");
+      expect(JSON.stringify(invalid.content)).toContain("No native action was executed");
 
       const execPromise = call("codex_exec", { turn_token: token, cmd: "pwd", workdir: tempRoot });
       const [execRequest] = await Promise.race([
@@ -3752,6 +4700,20 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(execRequest?.input).toContain(JSON.stringify({ cmd: "pwd", workdir: tempRoot }));
       broker.completeTool(token, execRequest!.callId, toolResult({ output: tempRoot, exit_code: 0 }));
       expect((await execPromise).structuredContent).toEqual({ output: tempRoot, exit_code: 0 });
+      const ticket = JSON.stringify(invalid.content).match(/rejection_[A-Za-z0-9_-]{32}/)?.[0];
+      expect(ticket).toBeDefined();
+      const recovery = await call("codex_tool_call", {
+        turn_token: token,
+        wire_name: CODEX_TURN_REFERENCE_RECOVERY_WIRE_NAME,
+        arguments: { rejection_ticket: ticket },
+      });
+      expect(recovery.structuredContent).toEqual({
+        accepted: true, completion_marker: CHATGPT_TURN_REFERENCE_RECOVERY_MARKER,
+      });
+      const revision = broker.beginCompletionFence(token);
+      expect(revision).toBeNumber();
+      expect(broker.commitCompletionFence(token, revision!)).toBe(true);
+      expect(broker.consumeRecoveryRequest(token)).toBe("unknown_turn_reference");
     } finally {
       await client.close().catch(() => {});
       broker.revoke(token);

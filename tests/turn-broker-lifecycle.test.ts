@@ -7,6 +7,18 @@ import { dirname, join } from "node:path";
 import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, isWindowsPipeEndpoint } from "../src/config";
 
+let directBrokerRequestSequence = 0;
+async function dispatchTurnBrokerForTest<T>(
+  broker: TurnBroker,
+  request: Record<string, unknown>,
+): Promise<T> {
+  const direct = broker as unknown as {
+    dispatch: (request: Record<string, unknown>, signal?: AbortSignal) => Promise<T>;
+  };
+  directBrokerRequestSequence += 1;
+  return await direct.dispatch({ id: `test_direct_${directBrokerRequestSequence}`, ...request });
+}
+
 test("explicit browser-turn cancellation aborts and removes every registered session", async () => {
   const sessions = new ChatGptTurnSessions();
   let cancelled = 0;
@@ -29,7 +41,10 @@ test("explicit browser-turn cancellation aborts and removes every registered ses
   }));
 
   expect(sessions.activeCount()).toBe(1);
-  expect(sessions.clear()).toBe(2);
+  // clear() retires every registered session but reports only the genuinely active one as
+  // cancelled: terminal replay entries are no-op retirements and must not inflate the
+  // cancelled-turn telemetry (an idle shutdown reports zero cancelled browser turns).
+  expect(sessions.clear()).toBe(1);
   expect(cancelled).toBe(2);
   expect(sessions.activeCount()).toBe(0);
 });
@@ -355,7 +370,7 @@ test("one slow named-pipe broker exchange cannot block or cancel an unrelated tu
     const fastToken = await broker.register(environment, 60_000, "fast-turn");
     const slow = callTurnBroker(socketPath, { method: "owner_next", token: slowToken }, null);
     const fast = await callTurnBroker<{ protocolVersion: number }>(socketPath, { method: "owner_status" });
-    expect(fast.protocolVersion).toBe(5);
+    expect(fast.protocolVersion).toBe(6);
 
     broker.revoke(slowToken, new Error("cancel only slow turn"));
     await expect(slow).rejects.toThrow("cancel only slow turn");
@@ -397,7 +412,7 @@ test("turn broker names the finished turn that owns a replayed handle", async ()
       tools: [],
     }, 60_000, "turn-alpha");
     await expect(callTurnBroker(socketPath, { method: "claim", token: ` ${token}` }))
-      .rejects.toThrow("turn token is invalid, expired, or revoked");
+      .rejects.toThrow("turn_reference_invalid_shape");
     const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
     broker.revoke(token);
 
@@ -432,6 +447,150 @@ test("turn broker names the finished turn that owns a replayed handle", async ()
     expect(unknownBinding).toBe("internal Codex turn binding is invalid or expired");
   } finally {
     await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("broker classifies unissued and retired turn references without claiming native work", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-broker-reference-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  const broker = TurnBroker.forSocket(socketPath);
+  try {
+    const environment = {
+      cwd: root, roots: [root], writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" as const }, tools: [],
+    };
+    const first = await broker.register(environment, 60_000, "first");
+    const second = await broker.register(environment, 60_000, "second");
+    const errorCode = async (token: string) => {
+      try {
+        await dispatchTurnBrokerForTest(broker, { method: "claim", token });
+        throw new Error("unexpected claim success");
+      } catch (error) {
+        return (error as { code?: string }).code;
+      }
+    };
+    expect(await errorCode(first.slice(0, -1))).toBe("unknown_turn_reference");
+    expect(await errorCode(`turn_${"A".repeat(32)}`)).toBe("unknown_turn_reference");
+    const valid = await dispatchTurnBrokerForTest<{ bindingId: string }>(broker, {
+      method: "claim", token: first, activityId: "activity_reference_first_0001",
+    });
+    expect(valid.bindingId).toStartWith("binding_");
+    // A caller that possesses B's valid bearer token is still accepted as B. This test documents
+    // the missing provider origin, and recovery must never silently turn that into an A claim.
+    const foreign = await dispatchTurnBrokerForTest<{ bindingId: string }>(broker, {
+      method: "claim", token: second, activityId: "activity_reference_second_0001",
+    });
+    expect(foreign.bindingId).toStartWith("binding_");
+    broker.revoke(first);
+    expect(await errorCode(first)).toBe("retired_turn_reference");
+  } finally {
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a rejected reference can request recovery only through an exact active turn handle", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-broker-recovery-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  const broker = TurnBroker.forSocket(socketPath);
+  try {
+    const environment = {
+      cwd: root, roots: [root], writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" as const }, tools: [],
+    };
+    const a = await broker.register(environment, 60_000, "a");
+    const b = await broker.register(environment, 60_000, "b");
+    let ticket: string | undefined;
+    try {
+      await dispatchTurnBrokerForTest(broker, { method: "claim", token: a.slice(0, -1) });
+    } catch (error) {
+      ticket = (error as { rejectionTicket?: string }).rejectionTicket;
+    }
+    expect(ticket).toMatch(/^rejection_[A-Za-z0-9_-]{32}$/);
+    await expect(dispatchTurnBrokerForTest(broker, {
+      method: "request_recovery", token: a.slice(0, -1), rejectionTicket: ticket,
+    })).rejects.toThrow();
+    expect(broker.consumeRecoveryRequest(a)).toBeUndefined();
+    await dispatchTurnBrokerForTest(broker, { method: "request_recovery", token: a, rejectionTicket: ticket });
+    expect(broker.consumeRecoveryRequest(b)).toBeUndefined();
+    const revision = broker.beginCompletionFence(a);
+    expect(revision).toBeNumber();
+    expect(broker.commitCompletionFence(a, revision!)).toBe(true);
+    expect(broker.consumeRecoveryRequest(a)).toBe("unknown_turn_reference");
+    expect(broker.consumeRecoveryRequest(a)).toBeUndefined();
+    broker.revoke(a);
+    await expect(dispatchTurnBrokerForTest(broker, {
+      method: "request_recovery", token: a, rejectionTicket: ticket,
+    })).rejects.toThrow("retired_turn_reference");
+  } finally {
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a delivered native call without a completed result blocks the recovery fence", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-broker-uncertain-recovery-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  const broker = TurnBroker.forSocket(socketPath);
+  try {
+    const environment = {
+      cwd: root, roots: [root], writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" as const },
+      tools: [{ name: "exec_command", description: "Run a command", parameters: { type: "object" } }],
+    };
+    const token = await broker.register(environment, 60_000, "uncertain-turn");
+    let ticket: string | undefined;
+    try {
+      await dispatchTurnBrokerForTest(broker, { method: "claim", token: token.slice(0, -1) });
+    } catch (error) {
+      ticket = (error as { rejectionTicket?: string }).rejectionTicket;
+    }
+    expect(ticket).toBeDefined();
+    await dispatchTurnBrokerForTest(broker, { method: "request_recovery", token, rejectionTicket: ticket });
+    const claim = await dispatchTurnBrokerForTest<{ bindingId: string }>(broker, {
+      method: "claim", token, activityId: "activity_uncertain_recovery_0001",
+    });
+    const invocation = dispatchTurnBrokerForTest(broker, {
+      method: "invoke", bindingId: claim.bindingId, wireName: "exec_command", freeform: false,
+      arguments: { cmd: "side effect" },
+    });
+    const [delivered] = await broker.nextToolBatch(token);
+    expect(delivered?.wireName).toBe("exec_command");
+    expect(broker.beginCompletionFence(token)).toBeUndefined();
+    expect(broker.consumeRecoveryRequest(token)).toBeUndefined();
+    broker.revoke(token);
+    await expect(invocation).rejects.toThrow();
+  } finally {
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("broker call rejects a response frame without exactly one of result/error", async () => {
+  // Upstream v6.1.2 (76aa5d1): strict frame contract — a malformed frame fails explicitly
+  // instead of silently resolving or rejecting on shape.
+  const root = mkdtempSync(join(tmpdir(), "cgw-broker-frame-"));
+  const pipePath = defaultBrokerEndpoint(root);
+  const { createServer } = await import("node:net");
+  const server = createServer(socket => {
+    let buffered = "";
+    socket.setEncoding("utf8");
+    socket.on("data", chunk => {
+      buffered += chunk;
+      const newline = buffered.indexOf("\n");
+      if (newline < 0) return;
+      const request = JSON.parse(buffered.slice(0, newline)) as { id: string };
+      buffered = "";
+      socket.end(JSON.stringify({ id: request.id }) + "\n");
+    });
+  });
+  await new Promise<void>(resolveListen => server.listen(pipePath, () => resolveListen()));
+  try {
+    await expect(callTurnBroker(pipePath, { method: "owner_status" }))
+      .rejects.toThrow("invalid response frame");
+  } finally {
+    server.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

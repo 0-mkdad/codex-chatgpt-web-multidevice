@@ -64,6 +64,54 @@ test("launcher activity restores valid records from the previous process", () =>
   }
 });
 
+test("launcher activity rotates the JSONL sink before appending new structured traces", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-logging-rotation-"));
+  const filePath = path.join(root, "launcher.jsonl");
+  try {
+    fs.writeFileSync(filePath, "x".repeat(4 * 1024 * 1024));
+    const logger = createLogger({ filePath });
+    logger.info("chatgpt_web.trace", {
+      traceEvent: "multipart_stage_sent",
+      traceId: "trace-safe",
+      stageIndex: 2,
+    });
+    assert.equal(fs.existsSync(`${filePath}.1`), true);
+    assert.equal(fs.statSync(`${filePath}.1`).size, 4 * 1024 * 1024);
+    const current = fs.readFileSync(filePath, "utf8");
+    assert.match(current, /chatgpt_web\.trace/);
+    assert.match(current, /multipart_stage_sent/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sanitized export strips any accidental content fields from structured trace records", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-trace-export-"));
+  const filePath = path.join(root, "launcher.jsonl");
+  const destinationPath = path.join(root, "shared", "trace.jsonl");
+  try {
+    const logger = createLogger({ filePath });
+    logger.info("chatgpt_web.trace", {
+      traceEvent: "retry_decision",
+      traceId: "safe-trace-id",
+      errorCode: "context_length_exceeded",
+      prompt: "PRIVATE PROMPT",
+      response: "PRIVATE RESPONSE",
+      controlToken: "PRIVATE CONTROL TOKEN",
+    });
+    assert.equal(exportSanitizedLogs({ filePath, destinationPath }), 1);
+    const exported = fs.readFileSync(destinationPath, "utf8");
+    assert.match(exported, /safe-trace-id/);
+    assert.match(exported, /context_length_exceeded/);
+    assert.doesNotMatch(exported, /PRIVATE/);
+    assert.match(exported, /"prompt":"\[redacted\]"/);
+    assert.match(exported, /"response":"\[redacted\]"/);
+    assert.match(exported, /"controlToken":"\[redacted\]"/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("exported launcher logs remove local usernames, private ChatGPT titles, and URL paths", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-export-"));
   const filePath = path.join(root, "launcher.jsonl");
@@ -104,6 +152,60 @@ test("exported launcher logs remove local usernames, private ChatGPT titles, and
       /Refusing to overwrite a launcher source log/,
     );
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Activity restores the last 300 valid events across rotation and incomplete writes", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-activity-history-"));
+  const filePath = path.join(root, "launcher.jsonl");
+  const record = index => JSON.stringify({ at: "2026-09-25T00:00:00Z", level: "info", event: `event-${index}`, detail: { authorization: "private" } });
+  try {
+    fs.writeFileSync(`${filePath}.1`, Array.from({ length: 300 }, (_, index) => record(index)).join("\n"));
+    fs.writeFileSync(filePath, `${record(300)}\n${record(301)}\n{"partial":\n${JSON.stringify({ at: "ignored", level: "invalid", event: "invalid" })}\n`);
+    const records = createLogger({ filePath }).recent(300);
+    assert.equal(records.length, 300);
+    assert.equal(records[0].event, "event-2");
+    assert.equal(records.at(-1).event, "event-301");
+    assert.equal(records[0].detail.authorization, "[redacted]");
+    fs.renameSync(`${filePath}.1`, filePath);
+    fs.appendFileSync(filePath, "\npartial-final-line");
+    assert.equal(createLogger({ filePath }).recent(300).length, 300);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("diagnostic export preserves source logs through links and a destination replacement", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-export-links-"));
+  const filePath = path.join(root, "launcher.jsonl");
+  const destinationPath = path.join(root, "export.jsonl");
+  const original = `${JSON.stringify({ at: "2026-09-25T00:00:00Z", level: "info", event: "test", detail: { url: "https://chatgpt.com/c/private" } })}\npartial`;
+  const write = fs.writeFileSync;
+  try {
+    for (const source of [filePath, `${filePath}.1`]) {
+      fs.writeFileSync(source, original);
+      fs.linkSync(source, destinationPath);
+      assert.throws(() => exportSanitizedLogs({ filePath, destinationPath }), /Refusing to overwrite/);
+      assert.equal(fs.readFileSync(source, "utf8"), original);
+      fs.unlinkSync(destinationPath);
+    }
+    if (process.platform !== "win32") {
+      fs.symlinkSync(filePath, destinationPath);
+      assert.throws(() => exportSanitizedLogs({ filePath, destinationPath }), /Refusing to overwrite/);
+      fs.unlinkSync(destinationPath);
+    }
+    fs.writeFileSync = (target, ...args) => {
+      if (String(target).startsWith(`${destinationPath}.tmp-`)) fs.linkSync(filePath, destinationPath);
+      return write(target, ...args);
+    };
+    exportSanitizedLogs({ filePath, destinationPath });
+    assert.equal(fs.readFileSync(filePath, "utf8"), original);
+    assert.equal(fs.readFileSync(`${filePath}.1`, "utf8"), original);
+    assert.doesNotMatch(fs.readFileSync(destinationPath, "utf8"), /private|partial/);
+    assert.equal(fs.readdirSync(root).some(name => name.includes(".tmp-")), false);
+  } finally {
+    fs.writeFileSync = write;
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

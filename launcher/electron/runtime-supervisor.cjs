@@ -12,6 +12,7 @@ const {
   terminateOwnedProcessTree,
 } = require("./process-tree.cjs");
 const { runtimeInvocation } = require("./runtime-command.cjs");
+const { windowsTrustEnvironment } = require("./windows-trust.cjs");
 
 const RESTART_WINDOW_MS = 60_000;
 const MAX_RESTARTS_PER_WINDOW = 5;
@@ -26,6 +27,7 @@ const TUNNEL_MONITOR_FAILURE_THRESHOLD = 3;
 const TUNNEL_MCP_FAILURE_RECENCY_MS = 2 * 60_000;
 const BOOT_TIME_CLOCK_TOLERANCE_MS = 5_000;
 const CURRENT_BOOT_STARTED_AT_MS = Date.now() - (os.uptime() * 1_000);
+const CHATGPT_WEB_STRUCTURED_TRACE_PREFIX = "[chatgpt-web-trace] ";
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -50,6 +52,25 @@ function collectLines(stream, onLine, onError) {
     if (line) onLine(line);
   });
   stream.on("error", (error) => onError?.(error));
+}
+
+function parseChatGptWebStructuredTraceLine(line) {
+  if (typeof line !== "string" || !line.startsWith(CHATGPT_WEB_STRUCTURED_TRACE_PREFIX)) return null;
+  try {
+    const record = JSON.parse(line.slice(CHATGPT_WEB_STRUCTURED_TRACE_PREFIX.length));
+    if (!record
+      || record.version !== 1
+      || typeof record.at !== "string"
+      || !["info", "warning", "error"].includes(record.level)
+      || typeof record.event !== "string"
+      || !/^[A-Za-z0-9_.-]{1,96}$/.test(record.event)
+      || !record.detail
+      || typeof record.detail !== "object"
+      || Array.isArray(record.detail)) return null;
+    return record;
+  } catch {
+    return null;
+  }
 }
 
 function loopbackHealthBaseURL(value) {
@@ -495,10 +516,10 @@ class RuntimeSupervisor {
     const child = spawn(invocation.executable, invocation.args, {
       cwd: invocation.cwd,
       detached: DETACH_OWNED_CHILD,
-      env: {
+      env: windowsTrustEnvironment({
         ...process.env,
         CODEX_CHATGPT_WEB_BROWSER_HOST_DESCRIPTOR: this.browserDescriptorPath,
-      },
+      }),
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -507,7 +528,18 @@ class RuntimeSupervisor {
     this.lastChildOutput[name] = null;
     collectLines(child.stdout, (line) => {
       this.lastChildOutput[name] = redactText(line).slice(0, 1_000);
-      this.logger.info(`runtime.${name}_stdout`, { line });
+      const trace = parseChatGptWebStructuredTraceLine(line);
+      if (trace) {
+        const detail = {
+          source: name,
+          recordedAt: trace.at,
+          traceEvent: trace.event,
+          ...trace.detail,
+        };
+        this.logger[trace.level === "warning" ? "warn" : trace.level]("chatgpt_web.trace", detail);
+      } else {
+        this.logger.info(`runtime.${name}_stdout`, { line });
+      }
     }, (error) => {
       this.logger.warn(`runtime.${name}_stdout_unavailable`, { message: errorMessage(error) });
     });
@@ -2115,5 +2147,6 @@ module.exports = {
   TUNNEL_START_TIMEOUT_MS,
   RuntimeSupervisor,
   managedTunnelConnectArgs,
+  parseChatGptWebStructuredTraceLine,
   validateConfig,
 };

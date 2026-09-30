@@ -1042,7 +1042,7 @@ test("a full-mode runtime exposes its broker endpoint before any turn registers"
       if (!message.includes("unavailable") || Date.now() >= deadline) break;
       await Bun.sleep(20);
     }
-    expect(message).toContain("turn token is invalid");
+    expect(message).toContain("turn_reference_invalid_shape");
   } finally {
     await server.stop(true);
     await closeTurnBrokers();

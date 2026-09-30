@@ -8,6 +8,8 @@ import { get_encoding, type Tiktoken } from "tiktoken";
  */
 
 const TOKENIZER_CHUNK_CHARS = 4_096;
+const TRANSPORT_VALIDATION_TOKEN_MARGIN_PERCENT = 2;
+const TRANSPORT_VALIDATION_TOKEN_MARGIN_MIN = 128;
 let tokenizer: Tiktoken | undefined;
 
 function chatGptTokenizer(): Tiktoken {
@@ -25,6 +27,12 @@ export function estimateTokens(text: string, modelId?: string): number {
   if (!text) return 0;
 
   const encoding = chatGptTokenizer();
+  // Long generated payloads often contain many byte-identical chunks, especially whitespace,
+  // repeated source fixtures, base64 padding, and serialized context records. Encoding the same
+  // chunk again is pure CPU cost. Keep this cache local to one estimate so prompt contents are not
+  // retained across requests and token accounting remains byte-for-byte identical to the previous
+  // chunked algorithm.
+  const chunkTokenCounts = new Map<string, number>();
   let count = 0;
   for (let start = 0; start < text.length;) {
     let end = Math.min(start + TOKENIZER_CHUNK_CHARS, text.length);
@@ -35,8 +43,28 @@ export function estimateTokens(text: string, modelId?: string): number {
         end -= 1;
       }
     }
-    count += encoding.encode_ordinary(text.slice(start, end)).length;
+    const chunk = text.slice(start, end);
+    let chunkTokens = chunkTokenCounts.get(chunk);
+    if (chunkTokens === undefined) {
+      chunkTokens = encoding.encode_ordinary(chunk).length;
+      chunkTokenCounts.set(chunk, chunkTokens);
+    }
+    count += chunkTokens;
     start = end;
   }
   return count;
+}
+
+/**
+ * Browser submission validation needs headroom for product-side tokenization and request framing
+ * that are not represented by the visible composer text. Keep the fast tokenizer count as the
+ * source estimate, then add a small bounded margin only at transport boundaries.
+ */
+export function estimateTokensForTransportValidation(text: string, modelId?: string): number {
+  const estimated = estimateTokens(text, modelId);
+  if (estimated === 0) return 0;
+  return estimated + Math.max(
+    TRANSPORT_VALIDATION_TOKEN_MARGIN_MIN,
+    Math.ceil(estimated * TRANSPORT_VALIDATION_TOKEN_MARGIN_PERCENT / 100),
+  );
 }

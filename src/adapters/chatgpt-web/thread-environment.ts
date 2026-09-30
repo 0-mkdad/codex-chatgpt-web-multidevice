@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { atomicWriteFile } from "../../config";
+import { criticalStoreLoadFailure } from "./store-diagnostics";
 import { getCodexHome } from "../../codex-integration-shared";
 import type { CodexParsedRequest } from "../../types";
 import {
@@ -8,19 +9,24 @@ import {
   extractChatGptCompactionSourceRevision,
   extractChatGptContinuationEnvironmentClaim,
   extractChatGptSteeringEnvironmentClaim,
+  extractChatGptMidTurnEnvironmentClaim,
   extractChatGptTurnIdentity,
   extractChatGptThreadSpawnLineage,
   extractChatGptRootThreadMetadata,
+  chatGptEnvironmentResolutionProbes,
   hasCurrentChatGptEnvironmentContext,
-  hasChatGptCalendarEnvironmentDelta,
+  matchChatGptNoCwdEnvironmentDelta,
   hasRawChatGptEnvironmentContext,
   unattributedChatGptEnvironmentMessages,
   isChatGptCompactionContinuation,
   MissingTrustedCodexEnvironmentError,
+  parseChatGptHistoricalEnvelope,
   type ChatGptSandboxPolicy,
   type ChatGptTurnEnvironment,
+  type ChatGptTurnIdentity,
 } from "./environment";
 import { resolveCurrentCodexRolloutEnvironment } from "./codex-rollout-environment";
+import { chatGptWebTraceHash, emitChatGptWebStructuredTrace } from "./structured-trace";
 
 interface StoredThreadEnvironment {
   cwd: string;
@@ -75,7 +81,12 @@ function sandboxPolicy(value: unknown, roots: string[], writableRoots: string[])
     return { type: "dangerFullAccess" };
   }
   if (parsed?.type === "workspaceWrite") {
-    if (typeof parsed.networkAccess !== "boolean" || writableRoots.some(path => !roots.some(root => contains(root, path)))) {
+    const policyRoots = absolutePaths(parsed.writableRoots, "workspace-write policy writable roots");
+    const declared = new Set(policyRoots.map(pathIdentity));
+    // Project membership is not the grant boundary: native Codex also authorizes
+    // external output directories. Both persisted grant sets must agree exactly.
+    if (typeof parsed.networkAccess !== "boolean" || policyRoots.length !== writableRoots.length
+      || writableRoots.some(path => !declared.has(pathIdentity(path)))) {
       throw new Error("Invalid persisted ChatGPT workspace-write policy");
     }
     return { type: "workspaceWrite", writableRoots, networkAccess: parsed.networkAccess };
@@ -163,9 +174,25 @@ export class ChatGptThreadEnvironmentStore {
         ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
       const steeringClaim = hasCurrentContext && !currentCompaction
         ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
-      const calendarDelta = hasCurrentContext && !currentCompaction && hasChatGptCalendarEnvironmentDelta(parsed);
-      if (hasCurrentContext && !currentCompaction && !historicalMessages && !steeringClaim && !calendarDelta) throw error;
-      const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim;
+      const noCwdDelta = hasCurrentContext && !currentCompaction
+        ? matchChatGptNoCwdEnvironmentDelta(parsed) : undefined;
+      const midTurnClaim = hasCurrentContext && !currentCompaction && !noCwdDelta
+        ? extractChatGptMidTurnEnvironmentClaim(parsed) : undefined;
+      const resolutionState = {
+        hasCurrentContext,
+        compactionContinuation: currentCompaction,
+        historicalMessages: historicalMessages !== undefined,
+        steeringClaim: steeringClaim !== undefined,
+        noCwdDelta: noCwdDelta !== undefined,
+        midTurnClaim: midTurnClaim !== undefined,
+      };
+      if (hasCurrentContext && !currentCompaction && !historicalMessages && !steeringClaim
+        && !noCwdDelta && !midTurnClaim) {
+        this.failResolution(parsed, identity, resolutionState, "unrecognized_current_environment_claim", error);
+        throw error;
+      }
+      const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed)
+        : steeringClaim ?? midTurnClaim;
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       // Automatic compaction has a current turn_context; standalone compaction has only its
       // source turn_context. Either must be the latest native record, never an arbitrary ancestor.
@@ -182,20 +209,52 @@ export class ChatGptThreadEnvironmentStore {
           tools: parsed.context.tools,
         });
         if (rolloutEnvironment) {
-          if (calendarDelta && rolloutEnvironment.sandboxPolicy.type !== "dangerFullAccess") {
-            throw new Error("Calendar environment delta conflicts with its current Codex rollout");
+          if (noCwdDelta && noCwdDelta.sandboxType !== rolloutEnvironment.sandboxPolicy.type) {
+            throw new Error("No-cwd environment delta conflicts with its current Codex rollout");
           }
           if (currentClaim && !sameAuthority(currentClaim, rolloutEnvironment)) {
-            throw new Error(`${currentCompaction ? "Compaction continuation" : "Steering"} environment conflicts with its current Codex rollout`);
+            throw new Error(`${currentCompaction ? "Compaction continuation" : steeringClaim ? "Steering" : "Mid-turn"} environment conflicts with its current Codex rollout`);
           }
           this.set(rolloutIdentity.threadId, rolloutEnvironment);
           return rolloutEnvironment;
         }
       }
+      if (noCwdDelta || midTurnClaim) {
+        // A mid-turn claim restates current policy; only this turn's native rollout can prove it.
+        // The cached same-thread authority cannot: it may predate a legitimate mid-turn change,
+        // so serving it here could mask a real revocation. Fail closed with diagnostics.
+        this.failResolution(parsed, identity, {
+          ...resolutionState,
+          rolloutIdentityPresent: rolloutIdentity !== undefined,
+          rolloutRecovered: false,
+          cachedSameThreadPresent: (() => {
+            try {
+              return Boolean(this.get(identity.threadId!));
+            } catch {
+              // A corrupt store must not mask the original rejection reason in the diagnostic.
+              return false;
+            }
+          })(),
+        }, "current_environment_claim_without_rollout_corroboration", error);
+        throw error;
+      }
+      const sameThread = this.get(identity.threadId);
+      // Resent continuation history carries this thread's own start envelope. When that historical
+      // envelope parses to exactly the stored, verified authority, it is recognition of server-side
+      // state rather than a new request claim and must not block the same-thread fallback. Current
+      // environment claims (midnight deltas, steering) and unrecognized envelopes still fail closed.
+      const historicalEnvelope = parseChatGptHistoricalEnvelope(parsed);
+      const resentOwnEnvelope = sameThread !== undefined && historicalEnvelope !== undefined
+        && sameAuthority(historicalEnvelope, {
+          cwd: sameThread.cwd,
+          roots: sameThread.roots,
+          writableRoots: sameThread.writableRoots,
+          sandboxPolicy: sameThread.sandboxPolicy,
+          tools: [],
+        });
       // Only a current native rollout can supersede an unrecognized historical envelope. Without
       // that proof, do not turn arbitrary history or an invalid update into cached authority.
-      if (hasRawChatGptEnvironmentContext(parsed)) throw error;
-      const sameThread = this.get(identity.threadId);
+      if (hasRawChatGptEnvironmentContext(parsed) && !resentOwnEnvelope) throw error;
       if (sameThread) return {
         cwd: sameThread.cwd,
         roots: sameThread.roots,
@@ -230,6 +289,47 @@ export class ChatGptThreadEnvironmentStore {
     }
   }
 
+  private failResolution(
+    parsed: CodexParsedRequest,
+    identity: ChatGptTurnIdentity,
+    states: {
+      hasCurrentContext: boolean;
+      compactionContinuation: boolean;
+      historicalMessages: boolean;
+      steeringClaim: boolean;
+      noCwdDelta: boolean;
+      midTurnClaim: boolean;
+      rolloutIdentityPresent?: boolean;
+      rolloutRecovered?: boolean;
+      cachedSameThreadPresent?: boolean;
+    },
+    reason: string,
+    error: unknown,
+  ): void {
+    const probes = chatGptEnvironmentResolutionProbes(parsed);
+    emitChatGptWebStructuredTrace("environment_resolution_failed", {
+      ...(identity.threadId ? { threadHash: chatGptWebTraceHash(identity.threadId) } : {}),
+      ...(identity.turnId ? { turnHash: chatGptWebTraceHash(identity.turnId) } : {}),
+      thread_id_present: Boolean(identity.threadId),
+      turn_id_present: Boolean(identity.turnId),
+      environment_fragment_count: probes.environmentFragmentCount,
+      current_turn_fragment_count: probes.currentTurnFragmentCount,
+      current_cwd_claim_present: probes.currentCwdClaimPresent,
+      current_workspace_roots_present: probes.currentWorkspaceRootsPresent,
+      current_environment_context: states.hasCurrentContext,
+      compaction_continuation: states.compactionContinuation,
+      historical_environment_messages: states.historicalMessages,
+      steering_claim: states.steeringClaim,
+      no_cwd_profile_delta: states.noCwdDelta,
+      mid_turn_claim: states.midTurnClaim,
+      rollout_identity_present: states.rolloutIdentityPresent ?? false,
+      rollout_recovered: states.rolloutRecovered ?? false,
+      cached_thread_environment_present: states.cachedSameThreadPresent ?? false,
+      rejection_reason: reason,
+    }, "warning");
+    void error;
+  }
+
   private get(threadId: string): StoredThreadEnvironment | undefined {
     this.load();
     const stored = this.threads.get(threadId);
@@ -256,20 +356,28 @@ export class ChatGptThreadEnvironmentStore {
 
   private load(): void {
     if (this.loaded) return;
-    this.loaded = true;
-    if (!this.path || !existsSync(this.path)) return;
-    const parsed = JSON.parse(readFileSync(this.path, "utf8")) as Partial<StoredThreadEnvironmentFile>;
-    const rawThreads = record(parsed.threads);
-    if (parsed.version !== 1 || !rawThreads) {
-      throw new Error(`Invalid ChatGPT thread environment store: ${this.path}`);
+    try {
+      if (!this.path || !existsSync(this.path)) {
+        this.loaded = true;
+        return;
+      }
+      const parsed = JSON.parse(readFileSync(this.path, "utf8")) as Partial<StoredThreadEnvironmentFile>;
+      const rawThreads = record(parsed.threads);
+      if (parsed.version !== 1 || !rawThreads) {
+        throw new Error(`Invalid ChatGPT thread environment store: ${this.path}`);
+      }
+      const cutoff = this.now() - THREAD_ENVIRONMENT_TTL_MS;
+      const entries = Object.entries(rawThreads)
+        .map(([threadId, value]) => [threadId, validateStoredEnvironment(value)] as const)
+        .filter(([, environment]) => environment.updatedAt >= cutoff)
+        .sort((left, right) => left[1].updatedAt - right[1].updatedAt)
+        .slice(-MAX_THREAD_ENVIRONMENTS);
+      for (const [threadId, environment] of entries) this.threads.set(threadId, environment);
+      // Only a fully validated load marks the store as loaded; corruption keeps failing closed.
+      this.loaded = true;
+    } catch (error) {
+      throw criticalStoreLoadFailure("ThreadEnvironment", this.path, error);
     }
-    const cutoff = this.now() - THREAD_ENVIRONMENT_TTL_MS;
-    const entries = Object.entries(rawThreads)
-      .map(([threadId, value]) => [threadId, validateStoredEnvironment(value)] as const)
-      .filter(([, environment]) => environment.updatedAt >= cutoff)
-      .sort((left, right) => left[1].updatedAt - right[1].updatedAt)
-      .slice(-MAX_THREAD_ENVIRONMENTS);
-    for (const [threadId, environment] of entries) this.threads.set(threadId, environment);
   }
 
   private persist(): void {

@@ -21,6 +21,7 @@ import type {
   ChatGptTurnEnvironment,
   ChatGptUnattributedEnvironmentMessage,
 } from "./environment";
+import { chatGptWebTraceHash, emitChatGptWebStructuredTrace } from "./structured-trace";
 
 type RolloutIdentity = ChatGptRootThreadMetadata | ChatGptThreadSpawnLineage;
 
@@ -29,6 +30,18 @@ const CODEX_ID = new RegExp(`^${CODEX_ID_SOURCE}$`, "i");
 const ROLLOUT_READ_CHUNK_BYTES = 64 * 1024;
 const MAX_ROLLOUT_JSON_LINE_BYTES = 16 * 1024 * 1024;
 const MAX_ROLLOUT_DIRECTORY_ENTRIES = 100_000;
+
+/**
+ * V-C experiment (2026-09-25). Codex 0.155.0-alpha.9.2 appends byte-identical duplicate direct
+ * write entries to a rollout turn_context permission profile on ordinary resume (multi-root
+ * workspace-write, no compaction involved), which the strict no-duplicates check below rejects.
+ * When true, exactManagedWorkspaceWriteProfile collapses direct write entries whose full
+ * normalized security representation is identical and then runs every existing check unchanged on
+ * the collapsed set. Any differing duplicate — access, path type, missing_path_behavior, or any
+ * other entry field — still fails closed exactly as before. Flip to false to restore the strict
+ * no-duplicates behavior without any further code changes.
+ */
+export const CHATGPT_WEB_ROLLOUT_PROFILE_ALLOW_IDENTICAL_WRITES = true;
 
 type IndexedRollout =
   | { kind: "unavailable" }
@@ -392,11 +405,79 @@ function splitPolicyMatchesProfile(
     && split.glob_scan_max_depth === profileFileSystem.glob_scan_max_depth;
 }
 
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(item => stableStringify(item)).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map(key => (
+      `${JSON.stringify(key)}:${stableStringify(record[key])}`
+    )).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "undefined";
+}
+
+/**
+ * Normalized security semantics of one direct write entry: the canonical path identity replaces
+ * the raw textual path (the validator's identity model everywhere else) and every other entry
+ * field is kept verbatim with key order ignored. Two entries with the same string are the same
+ * permission for every purpose of this validator; any other difference is a conflict.
+ */
+export function directWriteSemantics(entry: Record<string, unknown>, canonicalPath: string): string {
+  const { path, ...rest } = entry as { path: Record<string, unknown> };
+  return stableStringify({ ...rest, path: { ...path, path: canonicalPath } });
+}
+
+export interface DirectWriteDuplicateAnalysis {
+  pathGroups: number;
+  duplicateGroups: number;
+  conflicting: boolean;
+}
+
+/** Pure duplicate analysis over already-resolved direct write entries (exported for tests). */
+export function directWriteDuplicateAnalysis(
+  entries: Array<{ entry: Record<string, unknown>; resolved: string }>,
+): DirectWriteDuplicateAnalysis {
+  const groups = new Map<string, string[]>();
+  for (const { entry, resolved } of entries) {
+    const canonicalPath = pathIdentity(resolved);
+    const semantics = directWriteSemantics(entry, canonicalPath);
+    const group = groups.get(canonicalPath);
+    if (group) group.push(semantics);
+    else groups.set(canonicalPath, [semantics]);
+  }
+  let duplicateGroups = 0;
+  let conflicting = false;
+  for (const semantics of groups.values()) {
+    if (semantics.length === 1) continue;
+    duplicateGroups += 1;
+    if (semantics.some(value => value !== semantics[0])) conflicting = true;
+  }
+  return { pathGroups: groups.size, duplicateGroups, conflicting };
+}
+
+function reportDirectWriteDuplicates(
+  analysis: DirectWriteDuplicateAnalysis,
+  entriesBefore: number,
+  identity: { threadId?: string; turnId?: string } | undefined,
+): boolean {
+  emitChatGptWebStructuredTrace("rollout_profile_duplicate_collapse", {
+    ...(identity?.threadId ? { threadHash: chatGptWebTraceHash(identity.threadId) } : {}),
+    ...(identity?.turnId ? { turnHash: chatGptWebTraceHash(identity.turnId) } : {}),
+    direct_entries_before: entriesBefore,
+    unique_path_groups: analysis.pathGroups,
+    entries_after: analysis.pathGroups,
+    duplicate_groups: analysis.duplicateGroups,
+    outcome: analysis.conflicting ? "rejected-conflicting" : "accepted-identical",
+  }, analysis.conflicting ? "warning" : "info");
+  return !analysis.conflicting;
+}
+
 function exactManagedWorkspaceWriteProfile(
   profile: Record<string, unknown>,
   roots: string[],
   cwd: string,
   sandbox: Record<string, unknown>,
+  identity?: { threadId?: string; turnId?: string },
 ): { networkAccess: boolean; writableRoots: string[] } | undefined {
   const fileSystem = record(profile.file_system);
   if (fileSystem?.type !== "restricted"
@@ -413,12 +494,15 @@ function exactManagedWorkspaceWriteProfile(
   const uniqueExpectedWritableRoots = [...new Map(expectedWritableRoots.map(path => (
     [pathIdentity(path), path] as const
   ))).values()];
-  if (uniqueExpectedWritableRoots.length !== expectedWritableRoots.length
-    || uniqueExpectedWritableRoots.some(path => !roots.some(root => contains(root, path)))) return undefined;
+  // Native Codex can grant an output directory outside its project roots and can
+  // repeat a grant while composing policies. Compare the exact sets below instead.
+  // Local V-C additionally collapses only byte-identical duplicate direct writes
+  // and still fails closed on any conflicting duplicate (see the analysis below).
 
   let rootRead = 0;
   let projectRootsWrite = 0;
   const directWrites: string[] = [];
+  const directWriteEntries: Array<{ entry: Record<string, unknown>; resolved: string }> = [];
   const specialWrites = new Set<string>();
   for (const value of fileSystem.entries) {
     const entry = record(value);
@@ -468,14 +552,23 @@ function exactManagedWorkspaceWriteProfile(
       || typeof path.path !== "string"
       || !isAbsolute(path.path)
       || entry.missing_path_behavior !== undefined) return undefined;
-    directWrites.push(resolve(path.path));
+    const resolvedWrite = resolve(path.path);
+    directWrites.push(resolvedWrite);
+    directWriteEntries.push({ entry, resolved: resolvedWrite });
   }
 
   if (rootRead !== 1 || projectRootsWrite > 1) return undefined;
   const uniqueDirectWrites = [...new Map(directWrites.map(path => (
     [pathIdentity(path), path] as const
   ))).values()];
-  if (uniqueDirectWrites.length !== directWrites.length) return undefined;
+  if (uniqueDirectWrites.length !== directWrites.length) {
+    if (!CHATGPT_WEB_ROLLOUT_PROFILE_ALLOW_IDENTICAL_WRITES) return undefined;
+    if (!reportDirectWriteDuplicates(
+      directWriteDuplicateAnalysis(directWriteEntries),
+      directWriteEntries.length,
+      identity,
+    )) return undefined;
+  }
   const expectedIdentities = new Set(uniqueExpectedWritableRoots.map(pathIdentity));
   if (uniqueDirectWrites.some(path => !expectedIdentities.has(pathIdentity(path)))) return undefined;
   if (projectRootsWrite === 0 && uniqueDirectWrites.length !== uniqueExpectedWritableRoots.length) return undefined;
@@ -500,6 +593,7 @@ function environmentFromTurnContext(
   payload: Record<string, unknown>,
   expectedTurnId: string,
   tools: readonly CodexTool[] | undefined,
+  identity?: { threadId?: string; turnId?: string },
 ): ChatGptTurnEnvironment {
   if (payload.turn_id !== expectedTurnId) {
     throw new Error("Latest Codex rollout turn context does not belong to the requested turn");
@@ -558,7 +652,7 @@ function environmentFromTurnContext(
   }
   if (permissionProfile.type === "managed" && sandbox.type === "workspace-write") {
     const fileSystem = record(permissionProfile.file_system);
-    const workspace = exactManagedWorkspaceWriteProfile(permissionProfile, roots, cwd, sandbox);
+    const workspace = exactManagedWorkspaceWriteProfile(permissionProfile, roots, cwd, sandbox, identity);
     if (!fileSystem
       || !workspace
       || networkAccess(sandbox, "workspace-write") !== workspace.networkAccess
@@ -646,7 +740,10 @@ export function resolveCurrentCodexRolloutEnvironment(options: {
         }
         continue;
       }
-      const environment = environmentFromTurnContext(latest, latest.turn_id as string, tools);
+      const environment = environmentFromTurnContext(latest, latest.turn_id as string, tools, {
+        threadId: lineage.threadId,
+        turnId: latest.turn_id as string,
+      });
       validateMetadataConsistency(lineage, environment);
       if (options.historicalEnvironmentMessages) {
         verifyHistoricalEnvironmentMessages(fd, size, turnId, options.historicalEnvironmentMessages);

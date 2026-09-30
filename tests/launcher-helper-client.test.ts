@@ -29,6 +29,7 @@ test("daemon streams browser lifecycle through the real helper process", async (
       if (prepared.skillFiles?.[0]?.text !== "<skill>\\n<name>ipc</name>\\n<path>/skills/ipc/SKILL.md</path>\\ncheck IPC\\n</skill>") throw new Error("Skill file lost in IPC");
       if (prepared.multipart.parts.length !== 6) throw new Error("Multipart context was lost");
       for (let index = 1; index < prepared.multipart.parts.length; index++) {
+        await turn.onMultipartStageSendActivated?.(index);
         await turn.onMultipartStageAcknowledged?.(index);
       }
       await turn.onSendActivated();
@@ -46,6 +47,10 @@ test("daemon streams browser lifecycle through the real helper process", async (
           decisions: [],
           pending: [],
         },
+      });
+      if (turn.captureResumeCheckpoint) turn.onResumeCheckpoint({
+        answerHash: "b".repeat(64),
+        checkpoint: { version: 2, summary: "Objective: Finish the helper test." },
       });
       return "done";
     };
@@ -86,6 +91,8 @@ test("daemon streams browser lifecycle through the real helper process", async (
   const reasoning: Array<{ text: string; continuation: boolean }> = [];
   const deltas: string[] = [];
   const checkpoints: unknown[] = [];
+  const resumeCheckpoints: unknown[] = [];
+  const sentStages: number[] = [];
   const acknowledgedStages: number[] = [];
   let sendActivated = false;
   let submitted = false;
@@ -106,6 +113,7 @@ test("daemon streams browser lifecycle through the real helper process", async (
         multipart: { parts: ["part one", "part two", "part three", "part four", "part five", "part six"], commit: "inspect" },
         release: () => { released = true; },
       }),
+      onMultipartStageSendActivated: stage => { sentStages.push(stage); },
       onMultipartStageAcknowledged: stage => { acknowledgedStages.push(stage); },
       onSendActivated: () => { sendActivated = true; },
       onSubmitted: () => { submitted = true; },
@@ -122,6 +130,7 @@ test("daemon streams browser lifecycle through the real helper process", async (
     expect(deltas).toEqual(["done"]);
     expect(sendActivated).toBe(true);
     expect(submitted).toBe(true);
+    expect(sentStages).toEqual([1, 2, 3, 4, 5]);
     expect(acknowledgedStages).toEqual([1, 2, 3, 4, 5]);
     expect(checkpoints).toEqual([{
       answerHash: "a".repeat(64),
@@ -135,6 +144,33 @@ test("daemon streams browser lifecycle through the real helper process", async (
       },
     }]);
     expect(released).toBe(true);
+
+    let resumeReleased = false;
+    const resumed = await client.run({
+      traceId: "resume123456",
+      modelId: "gpt-5.6-sol",
+      reasoning: "high",
+      modelFamily: "5.6",
+      capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+      prepare: async () => ({
+        text: "resume test",
+        images: [],
+        skillFiles: [selectedSkillFile({ role: "user", origin: "codex_skill", timestamp: 0,
+          content: "<skill>\n<name>ipc</name>\n<path>/skills/ipc/SKILL.md</path>\ncheck IPC\n</skill>",
+        })],
+        multipart: { parts: ["part one", "part two", "part three", "part four", "part five", "part six"], commit: "inspect" },
+        release: () => { resumeReleased = true; },
+      }),
+      captureResumeCheckpoint: true,
+      onTextDelta: () => {},
+      onResumeCheckpoint: checkpoint => resumeCheckpoints.push(checkpoint),
+    });
+    expect(resumed).toBe("done");
+    expect(resumeCheckpoints).toEqual([{
+      answerHash: "b".repeat(64),
+      checkpoint: { version: 2, summary: "Objective: Finish the helper test." },
+    }]);
+    expect(resumeReleased).toBeTrue();
   } finally {
     await client.close();
   }
@@ -515,4 +551,26 @@ test("an older helper cannot silently drop selected skill files and releases the
   })).rejects.toThrow("does not support skill attachments");
   expect(sent).toEqual(["run", "abort"]);
   expect(released).toBe(true);
+});
+
+test("an older helper cannot bypass the multipart Send durability barrier", async () => {
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native2", browserHost: "launcher", browserHostDescriptorPath: "/durable/launcher.json",
+    storageStatePath: "/durable/unused.json", chromeExecutablePath: "/durable/chrome", headed: true, autoApproveToolCalls: false, useSavedChats: false,
+  });
+  const internal = client as unknown as {
+    child: unknown;
+    ensureChild(): Promise<void>;
+  };
+  internal.child = {};
+  internal.ensureChild = async () => {};
+  await expect(client.run({
+    traceId: "multipart-old-helper", modelId: "gpt-5.6-sol", reasoning: "high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    prepare: async () => ({
+      text: "inspect", images: [], multipart: { parts: ["stage", "commit"], commit: "inspect" }, release() {},
+    }),
+    onMultipartStageSendActivated() {},
+    onTextDelta() {},
+  })).rejects.toThrow("does not support multipart Send boundary forwarding");
 });

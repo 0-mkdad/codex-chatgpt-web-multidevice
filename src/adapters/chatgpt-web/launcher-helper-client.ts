@@ -8,7 +8,9 @@ import type { CompiledChatGptWebPrompt } from "./prompt";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
 import {
   parseChatGptLunaCheckpoint,
+  parseChatGptResumeCheckpoint,
   type ChatGptLunaCheckpoint,
+  type ChatGptResumeCheckpoint,
 } from "./rolling-checkpoint";
 
 interface PendingTurn {
@@ -20,6 +22,7 @@ interface PendingTurn {
   prepared?: CompiledChatGptWebPrompt & { release: () => void };
   localFailure?: Error;
   progressForwarding?: AbortController;
+  sentMultipartStage?: number;
   acknowledgedMultipartStage?: number;
 }
 
@@ -27,11 +30,13 @@ type HelperMessage =
   | { type: "ready"; features?: string[] }
   | { type: "event"; id: string; event: "heartbeat" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean }
   | { type: "event"; id: string; event: "tool_batch_observed"; revision: number }
+  | { type: "event"; id: string; event: "multipart_stage_send_activated"; stageIndex: number }
   | { type: "event"; id: string; event: "multipart_stage_acknowledged"; stageIndex: number }
   | { type: "event"; id: string; event: "completion_fence_begin"; requestId: number }
   | { type: "event"; id: string; event: "completion_fence_commit"; requestId: number; revision: number }
   | { type: "event"; id: string; event: "prepared_selected"; reused: boolean }
   | { type: "event"; id: string; event: "luna_checkpoint"; checkpoint: ChatGptLunaCheckpoint; answerHash: string }
+  | { type: "event"; id: string; event: "resume_checkpoint"; checkpoint: ChatGptResumeCheckpoint; answerHash: string }
   | { type: "result"; id: string; text: string }
   | {
       type: "error";
@@ -63,7 +68,7 @@ function parseHelperMessage(line: string): HelperMessage {
   }
   if (message.type === "event") {
     const event = message.event;
-    if (event === "multipart_stage_acknowledged") {
+    if (event === "multipart_stage_send_activated" || event === "multipart_stage_acknowledged") {
       if (!Number.isSafeInteger(message.stageIndex) || (message.stageIndex as number) <= 0) {
         throw new Error("Launcher browser helper multipart stage index is invalid");
       }
@@ -103,6 +108,18 @@ function parseHelperMessage(line: string): HelperMessage {
         id: message.id,
         event,
         checkpoint: parseChatGptLunaCheckpoint(message.checkpoint),
+        answerHash: message.answerHash,
+      };
+    }
+    if (event === "resume_checkpoint") {
+      if (typeof message.answerHash !== "string" || !/^[a-f0-9]{64}$/.test(message.answerHash)) {
+        throw new Error("Launcher browser helper resume checkpoint answer hash is invalid");
+      }
+      return {
+        type: "event",
+        id: message.id,
+        event,
+        checkpoint: parseChatGptResumeCheckpoint(message.checkpoint),
         answerHash: message.answerHash,
       };
     }
@@ -227,6 +244,16 @@ export class LauncherBrowserHelperClient {
         "Launcher browser helper does not support the MCP completion fence; update or restart the launcher",
       );
     }
+    if (turn.onMultipartStageSendActivated && !this.helperFeatures.has("multipart-stage-send")) {
+      throw new Error(
+        "Launcher browser helper does not support multipart Send boundary forwarding; update or restart the launcher",
+      );
+    }
+    if (turn.captureResumeCheckpoint && !this.helperFeatures.has("resume-checkpoint")) {
+      throw new Error(
+        "Launcher browser helper does not support durable resume checkpoints; update or restart the launcher",
+      );
+    }
     return await new Promise<string>((resolveResult, rejectResult) => {
         if (this.pending.has(turn.traceId)) {
           rejectResult(new Error(`Duplicate launcher browser turn: ${turn.traceId}`));
@@ -292,6 +319,7 @@ export class LauncherBrowserHelperClient {
             ...(turn.conversationKey ? { conversationKey: turn.conversationKey } : {}),
             ...(turn.compaction ? { compaction: true } : {}),
             ...(turn.captureLunaCheckpoint ? { captureLunaCheckpoint: true } : {}),
+            ...(turn.captureResumeCheckpoint ? { captureResumeCheckpoint: true } : {}),
             ...(turn.externalProgress ? { externalProgress: true } : {}),
           },
         })
@@ -491,10 +519,34 @@ export class LauncherBrowserHelperClient {
         ));
       }
       else if (message.event === "submitted") pending.turn.onSubmitted?.();
+      else if (message.event === "multipart_stage_send_activated") {
+        const multipart = pending.prepared?.multipart;
+        if (!multipart
+          || message.stageIndex >= multipart.parts.length
+          || message.stageIndex !== (pending.sentMultipartStage ?? 0) + 1
+          || message.stageIndex !== (pending.acknowledgedMultipartStage ?? 0) + 1) {
+          this.abortWithLocalFailure(
+            message.id,
+            new Error("Launcher browser helper activated an unexpected multipart stage"),
+            pending,
+          );
+          return;
+        }
+        pending.sentMultipartStage = message.stageIndex;
+        void Promise.resolve().then(() => pending.turn.onMultipartStageSendActivated?.(message.stageIndex)).then(() => {
+          if (this.pending.get(message.id) !== pending) return;
+          return this.send({ type: "send_activation_ack", id: message.id });
+        }).catch(error => this.abortWithLocalFailure(
+          message.id,
+          error instanceof Error ? error : new Error(String(error)),
+          pending,
+        ));
+      }
       else if (message.event === "multipart_stage_acknowledged") {
         const multipart = pending.prepared?.multipart;
         if (!multipart
           || message.stageIndex >= multipart.parts.length
+          || message.stageIndex !== pending.sentMultipartStage
           || message.stageIndex !== (pending.acknowledgedMultipartStage ?? 0) + 1) {
           this.abortWithLocalFailure(
             message.id,
@@ -533,6 +585,11 @@ export class LauncherBrowserHelperClient {
                 images: prepared.images,
                 ...(prepared.skillFiles ? { skillFiles: prepared.skillFiles } : {}),
                 ...(prepared.multipart ? { multipart: prepared.multipart } : {}),
+                // Payload-free MCP context summary: the helper validates the logical/physical
+                // split and labels the turn without receiving the canonical context text.
+                ...(prepared.contextTransportSummary
+                  ? { contextTransportSummary: prepared.contextTransportSummary }
+                  : {}),
                 ...(prepared.trimmedCompactionMessages !== undefined
                   ? { trimmedCompactionMessages: prepared.trimmedCompactionMessages }
                   : {}),
@@ -551,6 +608,13 @@ export class LauncherBrowserHelperClient {
           return;
         }
         pending.turn.onLunaCheckpoint({ checkpoint: message.checkpoint, answerHash: message.answerHash });
+      }
+      else if (message.event === "resume_checkpoint") {
+        if (!pending.turn.captureResumeCheckpoint || !pending.turn.onResumeCheckpoint) {
+          this.finishWithError(message.id, new Error("Launcher browser helper emitted an unexpected resume checkpoint"));
+          return;
+        }
+        pending.turn.onResumeCheckpoint({ checkpoint: message.checkpoint, answerHash: message.answerHash });
       }
       else if (message.event === "reasoning" && message.text) {
         pending.turn.onReasoningSummary?.(message.text, message.continuation === true);

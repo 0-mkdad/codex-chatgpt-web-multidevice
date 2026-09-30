@@ -13,6 +13,8 @@ import { CHATGPT_WEB_LUNA_MODEL_ID, CHATGPT_WEB_MODEL_ID } from "../src/adapters
 import { SUMMARY_PREFIX } from "../src/responses/compaction";
 import { biggerContextPartCount } from "../src/adapters/chatgpt-web/usage";
 import type { CodexParsedRequest } from "../src/types";
+import { estimateTokensForTransportValidation } from "../src/lib/token-estimate";
+import { resolveChatGptWebSafeComposerCharLimit, resolveChatGptWebSafeMessageTokenBudget } from "../src/chatgpt-web-models";
 
 function request(reasoning: "low" | "medium" | "high" | "xhigh" | "max"): CodexParsedRequest {
   return {
@@ -76,9 +78,30 @@ test("Full-mode Pro prompts pass one stable turn token directly to native action
   expect(transportOnly).toContain(`The task context is complete. Pass turn_token ${token} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`);
   expect(transportOnly).not.toMatch(/codex_bind_turn|binding_id|outer_tool_gateway|command_tool/);
   expect(transportOnly).not.toMatch(/codex_exec|codex_write_stdin|codex_apply_patch|codex_view_image|codex_tool_inventory|codex\.control\.turn_complete/);
-  expect(transportOnly).not.toMatch(/expired|invalid|revoked|blocked|safety|security layer|permission gate/i);
+  expect(transportOnly).not.toMatch(/token expired|token revoked|security layer|permission gate/i);
+  expect(transportOnly).toContain("codex.control.turn_reference_recovery");
+  expect(transportOnly).toContain("do not retry that work here");
   expect(compiled.text).not.toContain("CODEX_INTERNAL_CONTEXT_COMPACT");
   expect(compiled.text).not.toContain("internally compacts this response");
+});
+
+test("recovery continuation carries a committed checkpoint and completed native result", () => {
+  const parsed = request("high");
+  parsed.context.messages = [
+    { role: "user", content: `${SUMMARY_PREFIX}\nCommitted compaction checkpoint for the active task`, timestamp: 1 },
+    { role: "assistant", content: [{ type: "toolCall", id: "call_completed", name: "exec_command", arguments: { cmd: "pwd" } }], timestamp: 2 },
+    { role: "toolResult", toolCallId: "call_completed", toolName: "exec_command", content: "completed native result", isError: false, timestamp: 3 },
+    { role: "user", content: "Continue the same task", timestamp: 4 },
+  ];
+  const token = "turn_12345678901234567890123456789012";
+  const compiled = compileChatGptWebPrompt(parsed, {
+    localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true,
+  }, token, { recoveryContinuation: true });
+  expect(compiled.text).toContain("Committed compaction checkpoint for the active task");
+  expect(compiled.text).toContain("completed native result");
+  expect(compiled.text).toContain("do not repeat completed operations or the original browser submission");
+  expect(compiled.text).toContain(`Pass the new turn_token ${token} unchanged`);
+  expect(compiled.text).not.toContain("Execute the latest active user request now.");
 });
 
 test("Pro preserves the same native Codex delegation contract as Extra High", () => {
@@ -378,6 +401,75 @@ test("Bigger Context minimizes the largest ordered stage instead of overfilling 
   expect(parts).toHaveLength(6);
   expect(parts.flatMap(part => part.records)).toHaveLength(8);
   expect(Math.max(...multipart.multipart!.parts.map(part => part.length))).toBeLessThan(120_000);
+});
+
+test("Bigger Context reserves wrapper overhead inside every safe physical message budget", () => {
+  const parsed = request("high");
+  parsed.context.systemPrompt = [];
+  parsed.context.messages = Array.from({ length: 18 }, (_, index) => ({
+    role: "user" as const,
+    content: `record-${index}-${"word ".repeat(3_500)}`,
+    timestamp: index + 1,
+  }));
+  const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+  const compiled = compileChatGptWebPrompt(parsed, capabilities, undefined, { experimentalMultipartParts: 6 });
+  const transactionId = `ctx_${"f".repeat(32)}`;
+  const stageTokenBudget = resolveChatGptWebSafeMessageTokenBudget(CHATGPT_WEB_MODEL_ID, "medium", capabilities);
+  const stageCharBudget = resolveChatGptWebSafeComposerCharLimit(CHATGPT_WEB_MODEL_ID, "medium", capabilities)!;
+  for (const [index, payload] of compiled.multipart!.parts.slice(0, -1).entries()) {
+    const formatted = formatChatGptWebMultipartStage(payload, transactionId, index + 1, 6).text;
+    expect(formatted.length).toBeGreaterThan(payload.length);
+    expect(formatted.length).toBeLessThanOrEqual(stageCharBudget);
+    expect(estimateTokensForTransportValidation(formatted)).toBeLessThanOrEqual(stageTokenBudget);
+  }
+});
+
+test("many small semantic records share one conservative transport margin per formatted stage", () => {
+  const parsed = request("high");
+  parsed.context.systemPrompt = [];
+  parsed.context.messages = Array.from({ length: 1_200 }, (_, index) => ({
+    role: "user" as const,
+    content: "record-" + String(index).padStart(4, "0") + "-" + "x".repeat(160),
+    timestamp: index + 1,
+  }));
+  const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+  const compiled = compileChatGptWebPrompt(parsed, capabilities, undefined, { experimentalMultipartParts: 6 });
+  const parts = compiled.multipart!.parts;
+  const records = parts.flatMap(part => (JSON.parse(part) as { records: unknown[] }).records);
+  expect(records).toHaveLength(1_200);
+
+  const transactionId = "ctx_0123456789abcdef0123456789abcdef";
+  const messages = [
+    ...parts.slice(0, -1).map((part, index) => formatChatGptWebMultipartStage(part, transactionId, index + 1, 6).text),
+    formatChatGptWebMultipartCommit(compiled.multipart!, transactionId),
+  ];
+  const stageTokenBudget = resolveChatGptWebSafeMessageTokenBudget(CHATGPT_WEB_MODEL_ID, "medium", capabilities);
+  const finalTokenBudget = resolveChatGptWebSafeMessageTokenBudget(CHATGPT_WEB_MODEL_ID, "high", capabilities);
+  const stageCharBudget = resolveChatGptWebSafeComposerCharLimit(CHATGPT_WEB_MODEL_ID, "medium", capabilities)!;
+  const finalCharBudget = resolveChatGptWebSafeComposerCharLimit(CHATGPT_WEB_MODEL_ID, "high", capabilities)!;
+  for (const [index, message] of messages.entries()) {
+    expect(estimateTokensForTransportValidation(message)).toBeLessThanOrEqual(index === 5 ? finalTokenBudget : stageTokenBudget);
+    expect(message.length).toBeLessThanOrEqual(index === 5 ? finalCharBudget : stageCharBudget);
+  }
+});
+
+// V-B: the planner no longer rejects a single oversized record locally — the record is staged
+// intact and the browser preflight remains the gate, exactly as in v6.1.0.
+test("Bigger Context stages one oversized semantic record intact without local rejection", () => {
+  const parsed = request("high");
+  parsed.context.systemPrompt = [];
+  parsed.context.messages = [{
+    role: "user",
+    content: "a!b@c#d$e%f^g&h*".repeat(2_600),
+    timestamp: 1,
+  }];
+  const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+  const compiled = compileChatGptWebPrompt(
+    parsed, capabilities, undefined, { experimentalMultipartParts: 6 },
+  );
+  const records = compiled.multipart!.parts.flatMap(part => (JSON.parse(part) as { records: Array<{ message: { content: unknown } }> }).records);
+  expect(records).toHaveLength(1);
+  expect(records[0]!.message.content).toEqual(parsed.context.messages[0]!.content);
 });
 
 test("Web compaction rebuilds attachments after trimming an oversized oldest image message", () => {
