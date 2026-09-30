@@ -198,7 +198,7 @@ test("broker locks execution and completion until every context chunk was read",
 });
 
 test("context transport is immutable after the turn is bound", async () => {
-  const root = mkdtempSync(join(tmpdir(), "cgw-mcp-context-immutable-"));
+  const root = mkdtempSync(join(tmpdir(), "cgw-ctx-immutable-"));
   roots.push(root);
   const socketPath = defaultBrokerEndpoint(root);
   const broker = TurnBroker.forSocket(socketPath);
@@ -229,7 +229,7 @@ test("chunk size stays at the reference 32,768-character boundary", () => {
 });
 
 test("context telemetry proves installed → chunks → complete → execution unlocked, with metadata only", async () => {
-  const root = mkdtempSync(join(tmpdir(), "cgw-mcp-context-telemetry-"));
+  const root = mkdtempSync(join(tmpdir(), "cgw-ctx-telemetry-"));
   roots.push(root);
   const socketPath = defaultBrokerEndpoint(root);
   const broker = TurnBroker.forSocket(socketPath);
@@ -391,7 +391,7 @@ test("context telemetry proves installed → chunks → complete → execution u
 });
 
 test("completion fence rejects incomplete context in-process and over the wire, and commits only after the final chunk", async () => {
-  const root = mkdtempSync(join(tmpdir(), "cgw-mcp-context-fence-"));
+  const root = mkdtempSync(join(tmpdir(), "cgw-ctx-fence-"));
   roots.push(root);
   const socketPath = defaultBrokerEndpoint(root);
   const broker = TurnBroker.forSocket(socketPath);
@@ -558,7 +558,7 @@ test("usage counts the full canonical context while the physical composer messag
 });
 
 test("context-read lease extends on contiguous progress only", async () => {
-  const root = mkdtempSync(join(tmpdir(), "cgw-mcp-context-lease-"));
+  const root = mkdtempSync(join(tmpdir(), "cgw-ctx-lease-"));
   roots.push(root);
   const socketPath = defaultBrokerEndpoint(root);
   const broker = TurnBroker.forSocket(socketPath);

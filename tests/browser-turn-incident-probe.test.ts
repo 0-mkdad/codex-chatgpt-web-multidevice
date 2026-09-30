@@ -3,13 +3,15 @@ import { chromium, type Browser } from "playwright-core";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptAssistantTurnSelector } from "../src/chatgpt-session";
 
-const CHROME = process.env.CHATGPT_DOM_TEST_BROWSER ?? "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
+const CHROME = process.env.CHATGPT_DOM_TEST_BROWSER
+  ?? (process.platform === "win32" ? "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" : undefined);
 const submitted = "One  two\nThree";
 
 type Shape = "same" | "different" | "nbsp" | "missing_target" | "missing_response" | "missing_completion";
 let browser: Browser;
 
 beforeAll(async () => {
+  if (!CHROME) return;
   browser = await chromium.launch({ executablePath: CHROME, headless: true });
 });
 
@@ -72,7 +74,7 @@ async function probe(shape: Shape) {
   }
 }
 
-test("incident-shape probe: exact cross-key remount is accepted", async () => {
+test.skipIf(!CHROME)("incident-shape probe: exact cross-key remount is accepted", async () => {
   const lines: string[] = [];
   const capture = spyOn(console, "info").mockImplementation((...args: unknown[]) => {
     lines.push(args.map(String).join(" "));
@@ -92,18 +94,18 @@ test("incident-shape probe: exact cross-key remount is accepted", async () => {
   }
 }, 30_000);
 
-test("incident-shape probe: different text, missing target, and absent response/completion fail closed", async () => {
+test.skipIf(!CHROME)("incident-shape probe: different text, missing target, and absent response/completion fail closed", async () => {
   expect(await probe("different")).toBe("lost");
   expect(await probe("missing_target")).toBe("lost");
   expect(await probe("missing_response")).toBe("lost");
   expect(await probe("missing_completion")).toBe("lost");
 }, 45_000);
 
-test("incident-shape probe: multi-space NBSP rendering currently fails closed", async () => {
+test.skipIf(!CHROME)("incident-shape probe: multi-space NBSP rendering currently fails closed", async () => {
   expect(await probe("nbsp")).toBe("lost");
 }, 30_000);
 
-test("incident-shape probe: rejection trace gives private proof metadata without prompt text", async () => {
+test.skipIf(!CHROME)("incident-shape probe: rejection trace gives private proof metadata without prompt text", async () => {
   const lines: string[] = [];
   const capture = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
     lines.push(args.map(String).join(" "));

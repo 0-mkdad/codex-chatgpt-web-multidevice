@@ -530,7 +530,7 @@ test("a rejected reference can request recovery only through an exact active tur
 });
 
 test("a delivered native call without a completed result blocks the recovery fence", async () => {
-  const root = mkdtempSync(join(tmpdir(), "cgw-broker-uncertain-recovery-"));
+  const root = mkdtempSync(join(tmpdir(), "cgw-b-uncertain-rec-"));
   const socketPath = defaultBrokerEndpoint(root);
   const broker = TurnBroker.forSocket(socketPath);
   try {
@@ -572,6 +572,7 @@ test("broker call rejects a response frame without exactly one of result/error",
   // instead of silently resolving or rejecting on shape.
   const root = mkdtempSync(join(tmpdir(), "cgw-broker-frame-"));
   const pipePath = defaultBrokerEndpoint(root);
+  if (!isWindowsPipeEndpoint(pipePath)) mkdirSync(dirname(pipePath), { recursive: true });
   const { createServer } = await import("node:net");
   const server = createServer(socket => {
     let buffered = "";

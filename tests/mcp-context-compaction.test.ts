@@ -101,7 +101,7 @@ test("compaction transport keeps full canonical token accounting and the logical
 });
 
 test("compaction purpose keeps execution locked forever and never emits the unlock boundary", async () => {
-  const root = mkdtempSync(join(tmpdir(), "cgw-mcp-compaction-lock-"));
+  const root = mkdtempSync(join(tmpdir(), "cgw-ctx-lock-"));
   roots.push(root);
   const socketPath = defaultBrokerEndpoint(root);
   const broker = TurnBroker.forSocket(socketPath);
@@ -166,7 +166,7 @@ test("compaction purpose keeps execution locked forever and never emits the unlo
 });
 
 test("partial context cannot produce an accepted compaction summary", async () => {
-  const root = mkdtempSync(join(tmpdir(), "cgw-mcp-compaction-partial-"));
+  const root = mkdtempSync(join(tmpdir(), "cgw-ctx-partial-"));
   roots.push(root);
   const socketPath = defaultBrokerEndpoint(root);
   const broker = TurnBroker.forSocket(socketPath);
@@ -208,7 +208,7 @@ test("partial context cannot produce an accepted compaction summary", async () =
 });
 
 test("compaction handoff store is idempotent, conflict-safe, and gates replays", () => {
-  const root = mkdtempSync(join(tmpdir(), "cgw-mcp-compaction-store-"));
+  const root = mkdtempSync(join(tmpdir(), "cgw-ctx-store-"));
   roots.push(root);
   const storePath = join(root, "compaction-handoffs.json");
   const store = new ChatGptCompactionHandoffStore(storePath);
