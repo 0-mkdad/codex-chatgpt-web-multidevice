@@ -355,8 +355,10 @@ class RuntimeSupervisor {
     publishOperation,
     runtimeInvocationFactory = runtimeInvocation,
     onConfigRead,
+    platform = process.platform,
   }) {
     this.app = app;
+    this.platform = platform;
     this.logger = logger;
     this.sourceRoot = sourceRoot;
     this.installedRuntimeRoot = installedRuntimeRoot;
@@ -519,7 +521,7 @@ class RuntimeSupervisor {
       env: windowsTrustEnvironment({
         ...process.env,
         CODEX_CHATGPT_WEB_BROWSER_HOST_DESCRIPTOR: this.browserDescriptorPath,
-      }),
+      }, this.platform),
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
