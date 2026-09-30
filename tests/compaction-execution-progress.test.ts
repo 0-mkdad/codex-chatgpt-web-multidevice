@@ -60,7 +60,7 @@ function dispatchOf(broker: TurnBroker): BrokerDispatch {
 }
 
 test("context progress fires on unique contiguous frontier advances and on completion only", async () => {
-  const root = mkdtempSync(join(tmpdir(), "cgw-exec-progress-broker-"));
+  const root = mkdtempSync(join(tmpdir(), "cgw-exec-progress-"));
   const socketPath = defaultBrokerEndpoint(root);
   const broker = TurnBroker.forSocket(socketPath);
   await broker.listen();
@@ -99,7 +99,7 @@ test("context progress fires on unique contiguous frontier advances and on compl
 });
 
 test("a throwing progress callback never fails the context read", async () => {
-  const root = mkdtempSync(join(tmpdir(), "cgw-exec-progress-throw-"));
+  const root = mkdtempSync(join(tmpdir(), "cgw-exec-throw-"));
   const socketPath = defaultBrokerEndpoint(root);
   const broker = TurnBroker.forSocket(socketPath);
   await broker.listen();

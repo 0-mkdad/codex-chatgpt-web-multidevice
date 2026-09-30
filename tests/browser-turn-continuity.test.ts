@@ -18,7 +18,9 @@ import { parseRequest } from "../src/responses/parser";
  * network, no model submission; the physical send is counted at the production seam.
  */
 
-const CHROME = process.env.CHATGPT_DOM_TEST_BROWSER ?? "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
+const CHROME = process.env.CHATGPT_DOM_TEST_BROWSER
+  ?? (process.platform === "win32" ? "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" : undefined);
+const testIfBrowser = test.skipIf(!CHROME);
 const PROMPT = "Audit one module.\nThen summarize the finding.";
 
 const fixturePage = `
@@ -188,7 +190,7 @@ function traceCounts(): { reconciled: number; salvaged: number; lost: number; re
   return counts;
 }
 
-test("C-CLOSURE-2: mid-stream re-key remount recovers with exactly-once tool delivery", async () => {
+testIfBrowser("C-CLOSURE-2: mid-stream re-key remount recovers with exactly-once tool delivery", async () => {
   const browser = await chromium.launch({ executablePath: CHROME, headless: true });
   const root = mkdtempSync(join(tmpdir(), "pkg-c-closure-s1-"));
   const state = { submissions: 0, deliveries: 0, toolExecutions: 0, promptText: "" };
@@ -273,7 +275,7 @@ test("C-CLOSURE-2: mid-stream re-key remount recovers with exactly-once tool del
   }
 }, 30_000);
 
-test("C-CLOSURE-1: terminal reconcile failure with a complete proven candidate salvages the real result", async () => {
+testIfBrowser("C-CLOSURE-1: terminal reconcile failure with a complete proven candidate salvages the real result", async () => {
   const browser = await chromium.launch({ executablePath: CHROME, headless: true });
   const root = mkdtempSync(join(tmpdir(), "pkg-c-closure-s2-"));
   const state = { submissions: 0, deliveries: 0, toolExecutions: 0, promptText: "" };
@@ -314,7 +316,7 @@ test("C-CLOSURE-1: terminal reconcile failure with a complete proven candidate s
   }
 }, 30_000);
 
-test("C-CLOSURE-1b: an ambiguous candidate still fails typed and an incomplete response is never promoted", async () => {
+testIfBrowser("C-CLOSURE-1b: an ambiguous candidate still fails typed and an incomplete response is never promoted", async () => {
   const browser = await chromium.launch({ executablePath: CHROME, headless: true });
   const root = mkdtempSync(join(tmpdir(), "pkg-c-closure-s34-"));
   try {

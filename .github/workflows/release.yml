@@ -84,6 +84,7 @@ jobs:
             launcher/artifacts/*.dmg
             launcher/artifacts/*.zip
             launcher/artifacts/*.exe
+            launcher/artifacts/*.exe.blockmap
             launcher/artifacts/*.AppImage
           if-no-files-found: error
 

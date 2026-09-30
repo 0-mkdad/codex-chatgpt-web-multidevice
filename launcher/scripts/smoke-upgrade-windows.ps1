@@ -11,7 +11,6 @@ if ($env:CI -ne "true" -or -not $env:RUNNER_TEMP -or -not [Environment]::Is64Bit
 
 $CandidateInstaller = (Resolve-Path -LiteralPath $CandidateInstaller).Path
 $ExpectedVersion = (Get-Content -Raw (Join-Path $PSScriptRoot "..\package.json") | ConvertFrom-Json).version
-if ($ExpectedVersion -ne "6.1.0") { throw "Upgrade smoke expected candidate version 6.1.0" }
 $ExpectedName = "codex-web-gpt-multidevice-$ExpectedVersion-win-x64.exe"
 if ([IO.Path]::GetFileName($CandidateInstaller) -ne $ExpectedName) {
   throw "Candidate installer filename does not match $ExpectedName"
